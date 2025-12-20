@@ -30,6 +30,67 @@ wget -O checkpoints/tapip3d_final.pth https://huggingface.co/zbww/tapip3d/resolv
 
 ## Usage
 
+### Prepare videos
+
+**Case A: videos directly in the input folder**
+```
+<input_video_directory>/
+├── 1.webm
+├── 2.webm
+└── ...
+```
+- Use `--scan_depth 0` because the videos are already in the root folder.
+
+**Case B: one subfolder per video containing extracted frames**
+```
+<input_video_directory>/
+├── <video_name_1>/
+│   ├── 000000.png
+│   ├── 000001.png
+│   └── ...
+├── <video_name_2>/
+│   ├── 000000.png
+│   └── ...
+└── ...
+```
+- Use `--scan_depth 1` so TraceForge scans one level down to reach each video’s frames.
+
+**Case C: two-level layout (per-video folder with an `images/` subfolder)**
+```
+<input_video_directory>/
+├── <video_name_1>/
+│   └── images/
+│       ├── 000000.png
+│       ├── 000001.png
+│       └── ...
+├── <video_name_2>/
+│   └── images/
+│       ├── 000000.png
+│       └── ...
+└── ...
+```
+- Use `--scan_depth 2` to search two levels down for the image frames.
+
+**Quick test dataset**
+- Download a small sample dataset and unpack it under `data/test_dataset`:
+  ```bash
+  pip install gdown  # if not installed
+  mkdir -p data
+  gdown --fuzzy https://drive.google.com/file/d/1Vn1FNbthz-K8o2ijq9V7jYv10rElWuUd/view?usp=sharing -O data/test_dataset.tar
+  tar -xf data/test_dataset.tar -C data
+  ```
+- The downloaded data follows the Case B layout above; run inference with 
+    ```bash
+    python infer.py \
+        --video_path data/test_dataset \
+        --out_dir <output_directory> \
+        --batch_process \
+        --use_all_trajectories \
+        --skip_existing \
+        --frame_drop_rate 5 \
+        --scan_depth 1
+    ```
+
 ### Running Inference
 ```bash
 python infer.py \
@@ -78,6 +139,9 @@ python infer.py \
 
 ### 3D Trajectory Viewer
 Visualize 3D traces on single images using viser:
+
+<img src="assets/3dtrace_vis.png" alt="viser visualize" width="360">
+
 ```bash
 python visualize_single_image.py \
     --npz_path <output_dir>/<video_name>/samples/<video_name>_0.npz \
