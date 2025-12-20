@@ -655,8 +655,9 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
 
 def find_video_folders(base_path: str, scan_depth: int = 2):
     """
-    Recursively scan subfolders up to a given depth and return folders
-    that contain image files (.jpg, .jpeg, .png).
+    Recursively scan subfolders up to a given depth and return inputs
+    that contain images (.jpg/.jpeg/.png) or stand-alone video files
+    (.mp4/.webm/etc.).
 
     Args:
         base_path: Root directory to scan
@@ -665,7 +666,8 @@ def find_video_folders(base_path: str, scan_depth: int = 2):
     Returns:
         List of folder paths containing image files at the target depth
     """
-    valid_exts = (".jpg", ".jpeg", ".png")
+    img_exts = (".jpg", ".jpeg", ".png")
+    video_exts = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpg", ".mpeg")
 
     # Normalize the base path
     base_path = os.path.abspath(base_path.rstrip(os.sep))
@@ -681,17 +683,22 @@ def find_video_folders(base_path: str, scan_depth: int = 2):
         if current_depth < target_depth:
             continue
 
-        # Select only folders exactly at the target depth
+        # Select only folders/files exactly at the target depth
         if current_depth == target_depth:
-            has_images = any(f.lower().endswith(valid_exts) for f in files)
+            has_images = any(f.lower().endswith(img_exts) for f in files)
             if has_images:
                 video_folders.append(root)
+            # Also collect individual video files at this depth
+            for f in files:
+                if f.lower().endswith(video_exts):
+                    video_folders.append(os.path.join(root, f))
 
         # Skip deeper folders for performance (no need to go further)
         if current_depth > target_depth:
             dirs[:] = []  # prevent os.walk from descending further
 
-    video_folders.sort()
+    # Deduplicate and sort for stable ordering
+    video_folders = sorted(list(dict.fromkeys(video_folders)))
     return video_folders
 
 
