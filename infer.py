@@ -96,7 +96,13 @@ def parse_args():
         type=int,
         default=50,
         help="Target max frames to keep per episode. If --fps <= 0, use stride = ceil(N / max_frames_per_video).",
-    )   
+    )
+    parser.add_argument(
+        "--grid_size",
+        type=int,
+        default=20,
+        help="Grid size for uniform keypoint sampling (grid_size x grid_size points per frame). Default is 20 (400 points).",
+    )
     return parser.parse_args()
 
 def retarget_trajectories(
@@ -224,6 +230,7 @@ def save_structured_data(
     use_all_trajectories=True,
     query_frame_results=None,
     future_len: int = 128,
+    grid_size: int = 20,
 ):
     """Save data in the structured format"""
 
@@ -244,7 +251,7 @@ def save_structured_data(
         saved_count = 0
 
         for query_frame_idx, frame_data in query_frame_results.items():
-            coords_np = frame_data["coords"].cpu().numpy()  # (T, 400, 3)
+            coords_np = frame_data["coords"].cpu().numpy()  # (T, grid_size*grid_size, 3)
 
             # Save RGB images for this segment
             video_segment = frame_data["video_segment"].cpu().numpy() * 255
@@ -254,8 +261,8 @@ def save_structured_data(
 
 
             # Save sample data for this query frame
-            coords_np = frame_data["coords"].cpu().numpy()  # (T, 400, 3) where T <= 16
-            visibs_np = frame_data["visibs"].cpu().numpy()  # (T, 400)
+            coords_np = frame_data["coords"].cpu().numpy()  # (T, grid_size*grid_size, 3) where T <= future_len
+            visibs_np = frame_data["visibs"].cpu().numpy()  # (T, grid_size*grid_size)
             intrinsics_np = frame_data["intrinsics_segment"].cpu().numpy()  # (T, 3, 3)
             extrinsics_np = frame_data["extrinsics_segment"].cpu().numpy()  # (T, 4, 4)
 
@@ -280,25 +287,24 @@ def save_structured_data(
             # Create sample data for this query frame
             sample_data = {}
 
-            # Grid points (20x20 = 400 points) for this query frame
-            grid_size = 20
+            # Grid points (grid_size x grid_size points) for this query frame
             frame_h, frame_w = video_segment.shape[1:3]
             y_coords = np.linspace(0, frame_h - 1, grid_size)
             x_coords = np.linspace(0, frame_w - 1, grid_size)
             xx, yy = np.meshgrid(x_coords, y_coords)
-            keypoints = np.stack([xx.flatten(), yy.flatten()], axis=1)  # (400, 2)
+            keypoints = np.stack([xx.flatten(), yy.flatten()], axis=1)  # (grid_size*grid_size, 2)
 
             sample_data["image_path"] = np.array(
                 [f"images/{video_name}_{query_frame_idx}.png"], dtype="<U50"
             )
             sample_data["frame_index"] = np.array([query_frame_idx])
-            sample_data["keypoints"] = keypoints.astype(np.float32)  # (400, 2)
+            sample_data["keypoints"] = keypoints.astype(np.float32)  # (grid_size*grid_size, 2)
 
-            # trajectories: (400, T, 3) - 400 tracks, T frames (T <= 16), xyz coordinates
+            # trajectories: (grid_size*grid_size, T, 3) - grid_size*grid_size tracks, T frames (T <= future_len), xyz coordinates
             try:
                 sample_data["traj"] = coords_np.transpose(1, 0, 2).astype(
                     np.float32
-                )  # (400, T, 3)
+                )  # (grid_size*grid_size, T, 3)
             except ValueError as e:
                 logger.error(
                     f"Error transposing coords for frame {query_frame_idx}: {e}"
@@ -323,23 +329,23 @@ def save_structured_data(
             fixed_camera_view = camera_views_segment[0]
 
             # Project to 2D using the same camera view
-            coords_3d_for_projection = coords_np  # (16, 400, 3)
+            coords_3d_for_projection = coords_np  # (T, grid_size*grid_size, 3)
             try:
                 tracks2d_fixed = project_tracks_3d_to_2d(
                     tracks3d=coords_3d_for_projection,
                     camera_views=[fixed_camera_view] * len(coords_3d_for_projection),
-                )  # (T, 400, 2)
+                )  # (T, grid_size*grid_size, 2)
                 tracks3d_fixed = project_tracks_3d_to_3d(
                     tracks3d=coords_3d_for_projection,
                     camera_views=[fixed_camera_view] * len(coords_3d_for_projection),
-                )  # (T, 400, 3)
+                )  # (T, grid_size*grid_size, 3)
 
                 sample_data["traj_2d"] = tracks2d_fixed.transpose(1, 0, 2).astype(
                     np.float32
-                )  # (400, T, 2)
+                )  # (grid_size*grid_size, T, 2)
                 sample_data["traj"] = tracks3d_fixed.transpose(1, 0, 2).astype(
                     np.float32
-                )  # (400, T, 3)
+                )  # (grid_size*grid_size, T, 3)
             except Exception as e:
                 logger.error(
                     f"Error projecting tracks for frame {query_frame_idx}: {e}"
@@ -367,11 +373,26 @@ def save_structured_data(
             depth_filename = f"{video_name}_{query_frame_idx}.png"
             depth_path = os.path.join(depth_dir, depth_filename)
             if not os.path.exists(depth_path):  # Avoid duplicate saves
-                # Normalize depth for visualization and save as 16-bit PNG
-                depth_normalized = (query_frame_depth * 10000).astype(np.uint16)
+                # Save depth as 16-bit PNG with normalization for better visualization
+                # Normalize depth to use full 16-bit range (0-65535) for better contrast
+                # The raw depth values are saved in NPZ for accurate reconstruction
+                depth_valid = query_frame_depth[query_frame_depth > 0]
+                if len(depth_valid) > 0:
+                    depth_min = depth_valid.min()
+                    depth_max = depth_valid.max()
+                    # Normalize to 0-65535 range, with a small margin to avoid clipping
+                    if depth_max > depth_min:
+                        depth_normalized = ((query_frame_depth - depth_min) / (depth_max - depth_min) * 65535.0).clip(0, 65535).astype(np.uint16)
+                    else:
+                        # If all values are the same, set to a middle value
+                        depth_normalized = np.full_like(query_frame_depth, 32767, dtype=np.uint16)
+                else:
+                    # No valid depth values
+                    depth_normalized = np.zeros_like(query_frame_depth, dtype=np.uint16)
+                
                 Image.fromarray(depth_normalized, mode="I;16").save(depth_path)
 
-                # save depth raw value as npz
+                # save depth raw value as npz (for accurate reconstruction)
                 depth_raw_filename = f"{video_name}_{query_frame_idx}_raw.npz"
                 depth_raw_path = os.path.join(depth_dir, depth_raw_filename)
                 np.savez(depth_raw_path, depth=query_frame_depth)
@@ -386,7 +407,7 @@ def save_structured_data(
             np.savez(sample_path, **sample_data)
 
             logger.info(
-                f"Saved query frame {query_frame_idx} with 400 trajectories tracked for {actual_frames} frames"
+                f"Saved query frame {query_frame_idx} with {grid_size * grid_size} trajectories tracked for {actual_frames} frames"
             )
             saved_count += 1
 
@@ -458,7 +479,7 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
     # Sample query points using uniform grid and store which frame they belong to
     query_points_per_frame = {}
 
-    # Use uniform grid sampling (20x20 = 400 points per frame)
+    # Use uniform grid sampling (grid_size x grid_size points per frame)
     query_point = []
     tracking_segments = []  # Store info about which frames to track for each segment
 
@@ -474,10 +495,10 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
         end_frame = min(frame_idx + args.future_len, video_length)
         tracking_segments.append((frame_idx, end_frame))
 
-        # Create 20x20 uniform grid for this frame
+        # Create uniform grid for this frame (grid_size x grid_size points)
         grid_points = (
             create_uniform_grid_points(
-                height=frame_H, width=frame_W, grid_size=20, device="cpu"
+                height=frame_H, width=frame_W, grid_size=args.grid_size, device="cpu"
             )
             .squeeze(0)
             .numpy()
@@ -523,6 +544,10 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
         segment_query_point = [query_point[seg_idx].copy()]
         segment_query_point[0][:, 0] = 0  # Set frame index to 0 for segment start
 
+        # Calculate support_grid_size proportionally to grid_size
+        # Original: grid_size=20 -> support_grid_size=16 (ratio = 0.8)
+        support_grid_size = int(args.grid_size * 0.8)
+        
         video, depths, intrinsics, extrinsics, query_point_tensor, support_grid_size = (
             prepare_inputs(
                 video_segment,
@@ -531,7 +556,7 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
                 extrs_segment,
                 segment_query_point,
                 inference_res=(frame_H, frame_W),
-                support_grid_size=16,
+                support_grid_size=support_grid_size,
                 device=args.device,
             )
         )
@@ -564,8 +589,8 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
             )
             continue
 
-        # Check if we have the expected number of trajectories (400)
-        expected_trajectories = 400
+        # Check if we have the expected number of trajectories
+        expected_trajectories = args.grid_size * args.grid_size
         if coords_seg.shape[1] != expected_trajectories:
             logger.warning(
                 f"Query frame {start_frame}: Expected {expected_trajectories} trajectories, got {coords_seg.shape[1]}"
@@ -573,8 +598,8 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
 
         # Store results for this query frame
         query_frame_results[start_frame] = {
-            "coords": coords_seg,  # Shape: (T, 400, 3)
-            "visibs": visibs_seg,  # Shape: (T, 400)
+            "coords": coords_seg,  # Shape: (T, grid_size*grid_size, 3)
+            "visibs": visibs_seg,  # Shape: (T, grid_size*grid_size)
             "video_segment": video,
             "depths_segment": depths,
             "intrinsics_segment": intrinsics,
@@ -718,11 +743,16 @@ def load_video_and_mask(video_path, mask_dir=None, fps=1, max_num_frames=384, is
             img = Image.open(img_file)
             if is_depth:
                 img = img.convert("I;16")  # 16-bit grayscale for depth
+                # Convert depth from millimeters to meters
+                # 16-bit PNG depth images typically store depth in millimeters
+                # Model outputs depth in meters, so we need to convert mm to m
+                depth_array = np.array(img).astype(np.float32) / 1000.0
+                video_tensor.append(torch.from_numpy(depth_array))
             else:
                 img = img.convert("RGB")
-            video_tensor.append(
-                torch.from_numpy(np.array(img)).float()
-            )
+                video_tensor.append(
+                    torch.from_numpy(np.array(img)).float()
+                )
             # Extract original filename without extension
             filename = os.path.splitext(os.path.basename(img_file))[0]
             original_filenames.append(filename)
@@ -770,7 +800,7 @@ def create_uniform_grid_points(height, width, grid_size=20, device="cuda"):
     Args:
         height (int): Image height
         width (int): Image width
-        grid_size (int): Grid size (20x20)
+        grid_size (int): Grid size (grid_size x grid_size points)
         device (str): Device for tensor
 
     Returns:
@@ -919,6 +949,7 @@ if __name__ == "__main__":
                 use_all_trajectories=args.use_all_trajectories,
                 query_frame_results=result.get("query_frame_results"),
                 future_len=args.future_len,
+                grid_size=args.grid_size,
             )
 
             # Always save traditional visualization NPZ in video directory root

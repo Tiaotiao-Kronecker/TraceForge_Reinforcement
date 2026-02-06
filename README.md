@@ -89,10 +89,13 @@ wget -O checkpoints/tapip3d_final.pth https://huggingface.co/zbww/tapip3d/resolv
         --use_all_trajectories \
         --skip_existing \
         --frame_drop_rate 5 \
-        --scan_depth 1
+        --scan_depth 1 \
+        --grid_size 20  # Optional: increase for higher keypoint density
     ```
 
 ### Running Inference
+
+#### Single Video Processing
 ```bash
 python infer.py \
     --video_path <input_video_directory> \
@@ -101,8 +104,30 @@ python infer.py \
     --use_all_trajectories \
     --skip_existing \
     --frame_drop_rate 5 \
-    --scan_depth 2
+    --scan_depth 2 \
+    --grid_size 20  # Optional: increase for higher keypoint density (default: 20)
 ```
+
+#### Batch Processing with Multiple GPUs
+For processing large datasets with multiple GPUs in parallel:
+```bash
+python batch_infer.py \
+    --base_path <dataset_base_path> \
+    --out_dir <output_directory> \
+    --gpu_id 0,1,2,3,4,5,6,7 \
+    --use_all_trajectories \
+    --skip_existing \
+    --frame_drop_rate 5 \
+    --grid_size 30 \
+    --max_trajs 10  # Limit for testing
+```
+
+**Batch Processing Options**:
+- `--gpu_id`: Specify GPU IDs (e.g., `0,1,2,3` for 4 GPUs)
+- `--max_trajs`: Limit number of trajectories for testing
+- `--max_workers`: Control parallelism (default: equal to GPU count)
+- `--no_parallel`: Disable parallel processing (serial mode)
+- `--grid_size`: Grid size for uniform keypoint sampling (grid_size × grid_size points per frame). Default is `20` (400 points). Higher values increase keypoint density (e.g., `30` = 900 points, `40` = 1600 points)
 
 #### Options
 | Argument | Description | Default |
@@ -116,6 +141,7 @@ python infer.py \
 | `--fps` | Frame sampling stride (0 for auto) | `1` |
 | `--max_frames_per_video` | Target max frames per episode | `50` |
 | `--future_len` | Tracking window length per query frame | `128` |
+| `--grid_size` | Grid size for uniform keypoint sampling (grid_size × grid_size points per frame) | `20` |
 
 ### Output Structure
 ```
@@ -139,7 +165,7 @@ python infer.py \
 ## Visualization
 
 ### 3D Trajectory Viewer
-Visualize 3D traces on single images using viser:
+Visualize 3D traces on single images using viser. The visualization automatically adapts to different `grid_size` values:
 
 <img src="assets/3dtrace_vis.png" alt="viser visualize" width="360">
 
@@ -150,6 +176,16 @@ python visualize_single_image.py \
     --depth_path <output_dir>/<video_name>/depth/<video_name>_0.png \
     --port 8080
 ```
+
+**Interactive Controls**:
+- **Number of trajectories**: Adjust how many trajectories to display (useful for high-density keypoints, e.g., grid_size=80 with 6400 trajectories)
+- **Number of keypoints**: Adjust how many keypoints to display
+- **Track width**: Adjust trajectory line width (0.5-10.0)
+- **Keypoint size**: Adjust keypoint point size (0.001-0.1)
+- **Track length**: Control the length of displayed trajectory segments
+- **Show/Hide toggles**: Control visibility of point cloud, tracks, keypoints, camera frustum, and axes
+
+**Note**: The visualization script automatically handles different keypoint densities based on the `grid_size` used during inference. Use the interactive controls to adjust rendering for optimal performance and clarity.
 
 ### Verify Output Files
 Check saved NPZ files:
@@ -188,6 +224,70 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 
 - **Reading 3D data**: See `ThreedReader` in `visualize_single_image.py`
 - **Point and camera transformations**: See `utils/threed_utils.py`
+
+## Troubleshooting
+
+### 多GPU并行处理问题
+
+**问题**: 在多GPU环境下运行 `batch_infer.py` 时，非 cuda:0 设备出现 `CUDA error: an illegal memory access was encountered` 错误。
+
+**原因**: `pointops2` 模块在创建张量时使用了硬编码的 `torch.cuda.*Tensor()`，这些会在默认设备（cuda:0）上创建张量，导致设备不匹配。
+
+**修复**: 已修复 `third_party/pointops2/functions/pointops.py` 中的以下函数：
+- `KNNQuery.forward()`: 使用输入张量的设备创建输出张量
+- `FurthestSampling.forward()`: 使用输入张量的设备创建输出张量
+- `Grouping.forward()` 和 `Grouping.backward()`: 使用输入张量的设备创建输出张量
+
+**验证**: 修复后，所有GPU（cuda:0 到 cuda:7）都能正常工作。
+
+### 深度单位转换问题
+
+**问题**: 
+1. 读取的深度图像（16-bit PNG）单位与模型输出的深度单位不一致
+2. 深度值显示不合理（如厨房场景显示100-600米）
+
+**原因**: 
+- 原始深度图像（16-bit PNG）通常以**毫米**为单位存储
+- 模型输出的深度以**米**为单位
+- 在 `load_video_and_mask` 中加载深度时未进行单位转换
+
+**修复**: 
+1. **加载时** (`infer.py`): 添加单位转换 `depth_array / 1000.0`（毫米转米）
+2. **保存时** (`infer.py`): 使用厘米单位保存PNG `depth * 100.0`（米转厘米，最大655.35米）
+3. **加载时** (`visualize_single_image.py`): 从PNG加载时除以100（厘米转米）
+
+**注意**: 
+- 深度值 > 655.35米会被截断（uint16限制）
+- 建议优先使用NPZ文件（`_raw.npz`）保存完整精度
+
+### 批量推理输出检查
+
+**改进**: `batch_infer.py` 现在会自动检查输出目录是否有内容：
+- 如果输出为空，会显示警告和错误信息
+- 显示每个任务生成的文件数量
+- 帮助快速定位失败的任务
+
+### Keypoint密度调整
+
+**功能**: `grid_size` 参数现在可以动态调整，用于控制每帧采样的关键点数量。
+
+**使用方法**:
+- `--grid_size 20` (默认): 每帧 20×20 = 400 个关键点
+- `--grid_size 30`: 每帧 30×30 = 900 个关键点
+- `--grid_size 40`: 每帧 40×40 = 1600 个关键点
+
+**注意**:
+- `support_grid_size` 会自动按比例适配（比例为 0.8，即 `grid_size × 0.8`）
+- 更高的 `grid_size` 会增加计算时间和内存使用
+- 可视化脚本 `visualize_single_image.py` 会自动适配不同的 keypoint 密度，无需额外配置
+
+### CUDA版本不匹配问题
+
+**问题**: 编译 `pointops2` 时出现 CUDA 版本不匹配错误（如检测到13.1但PyTorch用12.8编译）。
+
+**临时解决方案**: 已修改 `torch/utils/cpp_extension.py` 将CUDA版本检查从错误改为警告，允许继续编译。
+
+**注意**: 这是临时修复，建议使用匹配的CUDA版本。
 
 ## 📖 Citation
 

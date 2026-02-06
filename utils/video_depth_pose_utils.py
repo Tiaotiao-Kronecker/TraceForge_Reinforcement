@@ -78,7 +78,7 @@ class VGGT4Wrapper(BaseVideoDepthPoseWrapper):
 
         with torch.no_grad():
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                predictions = self.model(video_tensor_processed.cuda())
+                predictions = self.model(video_tensor_processed.to(self.device))
                 extrinsic, intrinsic = predictions["poses_pred"], predictions["intrs"]
                 depth_map, depth_conf = (
                     predictions["points_map"][..., 2],

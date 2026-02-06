@@ -5,4 +5,5 @@ third_party/pointops2/build
 third_party/pointops2/dist
 checkpoints/
 test*/
+output*/
 .env

@@ -39,10 +39,22 @@ def load_depth_from_path(depth_path):
             depth_data.close()
             return depth
         else:
-            # Load from PNG (16-bit, need to convert back from mm)
-            depth_img = np.array(Image.open(depth_path))
-            depth = depth_img.astype(np.float32) / 10000.0  # Convert back from mm
-            return depth
+            # Load from PNG (16-bit, normalized to 0-65535 range)
+            # First try to load raw NPZ for accurate depth values
+            base_path = depth_path[:-4]  # Remove .png extension
+            raw_npz_path = f"{base_path}_raw.npz"
+            if os.path.exists(raw_npz_path):
+                depth_data = np.load(raw_npz_path)
+                depth = depth_data["depth"]
+                depth_data.close()
+                return depth
+            else:
+                # If no raw NPZ, PNG is normalized - we can't recover original depth
+                # This should not happen if inference was run correctly
+                raise ValueError(
+                    f"PNG depth file found but no corresponding raw NPZ file: {raw_npz_path}. "
+                    "Please use the _raw.npz file for accurate depth values."
+                )
     else:
         raise ValueError(f"Unsupported depth file format: {depth_path}")
 
@@ -204,12 +216,13 @@ def visualize_single_image(npz_path, image_path, depth_path, port=8080):
     logger.info(f"Started Viser server at http://localhost:{port}")
 
     # Add GUI controls
+    num_trajectories = len(traj_world)
     with server.gui.add_folder("Visualization"):
         gui_point_size = server.gui.add_slider(
             "Point size", min=0.001, max=0.02, step=1e-3, initial_value=0.006
         )
         gui_track_width = server.gui.add_slider(
-            "Track width", min=0.5, max=5.0, step=0.5, initial_value=4.0
+            "Track width", min=0.5, max=10.0, step=0.5, initial_value=4.0
         )
         gui_track_length = server.gui.add_slider(
             "Track length",
@@ -218,11 +231,25 @@ def visualize_single_image(npz_path, image_path, depth_path, port=8080):
             step=1,
             initial_value=min(30, traj_world.shape[1]),
         )
+        gui_num_trajectories = server.gui.add_slider(
+            "Number of trajectories",
+            min=1,
+            max=num_trajectories,
+            step=1,
+            initial_value=min(100, num_trajectories),
+        )
+        gui_num_keypoints = server.gui.add_slider(
+            "Number of keypoints",
+            min=1,
+            max=num_trajectories,
+            step=1,
+            initial_value=min(100, num_trajectories),
+        )
         gui_show_pointcloud = server.gui.add_checkbox("Show point cloud", True)
         gui_show_tracks = server.gui.add_checkbox("Show tracks", True)
         gui_show_keypoints = server.gui.add_checkbox("Show keypoints", False)
         gui_keypoint_size = server.gui.add_slider(
-            "Keypoint size", min=0.005, max=0.05, step=0.005, initial_value=0.005
+            "Keypoint size", min=0.001, max=0.1, step=0.001, initial_value=0.005
         )
         gui_show_frustum = server.gui.add_checkbox("Show camera frustum", True)
         gui_show_axes = server.gui.add_checkbox("Show world axes", True)
@@ -240,45 +267,73 @@ def visualize_single_image(npz_path, image_path, depth_path, port=8080):
     track_handles = []
     keypoint_handles = []
 
-    for i, (traj, color) in enumerate(zip(traj_world, track_colors)):
-        # Create line segments for trajectory
-        valid_traj = traj[: gui_track_length.value]  # Use only the first N points
-        if len(valid_traj) > 1:
-            segments = []
-            seg_colors = []
-            for j in range(len(valid_traj) - 1):
-                segments.append([valid_traj[j], valid_traj[j + 1]])
-                seg_colors.append([color, color])
+    def update_trajectories():
+        """Update visible trajectories based on GUI settings"""
+        # Remove old handles
+        for handle in track_handles:
+            handle.remove()
+        track_handles.clear()
+        
+        num_traj_to_show = int(gui_num_trajectories.value)
+        num_traj_to_show = min(num_traj_to_show, num_trajectories)
+        
+        for i, (traj, color) in enumerate(zip(traj_world[:num_traj_to_show], track_colors[:num_traj_to_show])):
+            # Create line segments for trajectory
+            valid_traj = traj[: gui_track_length.value]  # Use only the first N points
+            if len(valid_traj) > 1:
+                segments = []
+                seg_colors = []
+                for j in range(len(valid_traj) - 1):
+                    segments.append([valid_traj[j], valid_traj[j + 1]])
+                    seg_colors.append([color, color])
 
-            if segments:
-                track_handle = server.scene.add_line_segments(
-                    name=f"track_{i}",
-                    points=np.array(segments),
-                    colors=np.array(seg_colors),
-                    line_width=gui_track_width.value,
-                )
-                track_handles.append(track_handle)
+                if segments:
+                    track_handle = server.scene.add_line_segments(
+                        name=f"track_{i}",
+                        points=np.array(segments),
+                        colors=np.array(seg_colors),
+                        line_width=gui_track_width.value,
+                    )
+                    track_handle.visible = gui_show_tracks.value
+                    track_handles.append(track_handle)
 
-        # Add starting keypoint in 3D (convert from image coordinates to world)
-        kp_x, kp_y = keypoints[i]
-        kp_depth = (
-            depth[int(kp_y), int(kp_x)] if 0 <= kp_x < W and 0 <= kp_y < H else 1.0
-        )
+    def update_keypoints():
+        """Update visible keypoints based on GUI settings"""
+        # Remove old handles
+        for handle in keypoint_handles:
+            handle.remove()
+        keypoint_handles.clear()
+        
+        num_kp_to_show = int(gui_num_keypoints.value)
+        num_kp_to_show = min(num_kp_to_show, num_trajectories)
+        
+        for i in range(num_kp_to_show):
+            color = track_colors[i]
+            
+            # Add starting keypoint in 3D (convert from image coordinates to world)
+            kp_x, kp_y = keypoints[i]
+            kp_depth = (
+                depth[int(kp_y), int(kp_x)] if 0 <= kp_x < W and 0 <= kp_y < H else 1.0
+            )
 
-        # Convert keypoint to world coordinates
-        kp_world = convert_image_coords_to_world(
-            np.array([[[kp_x, kp_y, kp_depth]]]), camera_params
-        )[0, 0]
+            # Convert keypoint to world coordinates
+            kp_world = convert_image_coords_to_world(
+                np.array([[[kp_x, kp_y, kp_depth]]]), camera_params
+            )[0, 0]
 
-        keypoint_handle = server.scene.add_point_cloud(
-            name=f"keypoint_{i}",
-            points=kp_world[None],
-            colors=color[None],
-            point_size=gui_keypoint_size.value,
-            point_shape="circle",
-        )
-        keypoint_handle.visible = False  # Initially hidden
-        keypoint_handles.append(keypoint_handle)
+            keypoint_handle = server.scene.add_point_cloud(
+                name=f"keypoint_{i}",
+                points=kp_world[None],
+                colors=color[None],
+                point_size=gui_keypoint_size.value,
+                point_shape="circle",
+            )
+            keypoint_handle.visible = gui_show_keypoints.value
+            keypoint_handles.append(keypoint_handle)
+
+    # Initial render
+    update_trajectories()
+    update_keypoints()
 
     # Add camera frame
     c2w = camera_params["c2w"]
@@ -355,30 +410,15 @@ def visualize_single_image(npz_path, image_path, depth_path, port=8080):
 
     @gui_track_length.on_update
     def _(_) -> None:
-        # Remove old track handles
-        for handle in track_handles:
-            handle.remove()
-        track_handles.clear()
+        update_trajectories()
 
-        # Create new tracks with updated length
-        for i, (traj, color) in enumerate(zip(traj_world, track_colors)):
-            valid_traj = traj[: gui_track_length.value]
-            if len(valid_traj) > 1:
-                segments = []
-                seg_colors = []
-                for j in range(len(valid_traj) - 1):
-                    segments.append([valid_traj[j], valid_traj[j + 1]])
-                    seg_colors.append([color, color])
+    @gui_num_trajectories.on_update
+    def _(_) -> None:
+        update_trajectories()
 
-                if segments:
-                    track_handle = server.scene.add_line_segments(
-                        name=f"track_{i}_updated",
-                        points=np.array(segments),
-                        colors=np.array(seg_colors),
-                        line_width=gui_track_width.value,
-                    )
-                    track_handle.visible = gui_show_tracks.value
-                    track_handles.append(track_handle)
+    @gui_num_keypoints.on_update
+    def _(_) -> None:
+        update_keypoints()
 
     logger.info("Visualization ready! Press Ctrl+C to exit.")
 
