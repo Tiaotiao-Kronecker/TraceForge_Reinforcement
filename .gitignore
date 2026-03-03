@@ -7,3 +7,7 @@ checkpoints/
 test*/
 output*/
 .env
+*.log
+sampled_*.txt
+failed_traj_ids.txt
+discussion.txt

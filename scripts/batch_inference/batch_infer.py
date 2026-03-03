@@ -48,6 +48,11 @@
 import os
 import sys
 import argparse
+
+# 确保项目根目录在 sys.path 中，以便预加载模型时能正确导入 models、utils 等
+_project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 import subprocess
 import time
 from pathlib import Path
@@ -150,15 +155,35 @@ def process_single_traj(traj_info, args, infer_script, gpu_ids, traj_index, tota
         print(f"  Device: {device}")
     
     # 构建命令
-    cmd = [
-        "conda", "run", "-n", "traceforge", "python", infer_script,
-        "--use_all_trajectories",
-        "--frame_drop_rate", str(args.frame_drop_rate),
-        "--out_dir", traj_out_dir,
-        "--video_path", video_path,
-        "--depth_path", depth_path,
-        "--device", device,
-    ]
+    # 直接使用conda环境的Python解释器，避免conda run的插件冲突问题
+    # 优先使用用户目录下的conda环境
+    conda_env_python = "/home/wangchen/.conda/envs/traceforge/bin/python"
+    if not os.path.exists(conda_env_python):
+        # 如果不存在，尝试系统conda路径
+        conda_env_python = "/usr/local/miniconda3/envs/traceforge/bin/python"
+    
+    # 如果还是不存在，回退到conda run（但添加--no-plugins选项）
+    if not os.path.exists(conda_env_python):
+        cmd = [
+            "conda", "run", "--no-plugins", "-n", "traceforge", "python", infer_script,
+            "--use_all_trajectories",
+            "--frame_drop_rate", str(args.frame_drop_rate),
+            "--out_dir", traj_out_dir,
+            "--video_path", video_path,
+            "--depth_path", depth_path,
+            "--device", device,
+        ]
+    else:
+        # 直接使用Python解释器（推荐方式）
+        cmd = [
+            conda_env_python, infer_script,
+            "--use_all_trajectories",
+            "--frame_drop_rate", str(args.frame_drop_rate),
+            "--out_dir", traj_out_dir,
+            "--video_path", video_path,
+            "--depth_path", depth_path,
+            "--device", device,
+        ]
     
     if args.skip_existing:
         cmd.append("--skip_existing")
@@ -170,11 +195,21 @@ def process_single_traj(traj_info, args, infer_script, gpu_ids, traj_index, tota
     traj_start_time = time.time()
     try:
         # 使用subprocess.run执行，capture_output=True避免输出混乱
+        # 设置环境变量，确保conda环境正确激活（如果使用直接Python路径）
+        env = os.environ.copy()
+        if 'conda_env_python' in locals() and conda_env_python and os.path.exists(conda_env_python):
+            # 添加conda环境的bin目录到PATH
+            conda_env_bin = os.path.dirname(conda_env_python)
+            env['PATH'] = conda_env_bin + os.pathsep + env.get('PATH', '')
+        # 确保子进程（infer.py）能找到项目根目录的 models、utils 等模块
+        env['PYTHONPATH'] = _project_root + (os.pathsep + env.get('PYTHONPATH', '')) if env.get('PYTHONPATH') else _project_root
+        
         result = subprocess.run(
             cmd,
             check=True,
             capture_output=True,
             text=True,
+            env=env,
         )
         traj_elapsed = time.time() - traj_start_time
         
@@ -253,6 +288,58 @@ def process_single_traj(traj_info, args, infer_script, gpu_ids, traj_index, tota
             print(f"❌ [{traj_index}/{total_trajs}] {traj_name} 处理异常 (耗时: {traj_elapsed:.2f}秒): {error_msg}")
         
         return (False, traj_name, traj_elapsed, error_msg)
+
+def preload_models():
+    """
+    预先加载模型到缓存，避免每个子进程都尝试下载
+    """
+    print("=" * 80)
+    print("预加载模型到缓存...")
+    print("=" * 80)
+    
+    try:
+        # 预加载VGGT4模型
+        from models.SpaTrackV2.models.vggt4track.models.vggt_moe import VGGT4Track
+        print("正在预加载 VGGT4Track (Yuxihenry/SpatialTrackerV2_Front)...")
+        
+        # 添加重试机制（与video_depth_pose_utils.py中的逻辑一致）
+        import time
+        max_retries = 5
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                model = VGGT4Track.from_pretrained("Yuxihenry/SpatialTrackerV2_Front")
+                print("✅ VGGT4Track 预加载成功")
+                del model  # 释放内存
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    print(f"⚠️  预加载失败 (尝试 {attempt + 1}/{max_retries})，等待 {wait_time} 秒后重试: {e}")
+                    time.sleep(wait_time)
+                else:
+                    raise
+        
+        # 预加载MoGe模型（如果需要）
+        try:
+            from models.SpaTrackV2.models.SpaTrack import MoGeModel
+            print("正在预加载 MoGeModel (Ruicheng/moge-vitl)...")
+            moge_model = MoGeModel.from_pretrained('Ruicheng/moge-vitl')
+            print("✅ MoGeModel 预加载成功")
+            del moge_model
+        except Exception as e:
+            print(f"⚠️  MoGeModel 预加载失败（可能不需要）: {e}")
+        
+        print("=" * 80)
+        print("模型预加载完成！")
+        print("=" * 80)
+        return True
+    except Exception as e:
+        print(f"❌ 模型预加载失败: {e}")
+        print("⚠️  警告: 将继续运行，但每个子进程可能会尝试下载模型")
+        print("   如果遇到SSL错误，请检查网络连接或手动下载模型")
+        return False
 
 def main():
     parser = argparse.ArgumentParser(description="批量推理 traj_group0 下的所有 traj")
@@ -388,6 +475,23 @@ def main():
     if not valid_trajs:
         print("❌ 没有找到有效的traj目录")
         return
+    
+    # 预加载模型到缓存（避免每个子进程都尝试下载）
+    print("\n" + "=" * 80)
+    print("步骤1: 预加载模型到缓存")
+    print("=" * 80)
+    preload_success = preload_models()
+    if not preload_success:
+        print("⚠️  警告: 模型预加载失败，将继续运行但可能遇到SSL错误")
+        # 非交互式环境：自动继续；交互式环境：询问用户
+        try:
+            response = input("是否继续？(y/n，默认y): ").strip().lower()
+            if response and response != 'y':
+                print("已取消")
+                return
+        except (EOFError, KeyboardInterrupt):
+            # 非交互式环境（如后台运行），自动继续
+            print("(非交互式环境，自动继续)")
     
     # 构建infer.py命令的基础参数（不包含 --out_dir，因为每个 traj 需要独立的输出目录）
     infer_script = os.path.join(os.path.dirname(__file__), "infer.py")

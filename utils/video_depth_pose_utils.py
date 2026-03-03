@@ -67,11 +67,52 @@ class VGGT4Wrapper(BaseVideoDepthPoseWrapper):
         self.model = self.load_model()
 
     def load_model(self, checkpoint_path="Yuxihenry/SpatialTrackerV2_Front"):
-        model = VGGT4Track.from_pretrained(checkpoint_path)
-        logger.debug(f"load vggt4 from {checkpoint_path}")
-        model = model.eval()
-        model = model.to(self.device)
-        return model
+        import time
+        import os
+        
+        max_retries = 5
+        retry_delay = 2  # 初始延迟2秒
+        
+        # 检查缓存是否存在
+        cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+        model_cache_name = checkpoint_path.replace("/", "--")
+        model_cache_path = os.path.join(cache_dir, f"models--{model_cache_name}")
+        
+        # 如果缓存存在，尝试使用local_files_only=True强制只使用本地文件
+        use_local_only = os.path.exists(model_cache_path)
+        
+        if use_local_only:
+            logger.info(f"检测到模型缓存，尝试仅使用本地文件加载: {checkpoint_path}")
+        
+        # 尝试加载模型（带重试）
+        for attempt in range(max_retries):
+            try:
+                if use_local_only:
+                    # 优先尝试仅使用本地文件
+                    try:
+                        model = VGGT4Track.from_pretrained(checkpoint_path, local_files_only=True)
+                        logger.info(f"✅ 成功从本地缓存加载模型（无需网络）")
+                    except Exception as local_error:
+                        # 如果local_files_only失败，回退到允许网络（但会优先使用缓存）
+                        logger.warning(f"仅使用本地文件失败，尝试允许网络连接: {local_error}")
+                        model = VGGT4Track.from_pretrained(checkpoint_path, local_files_only=False)
+                else:
+                    # 缓存不存在，需要从网络下载
+                    model = VGGT4Track.from_pretrained(checkpoint_path)
+                
+                logger.debug(f"load vggt4 from {checkpoint_path}")
+                model = model.eval()
+                model = model.to(self.device)
+                return model
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)  # 指数退避: 2, 4, 8, 16, 32秒
+                    logger.warning(f"加载模型失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                    logger.warning(f"等待 {wait_time} 秒后重试...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"加载模型失败，已重试 {max_retries} 次: {e}")
+                    raise
 
     def __call__(self, video_tensor, known_depth=None, stationary_camera=False, replace_with_known_depth=True):
         video_tensor_processed = preprocess_image(video_tensor)[None]  # (1, T, 3, H, W)

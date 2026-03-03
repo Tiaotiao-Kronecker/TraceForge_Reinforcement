@@ -1,9 +1,31 @@
 from typing import *
 import fnmatch
+import threading
 
-import sympy
 import torch
 import torch.nn as nn
+
+# 延迟导入sympy，避免并发导入时的死锁问题
+_sympy_lock = threading.Lock()
+_sympy_imported = False
+_sympy_module = None
+
+def _import_sympy():
+    """线程安全的sympy导入"""
+    global _sympy_module, _sympy_imported
+    if not _sympy_imported:
+        with _sympy_lock:
+            if not _sympy_imported:
+                import sympy
+                _sympy_module = sympy
+                _sympy_imported = True
+    return _sympy_module
+
+# 创建sympy的别名，延迟导入
+def __getattr__(name):
+    if name == 'sympy':
+        return _import_sympy()
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
 def any_match(s: str, patterns: List[str]) -> bool:
@@ -29,6 +51,7 @@ def build_optimizer(model: nn.Module, optimizer_config: Dict[str, Any]) -> torch
 
 
 def parse_lr_lambda(s: str) -> Callable[[int], float]:
+    sympy = _import_sympy()  # 延迟导入
     epoch = sympy.symbols('epoch')
     lr_lambda = sympy.sympify(s)
     return sympy.lambdify(epoch, lr_lambda, 'math')

@@ -1,0 +1,17 @@
+# 可视化脚本和文档
+
+本目录包含可视化相关的所有脚本和文档。
+
+## 脚本文件
+
+- **visualize_single_image.py** - 可视化单张图像的 3D 轨迹（静态）
+- **visualize_3d_keypoint_animation.py** - 3D Keypoint 动画可视化（按查询帧播放）
+
+## 文档
+
+- **visualization_features.md** - 可视化功能说明
+
+## 使用说明
+
+详细说明请参考 [visualization_features.md](visualization_features.md)
+

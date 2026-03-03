@@ -1,4 +1,5 @@
 import os
+import re
 import numpy as np
 import cv2
 import mediapy as media
@@ -427,10 +428,8 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
         stride = 1
         n_frames = 0
         if os.path.isdir(video_path):
-            # Count frames by scanning image files in the episode folder
-            img_files = []
-            for ext in ["jpg", "jpeg", "png"]:
-                img_files.extend(glob.glob(os.path.join(video_path, f"*.{ext}")))
+            # Count frames（与 load_video_and_mask 相同的收集与排序逻辑，保证 stride 一致）
+            img_files = _collect_and_sort_frame_files(video_path, ["jpg", "jpeg", "png"])
             n_frames = len(img_files)
 
             # Auto stride: ceil(N / target), where target = --max_frames_per_video
@@ -450,12 +449,21 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
         video_path, args.mask_dir, stride, args.max_num_frames
     )
 
-    # Load depth (if provided) with the SAME stride to keep alignment with RGB
+    # Load depth (if provided) with the SAME stride and same frame order ( _frame_sort_key ) as RGB
     depth_tensor = None
     if depth_path is not None:
         depth_tensor, _, _ = load_video_and_mask(
             depth_path, None, stride, args.max_num_frames, is_depth=True
         )  # [T, H, W]
+        if len(depth_tensor) != len(video_tensor):
+            logger.warning(
+                f"Depth frame count ({len(depth_tensor)}) != RGB frame count ({len(video_tensor)}); "
+                "aligning to min length."
+            )
+            min_len = min(len(depth_tensor), len(video_tensor))
+            depth_tensor = depth_tensor[:min_len]
+            video_tensor = video_tensor[:min_len]
+            original_filenames = original_filenames[:min_len]
         valid_depth = (depth_tensor > 0)
         depth_tensor[~valid_depth] = 0  # Invalidate bad depth values
 
@@ -727,19 +735,44 @@ def find_video_folders(base_path: str, scan_depth: int = 2):
     return video_folders
 
 
+def _frame_sort_key(path):
+    """
+    为帧文件路径生成排序键，自动兼容两种常见命名规则，按时间顺序排序：
+    - 规则1：纯数字文件名，如 00000.png, 00001.png, 00100.png → 按数值 0,1,100 排序
+    - 规则2：前缀+数字，如 im_0.jpg, im_1.jpg, im_10.jpg, frame_00001.png → 按末尾数字 0,1,10,1 排序
+    避免字典序导致 im_10 排在 im_2 前。
+    """
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if stem.isdigit():
+        return (int(stem), path)
+    numbers = re.findall(r"\d+", stem)
+    if numbers:
+        return (int(numbers[-1]), path)
+    return (0, path)
+
+
+def _collect_and_sort_frame_files(video_path, extensions):
+    """收集目录下指定扩展名的帧文件，并按 _frame_sort_key 排序（与 RGB/深度 对齐）。"""
+    files = []
+    for ext in extensions:
+        files.extend(glob.glob(os.path.join(video_path, f"*.{ext}")))
+    files.sort(key=_frame_sort_key)
+    return files
+
+
 def load_video_and_mask(video_path, mask_dir=None, fps=1, max_num_frames=384, is_depth=False):
     original_filenames = []
 
     if os.path.isdir(video_path):
-        img_files = []
-        for ext in ["jpg", "png"]:
-            img_files.extend(sorted(glob.glob(os.path.join(video_path, f"*.{ext}"))))
+        # RGB 支持 jpg/jpeg/png；深度图通常为 png，统一用同一排序逻辑保证与 RGB 逐帧对齐
+        exts = ["jpg", "jpeg", "png"] if not is_depth else ["png", "jpg", "jpeg"]
+        img_files = _collect_and_sort_frame_files(video_path, exts)
 
         # IMPORTANT: Subsample the file list BEFORE loading to save memory
         img_files = img_files[::fps]
 
         video_tensor = []
-        for img_file in tqdm.tqdm(img_files, desc="Loading images"):
+        for img_file in tqdm.tqdm(img_files, desc="Loading images" if not is_depth else "Loading depth"):
             img = Image.open(img_file)
             if is_depth:
                 img = img.convert("I;16")  # 16-bit grayscale for depth
@@ -781,7 +814,7 @@ def load_video_and_mask(video_path, mask_dir=None, fps=1, max_num_frames=384, is
     video_mask_npy = None
     if mask_dir is not None:
         video_mask_npy = []
-        mask_files = sorted(glob.glob(os.path.join(mask_dir, "*.png")))
+        mask_files = _collect_and_sort_frame_files(mask_dir, ["png"])
 
         for mask_file in mask_files:
             mask = media.read_image(mask_file)
@@ -922,8 +955,43 @@ if __name__ == "__main__":
         if args.skip_existing:
             output_path = os.path.join(out_dir, video_name)
             if os.path.exists(output_path):
-                logger.info(f"Skipping {video_name} - output already exists")
-                continue
+                # 检查输出目录是否有实际内容（不仅仅是空目录）
+                images_dir = os.path.join(output_path, "images")
+                depth_dir = os.path.join(output_path, "depth")
+                samples_dir = os.path.join(output_path, "samples")
+                
+                # 检查是否有文件（至少检查images和samples目录）
+                has_images = False
+                has_samples = False
+                
+                if os.path.exists(images_dir):
+                    try:
+                        has_images = any(
+                            os.path.isfile(os.path.join(images_dir, f))
+                            for f in os.listdir(images_dir)
+                        )
+                    except (OSError, PermissionError):
+                        pass
+                
+                if os.path.exists(samples_dir):
+                    try:
+                        has_samples = any(
+                            os.path.isfile(os.path.join(samples_dir, f))
+                            for f in os.listdir(samples_dir)
+                        )
+                    except (OSError, PermissionError):
+                        pass
+                
+                # 如果images和samples都有内容，认为输出完整，跳过
+                if has_images and has_samples:
+                    logger.info(f"Skipping {video_name} - output already exists and is complete")
+                    continue
+                else:
+                    # 目录存在但内容不完整，重新处理
+                    logger.warning(f"Output directory for {video_name} exists but is incomplete, will reprocess")
+                    # 可以选择删除不完整的目录，或者直接覆盖
+                    # import shutil
+                    # shutil.rmtree(output_path)
 
         try:
             # Clear CUDA cache before processing each video

@@ -29,6 +29,38 @@ mkdir -p checkpoints
 wget -O checkpoints/tapip3d_final.pth https://huggingface.co/zbww/tapip3d/resolve/main/tapip3d_final.pth
 ```
 
+## Project Structure
+
+The project is organized with scripts and documentation grouped by functionality:
+
+```
+TraceForge/
+├── README.md                    # This file
+├── PROBLEM_HISTORY.md          # Problem history and solutions
+├── SCREEN_USAGE.md             # Screen usage guide
+├── setup_env.sh                # Environment setup script
+├── scripts/                    # All scripts organized by category
+│   ├── batch_inference/        # Batch inference scripts and docs
+│   │   ├── batch_infer.py      # Main batch inference script
+│   │   ├── infer.py            # Single trajectory inference
+│   │   ├── stress_test_batch_inference.py
+│   │   └── BATCH_INFERENCE_GUIDE.md
+│   ├── data_analysis/          # Data analysis scripts and docs
+│   │   ├── analyze_*.py
+│   │   └── action_data_format_analysis.md
+│   ├── visualization/          # Visualization scripts and docs
+│   │   ├── visualize_single_image.py
+│   │   └── visualization_features.md
+│   └── archived/               # Archived scripts (completed or deprecated)
+│       ├── find_widowx_urdf.py
+│       └── check_agent_data_for_urdf.py
+└── docs/                       # Technical documentation
+    ├── archived/               # Archived documentation
+    └── depth_scale_alignment_math.md
+```
+
+**Note**: Scripts and their corresponding documentation are kept together in the same directory for easy access. See [scripts/README.md](scripts/README.md) for details.
+
 ## Usage
 
 ### Prepare videos
@@ -82,7 +114,7 @@ wget -O checkpoints/tapip3d_final.pth https://huggingface.co/zbww/tapip3d/resolv
   ```
 - The downloaded data follows the Case B layout above; run inference with 
     ```bash
-    python infer.py \
+    python scripts/batch_inference/infer.py \
         --video_path data/test_dataset \
         --out_dir <output_directory> \
         --batch_process \
@@ -97,7 +129,8 @@ wget -O checkpoints/tapip3d_final.pth https://huggingface.co/zbww/tapip3d/resolv
 
 #### Single Video Processing
 ```bash
-python infer.py \
+# 从项目根目录运行（推荐）
+python scripts/batch_inference/infer.py \
     --video_path <input_video_directory> \
     --out_dir <output_directory> \
     --batch_process \
@@ -111,7 +144,8 @@ python infer.py \
 #### Batch Processing with Multiple GPUs
 For processing large datasets with multiple GPUs in parallel:
 ```bash
-python batch_infer.py \
+# 从项目根目录运行（推荐）
+python scripts/batch_inference/batch_infer.py \
     --base_path <dataset_base_path> \
     --out_dir <output_directory> \
     --gpu_id 0,1,2,3,4,5,6,7 \
@@ -170,7 +204,8 @@ Visualize 3D traces on single images using viser. The visualization automaticall
 <img src="assets/3dtrace_vis.png" alt="viser visualize" width="360">
 
 ```bash
-python visualize_single_image.py \
+# From project root directory
+python scripts/visualization/visualize_single_image.py \
     --npz_path <output_dir>/<video_name>/samples/<video_name>_0.npz \
     --image_path <output_dir>/<video_name>/images/<video_name>_0.png \
     --depth_path <output_dir>/<video_name>/depth/<video_name>_0.png \
@@ -222,14 +257,48 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 
 ## Helper Functions
 
-- **Reading 3D data**: See `ThreedReader` in `visualize_single_image.py`
+- **Reading 3D data**: See `ThreedReader` in `scripts/visualization/visualize_single_image.py`
 - **Point and camera transformations**: See `utils/threed_utils.py`
+
+## Scripts and Documentation
+
+All scripts are organized in the `scripts/` directory by functionality:
+
+- **Batch Inference**: [scripts/batch_inference/](scripts/batch_inference/) - Main inference scripts and comprehensive guide
+- **Data Analysis**: [scripts/data_analysis/](scripts/data_analysis/) - Dataset analysis and format checking tools
+- **Visualization**: [scripts/visualization/](scripts/visualization/) - Visualization tools and features
+- **Archived**: [scripts/archived/](scripts/archived/) - Completed or deprecated scripts (kept for reference)
+
+Each directory contains:
+- Scripts (`.py` and `.sh` files)
+- Documentation (`.md` files)
+- A `README.md` explaining the scripts in that directory
+
+### Archived Scripts and Documentation
+
+The following items are archived as they are no longer actively used but kept for reference:
+
+**Archived Scripts** (`scripts/archived/`):
+- `find_widowx_urdf.py` - Script for finding WidowX URDF files (completed, URDF extraction project created separately)
+- `check_agent_data_for_urdf.py` - Script to check if agent_data.pkl contains URDF (completed, determined that URDF is not in agent_data.pkl)
+
+**Archived Documentation** (`docs/archived/`):
+- `WIDOWX_URDF_SEARCH.md` - WidowX URDF search guide (completed, URDF extraction project created separately)
+- `check_urdf_in_agent_data.md` - Analysis of URDF in agent_data.pkl (completed, concluded that URDF is not present)
+
+These archived items are kept for historical reference and may be useful for understanding the project's development process.
+
+For detailed information, see:
+- [Batch Inference Guide](scripts/batch_inference/BATCH_INFERENCE_GUIDE.md) - Complete guide for batch processing
+- [Data Analysis Documentation](scripts/data_analysis/action_data_format_analysis.md) - Action data format analysis
+- [Visualization Features](scripts/visualization/visualization_features.md) - Visualization capabilities
+- [Scripts Directory](scripts/README.md) - Overview of all scripts
 
 ## Troubleshooting
 
 ### 多GPU并行处理问题
 
-**问题**: 在多GPU环境下运行 `batch_infer.py` 时，非 cuda:0 设备出现 `CUDA error: an illegal memory access was encountered` 错误。
+**问题**: 在多GPU环境下运行批量推理时，非 cuda:0 设备出现 `CUDA error: an illegal memory access was encountered` 错误。
 
 **原因**: `pointops2` 模块在创建张量时使用了硬编码的 `torch.cuda.*Tensor()`，这些会在默认设备（cuda:0）上创建张量，导致设备不匹配。
 
@@ -252,8 +321,8 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 - 在 `load_video_and_mask` 中加载深度时未进行单位转换
 
 **修复**: 
-1. **加载时** (`infer.py`): 添加单位转换 `depth_array / 1000.0`（毫米转米）
-2. **保存时** (`infer.py`): 使用厘米单位保存PNG `depth * 100.0`（米转厘米，最大655.35米）
+1. **加载时** (推理脚本): 添加单位转换 `depth_array / 1000.0`（毫米转米）
+2. **保存时** (推理脚本): 使用厘米单位保存PNG `depth * 100.0`（米转厘米，最大655.35米）
 3. **加载时** (`visualize_single_image.py`): 从PNG加载时除以100（厘米转米）
 
 **注意**: 
@@ -262,7 +331,7 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 
 ### 批量推理输出检查
 
-**改进**: `batch_infer.py` 现在会自动检查输出目录是否有内容：
+**改进**: 批量推理脚本现在会自动检查输出目录是否有内容：
 - 如果输出为空，会显示警告和错误信息
 - 显示每个任务生成的文件数量
 - 帮助快速定位失败的任务
