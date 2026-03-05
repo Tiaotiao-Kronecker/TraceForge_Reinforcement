@@ -151,6 +151,104 @@ class VGGT4Wrapper(BaseVideoDepthPoseWrapper):
         return video_ten, depth_npy, depth_conf, extrs_npy, intrs_npy
 
 
+class ExternalGeomWrapper(BaseVideoDepthPoseWrapper):
+    """
+    使用外部提供的几何（深度 + 相机内外参），完全不调用 VGGT。
+
+    预期：
+    - known_depth: (T, H, W) torch tensor，单位为米（m），由 --depth_path 加载
+    - args.external_geom_npz: NPZ 文件路径，至少包含：
+        - intrinsics: (T_ext, 3, 3)
+        - extrinsics: (T_ext, 4, 4)  # camera-to-world 或 world-to-camera 由上游约定
+
+    返回：
+    - video_ten: (T_use, 3, H, W) torch tensor，值域 [0,1]，仅做简单归一化，不做 VGGT 的 resize/crop
+    - depth_npy: (T_use, H, W) numpy array，单位米
+    - depth_conf: (T_use, H, W) numpy array，简单取 (depth>0) 作为置信度
+    - extrs_npy: (T_use, 4, 4) numpy array，直接来自外部 NPZ（按上游约定）
+    - intrs_npy: (T_use, 3, 3) numpy array
+    """
+
+    def __init__(self, args):
+        super().__init__(args)
+        geom_path = getattr(args, "external_geom_npz", None)
+        if geom_path is None:
+            raise ValueError(
+                "depth_pose_method='external' requires --external_geom_npz "
+                "pointing to an NPZ file with 'intrinsics' and 'extrinsics'."
+            )
+        if not os.path.exists(geom_path):
+            raise FileNotFoundError(
+                f"external_geom_npz not found: {geom_path}"
+            )
+
+        data = np.load(geom_path)
+        if "intrinsics" not in data or "extrinsics" not in data:
+            data.close()
+            raise KeyError(
+                f"external_geom_npz={geom_path} must contain 'intrinsics' and 'extrinsics' arrays."
+            )
+
+        self.intrs_npy_full = data["intrinsics"]  # (T_ext, 3, 3)
+        self.extrs_npy_full = data["extrinsics"]  # (T_ext, 4, 4)
+        data.close()
+
+    def __call__(self, video_tensor, known_depth=None, stationary_camera=False, replace_with_known_depth=True):
+        if known_depth is None:
+            raise ValueError(
+                "depth_pose_method='external' requires known_depth via --depth_path "
+                "(external depth)."
+            )
+
+        # video_tensor: (T, 3, H, W), 原始 0-255
+        if not isinstance(video_tensor, torch.Tensor):
+            video_tensor = torch.from_numpy(video_tensor)
+        video_ten = (video_tensor.float() / 255.0).to(self.device)  # (T, 3, H, W), [0,1]
+        T_vid = video_ten.shape[0]
+
+        # 外部深度：假定单位为米 (m)
+        if not isinstance(known_depth, torch.Tensor):
+            known_depth = torch.from_numpy(known_depth)
+        depth = known_depth.float().cpu().numpy()  # (T_depth, H, W)
+        T_depth = depth.shape[0]
+
+        T_ext = self.intrs_npy_full.shape[0]
+        T_ext2 = self.extrs_npy_full.shape[0]
+        if T_ext != T_ext2:
+            raise ValueError(
+                f"external_geom_npz intrinsics/extrinsics length mismatch: "
+                f"{T_ext} vs {T_ext2}"
+            )
+
+        # 取三者最短长度对齐时间维度
+        T_use = min(T_vid, T_depth, T_ext)
+        if T_use == 0:
+            raise ValueError(
+                f"depth_pose_method='external' got zero usable frames: "
+                f"T_vid={T_vid}, T_depth={T_depth}, T_ext={T_ext}"
+            )
+
+        if not (T_vid == T_depth == T_ext):
+            logger.warning(
+                f"[ExternalGeomWrapper] Time length mismatch: "
+                f"video={T_vid}, depth={T_depth}, geom={T_ext}; "
+                f"using first {T_use} frames."
+            )
+
+        video_ten = video_ten[:T_use]
+        depth = depth[:T_use]
+        intrs_npy = self.intrs_npy_full[:T_use]
+        extrs_npy = self.extrs_npy_full[:T_use]
+
+        depth_conf = (depth > 0).astype(np.float32)
+
+        if stationary_camera:
+            extrs_npy = np.repeat(extrs_npy[0:1], extrs_npy.shape[0], axis=0)
+
+        return video_ten, depth, depth_conf, extrs_npy, intrs_npy
+
+
 video_depth_pose_dict = {
     "vggt4": VGGT4Wrapper,
+    "external": ExternalGeomWrapper,
 }

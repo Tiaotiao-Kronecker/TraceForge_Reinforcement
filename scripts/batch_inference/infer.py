@@ -43,6 +43,12 @@ def parse_args():
         "--checkpoint", type=str, default="./checkpoints/tapip3d_final.pth"
     )
     parser.add_argument('--depth_pose_method', type=str, default='vggt4', choices=video_depth_pose_dict.keys())
+    parser.add_argument(
+        "--external_geom_npz",
+        type=str,
+        default=None,
+        help="When depth_pose_method='external', path to NPZ with external intrinsics (T,3,3) and extrinsics (T,4,4).",
+    )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num_iters", type=int, default=6)
     parser.add_argument("--fps", type=int, default=1)
@@ -480,7 +486,11 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
     )
 
     # Keep depth_conf for visualization NPZ
-    depth_conf_npy = depth_conf.squeeze().cpu().numpy()
+    # VGGT wrapper 返回的是 torch.Tensor，而 ExternalGeomWrapper 返回的是 numpy.ndarray
+    if isinstance(depth_conf, torch.Tensor):
+        depth_conf_npy = depth_conf.squeeze().cpu().numpy()
+    else:
+        depth_conf_npy = np.asarray(depth_conf).squeeze()
 
     frame_H, frame_W = video_ten.shape[-2:]
 
