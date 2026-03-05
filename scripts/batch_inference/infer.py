@@ -47,7 +47,13 @@ def parse_args():
         "--external_geom_npz",
         type=str,
         default=None,
-        help="When depth_pose_method='external', path to NPZ with external intrinsics (T,3,3) and extrinsics (T,4,4).",
+        help="When depth_pose_method='external', path to NPZ/H5 with external intrinsics and extrinsics.",
+    )
+    parser.add_argument(
+        "--camera_name",
+        type=str,
+        default="hand_camera",
+        help="Camera name for H5 file (e.g., hand_camera, varied_camera_1). Used with depth_pose_method='external'.",
     )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num_iters", type=int, default=6)
@@ -221,6 +227,106 @@ def retarget_trajectories(
     retargeted[:, :L, :] = samples_out
     valid_mask[:L] = True
     return retargeted, valid_mask
+
+def save_single_query_frame(
+    video_name,
+    output_dir,
+    query_frame_idx,
+    frame_data,
+    future_len: int,
+    grid_size: int,
+):
+    """Save single query frame result"""
+    video_output_dir = os.path.join(output_dir, video_name)
+    images_dir = os.path.join(video_output_dir, "images")
+    depth_dir = os.path.join(video_output_dir, "depth")
+    samples_dir = os.path.join(video_output_dir, "samples")
+
+    for dir_path in [images_dir, depth_dir, samples_dir]:
+        os.makedirs(dir_path, exist_ok=True)
+
+    coords_np = frame_data["coords"].cpu().numpy()
+    visibs_np = frame_data["visibs"].cpu().numpy()
+    video_segment = frame_data["video_segment"].cpu().numpy() * 255
+    video_segment = video_segment.astype(np.uint8).transpose(0, 2, 3, 1)
+    intrinsics_np = frame_data["intrinsics_segment"].cpu().numpy()
+    extrinsics_np = frame_data["extrinsics_segment"].cpu().numpy()
+
+    frame_h, frame_w = video_segment.shape[1:3]
+    y_coords = np.linspace(0, frame_h - 1, grid_size)
+    x_coords = np.linspace(0, frame_w - 1, grid_size)
+    xx, yy = np.meshgrid(x_coords, y_coords)
+    keypoints = np.stack([xx.flatten(), yy.flatten()], axis=1)
+
+    sample_data = {
+        "image_path": np.array([f"images/{video_name}_{query_frame_idx}.png"], dtype="<U50"),
+        "frame_index": np.array([query_frame_idx]),
+        "keypoints": keypoints.astype(np.float32),
+    }
+
+    camera_views_segment = []
+    for t in range(len(intrinsics_np)):
+        camera_views_segment.append({
+            "c2w": np.linalg.inv(extrinsics_np[t]),
+            "K": intrinsics_np[t],
+            "height": frame_h,
+            "width": frame_w,
+        })
+
+    fixed_camera_view = camera_views_segment[0]
+    coords_3d_for_projection = coords_np
+
+    try:
+        tracks2d_fixed = project_tracks_3d_to_2d(
+            tracks3d=coords_3d_for_projection,
+            camera_views=[fixed_camera_view] * len(coords_3d_for_projection),
+        )
+        tracks3d_fixed = project_tracks_3d_to_3d(
+            tracks3d=coords_3d_for_projection,
+            camera_views=[fixed_camera_view] * len(coords_3d_for_projection),
+        )
+        sample_data["traj_2d"] = tracks2d_fixed.transpose(1, 0, 2).astype(np.float32)
+        sample_data["traj"] = tracks3d_fixed.transpose(1, 0, 2).astype(np.float32)
+    except Exception as e:
+        logger.error(f"Error projecting tracks for frame {query_frame_idx}: {e}")
+        sample_data["traj_2d"] = coords_np[:, :, :2].transpose(1, 0, 2).astype(np.float32)
+        sample_data["traj"] = coords_np.transpose(1, 0, 2).astype(np.float32)
+
+    query_frame_img = video_segment[0]
+    query_frame_depth = frame_data["depths_segment"].cpu().numpy()[0]
+
+    img_filename = f"{video_name}_{query_frame_idx}.png"
+    img_path = os.path.join(images_dir, img_filename)
+    Image.fromarray(query_frame_img).save(img_path)
+
+    depth_filename = f"{video_name}_{query_frame_idx}.png"
+    depth_path = os.path.join(depth_dir, depth_filename)
+    depth_valid = query_frame_depth[query_frame_depth > 0]
+    if len(depth_valid) > 0:
+        depth_min = depth_valid.min()
+        depth_max = depth_valid.max()
+        if depth_max > depth_min:
+            depth_normalized = ((query_frame_depth - depth_min) / (depth_max - depth_min) * 65535.0).clip(0, 65535).astype(np.uint16)
+        else:
+            depth_normalized = np.full_like(query_frame_depth, 32767, dtype=np.uint16)
+    else:
+        depth_normalized = np.zeros_like(query_frame_depth, dtype=np.uint16)
+    Image.fromarray(depth_normalized, mode="I;16").save(depth_path)
+
+    depth_raw_filename = f"{video_name}_{query_frame_idx}_raw.npz"
+    depth_raw_path = os.path.join(depth_dir, depth_raw_filename)
+    np.savez(depth_raw_path, depth=query_frame_depth)
+
+    retargeted, valid_mask = retarget_trajectories(sample_data["traj"], max_length=future_len)
+    sample_data["traj"] = retargeted
+    sample_data["valid_steps"] = valid_mask
+
+    sample_filename = f"{video_name}_{query_frame_idx}.npz"
+    sample_path = os.path.join(samples_dir, sample_filename)
+    np.savez(sample_path, **sample_data)
+
+    logger.info(f"Saved query frame {query_frame_idx}")
+
 
 def save_structured_data(
     video_name,
@@ -421,7 +527,7 @@ def save_structured_data(
         logger.info(f"Saved {saved_count} frames")
 
 
-def process_single_video(video_path, depth_path, args, model_3dtracker, model_depth_pose):
+def process_single_video(video_path, depth_path, args, model_3dtracker, model_depth_pose, video_name=None, output_dir=None):
     """Process a single video and return the processed data"""
     logger.info(f"Processing video: {video_path}")
 
@@ -614,20 +720,31 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
                 f"Query frame {start_frame}: Expected {expected_trajectories} trajectories, got {coords_seg.shape[1]}"
             )
 
-        # Store results for this query frame
+        # Store results for this query frame (move to CPU to avoid GPU memory accumulation)
         query_frame_results[start_frame] = {
-            "coords": coords_seg,  # Shape: (T, grid_size*grid_size, 3)
-            "visibs": visibs_seg,  # Shape: (T, grid_size*grid_size)
-            "video_segment": video,
-            "depths_segment": depths,
-            "intrinsics_segment": intrinsics,
-            "extrinsics_segment": extrinsics,
+            "coords": coords_seg.cpu(),  # Shape: (T, grid_size*grid_size, 3)
+            "visibs": visibs_seg.cpu(),  # Shape: (T, grid_size*grid_size)
+            "video_segment": video.cpu(),
+            "depths_segment": depths.cpu(),
+            "intrinsics_segment": intrinsics.cpu(),
+            "extrinsics_segment": extrinsics.cpu(),
         }
 
         logger.info(
             f"Query frame {start_frame}: tracked {coords_seg.shape[1]} trajectories for {coords_seg.shape[0]} frames"
         )
-        
+
+        # Save immediately after processing each query frame
+        if video_name is not None and output_dir is not None:
+            save_single_query_frame(
+                video_name=video_name,
+                output_dir=output_dir,
+                query_frame_idx=start_frame,
+                frame_data=query_frame_results[start_frame],
+                future_len=args.future_len,
+                grid_size=args.grid_size,
+            )
+
         # Clear cache after inference to free memory
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -775,7 +892,7 @@ def load_video_and_mask(video_path, mask_dir=None, fps=1, max_num_frames=384, is
 
     if os.path.isdir(video_path):
         # RGB 支持 jpg/jpeg/png；深度图通常为 png，统一用同一排序逻辑保证与 RGB 逐帧对齐
-        exts = ["jpg", "jpeg", "png"] if not is_depth else ["png", "jpg", "jpeg"]
+        exts = ["jpg", "jpeg", "png"] if not is_depth else ["npy", "png", "jpg", "jpeg"]
         img_files = _collect_and_sort_frame_files(video_path, exts)
 
         # IMPORTANT: Subsample the file list BEFORE loading to save memory
@@ -783,15 +900,20 @@ def load_video_and_mask(video_path, mask_dir=None, fps=1, max_num_frames=384, is
 
         video_tensor = []
         for img_file in tqdm.tqdm(img_files, desc="Loading images" if not is_depth else "Loading depth"):
-            img = Image.open(img_file)
             if is_depth:
-                img = img.convert("I;16")  # 16-bit grayscale for depth
-                # Convert depth from millimeters to meters
-                # 16-bit PNG depth images typically store depth in millimeters
-                # Model outputs depth in meters, so we need to convert mm to m
-                depth_array = np.array(img).astype(np.float32) / 1000.0
-                video_tensor.append(torch.from_numpy(depth_array))
+                # 支持 .npy 和 .png 两种深度格式
+                if img_file.endswith('.npy'):
+                    # .npy 格式：直接加载，假定单位已经是米 (m)
+                    depth_array = np.load(img_file).astype(np.float32)
+                    video_tensor.append(torch.from_numpy(depth_array))
+                else:
+                    # .png 格式：从 16-bit PNG 加载，单位为毫米 (mm)，转换为米 (m)
+                    img = Image.open(img_file)
+                    img = img.convert("I;16")
+                    depth_array = np.array(img).astype(np.float32) / 1000.0
+                    video_tensor.append(torch.from_numpy(depth_array))
             else:
+                img = Image.open(img_file)
                 img = img.convert("RGB")
                 video_tensor.append(
                     torch.from_numpy(np.array(img)).float()
@@ -959,7 +1081,11 @@ if __name__ == "__main__":
 
     # Process each video
     for video_path, depth_path in zip(video_folders, depth_folders):
-        video_name = os.path.basename(video_path.rstrip("/"))
+        # 使用 camera_name 作为输出目录名（external 模式）
+        if args.depth_pose_method == 'external' and hasattr(args, 'camera_name'):
+            video_name = args.camera_name
+        else:
+            video_name = os.path.basename(video_path.rstrip("/"))
 
         # Check if output already exists and skip if requested
         if args.skip_existing:
@@ -1009,7 +1135,7 @@ if __name__ == "__main__":
                 torch.cuda.empty_cache()
             
             # Process video
-            result = process_single_video(video_path, depth_path, args, model_3dtracker, model_depth_pose)
+            result = process_single_video(video_path, depth_path, args, model_3dtracker, model_depth_pose, video_name, out_dir)
 
             # Save structured data
             save_structured_data(

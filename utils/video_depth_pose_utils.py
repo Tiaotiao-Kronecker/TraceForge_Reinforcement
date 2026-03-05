@@ -175,23 +175,39 @@ class ExternalGeomWrapper(BaseVideoDepthPoseWrapper):
         if geom_path is None:
             raise ValueError(
                 "depth_pose_method='external' requires --external_geom_npz "
-                "pointing to an NPZ file with 'intrinsics' and 'extrinsics'."
+                "pointing to an NPZ or H5 file with intrinsics and extrinsics."
             )
         if not os.path.exists(geom_path):
             raise FileNotFoundError(
                 f"external_geom_npz not found: {geom_path}"
             )
 
-        data = np.load(geom_path)
-        if "intrinsics" not in data or "extrinsics" not in data:
+        # 检测文件类型并加载
+        if geom_path.endswith('.h5'):
+            # H5 文件：从 trajectory_valid.h5 读取
+            import h5py
+            camera_name = getattr(args, "camera_name", "hand_camera")
+            with h5py.File(geom_path, 'r') as f:
+                intr_key = f"observation/camera/intrinsics/{camera_name}_left"
+                extr_key = f"observation/camera/extrinsics/{camera_name}_left"
+                if intr_key not in f or extr_key not in f:
+                    raise KeyError(
+                        f"H5 file must contain '{intr_key}' and '{extr_key}'. "
+                        f"Available cameras: {list(f['observation/camera/intrinsics'].keys())}"
+                    )
+                self.intrs_npy_full = f[intr_key][:].astype(np.float32)  # (T, 3, 3)
+                self.extrs_npy_full = f[extr_key][:].astype(np.float32)  # (T, 4, 4)
+        else:
+            # NPZ 文件：保持原有逻辑
+            data = np.load(geom_path)
+            if "intrinsics" not in data or "extrinsics" not in data:
+                data.close()
+                raise KeyError(
+                    f"NPZ file must contain 'intrinsics' and 'extrinsics' arrays."
+                )
+            self.intrs_npy_full = data["intrinsics"]  # (T_ext, 3, 3)
+            self.extrs_npy_full = data["extrinsics"]  # (T_ext, 4, 4)
             data.close()
-            raise KeyError(
-                f"external_geom_npz={geom_path} must contain 'intrinsics' and 'extrinsics' arrays."
-            )
-
-        self.intrs_npy_full = data["intrinsics"]  # (T_ext, 3, 3)
-        self.extrs_npy_full = data["extrinsics"]  # (T_ext, 4, 4)
-        data.close()
 
     def __call__(self, video_tensor, known_depth=None, stationary_camera=False, replace_with_known_depth=True):
         if known_depth is None:
@@ -200,10 +216,10 @@ class ExternalGeomWrapper(BaseVideoDepthPoseWrapper):
                 "(external depth)."
             )
 
-        # video_tensor: (T, 3, H, W), 原始 0-255
+        # video_tensor: (T, 3, H, W), 已归一化到 [0,1] (load_video_and_mask 已处理)
         if not isinstance(video_tensor, torch.Tensor):
             video_tensor = torch.from_numpy(video_tensor)
-        video_ten = (video_tensor.float() / 255.0).to(self.device)  # (T, 3, H, W), [0,1]
+        video_ten = video_tensor.float().to(self.device)  # (T, 3, H, W), [0,1]
         T_vid = video_ten.shape[0]
 
         # 外部深度：假定单位为米 (m)
