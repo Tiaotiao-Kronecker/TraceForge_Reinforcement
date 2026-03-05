@@ -398,14 +398,17 @@ def save_structured_data(
                 depth_raw_path = os.path.join(depth_dir, depth_raw_filename)
                 np.savez(depth_raw_path, depth=query_frame_depth)
             
-            retargeted, valid_mask = retarget_trajectories(sample_data["traj"], max_length=args.future_len)
-            sample_data["traj"] = retargeted
-            sample_data["valid_steps"] = valid_mask
+            # 在 depth_only 模式下仍然生成 RGB/depth 图像，但不保存 keypoint 轨迹的 sample NPZ
+            depth_only_mode = getattr(args, "depth_only", False)
+            if not depth_only_mode:
+                retargeted, valid_mask = retarget_trajectories(sample_data["traj"], max_length=args.future_len)
+                sample_data["traj"] = retargeted
+                sample_data["valid_steps"] = valid_mask
 
-            # Save sample NPZ for this query frame
-            sample_filename = f"{video_name}_{query_frame_idx}.npz"
-            sample_path = os.path.join(samples_dir, sample_filename)
-            np.savez(sample_path, **sample_data)
+                # Save sample NPZ for this query frame
+                sample_filename = f"{video_name}_{query_frame_idx}.npz"
+                sample_path = os.path.join(samples_dir, sample_filename)
+                np.savez(sample_path, **sample_data)
 
             logger.info(
                 f"Saved query frame {query_frame_idx} with {grid_size * grid_size} trajectories tracked for {actual_frames} frames"

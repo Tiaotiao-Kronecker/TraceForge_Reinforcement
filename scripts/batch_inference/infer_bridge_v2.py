@@ -144,6 +144,11 @@ def parse_args():
         default=None,
         help="只处理指定轨迹 ID（如 05798），用于单条对比或重跑",
     )
+    parser.add_argument(
+        "--depth_only",
+        action="store_true",
+        help="仅输出深度相关结果（RGB/深度/位姿），不生成 keypoint 轨迹及 samples/*.npz",
+    )
     return parser.parse_args()
 
 
@@ -260,7 +265,9 @@ def run_traj(
             continue
 
         out_dir_str = str(out_traj_dir)
-        # save_structured_data 内部使用 args.future_len，需注入
+
+        # 始终调用 infer.save_structured_data 以生成 RGB / 深度 PNG 等；
+        # 在 depth_only 模式下，内部会跳过 samples/*.npz 与轨迹相关字段的写入。
         infer.args = args
         infer.save_structured_data(
             video_name=camera_name,
@@ -281,16 +288,19 @@ def run_traj(
         )
 
         video_dir = os.path.join(out_dir_str, camera_name)
+        os.makedirs(video_dir, exist_ok=True)
+        # 传统可视化 NPZ：始终保留深度/位姿信息；在 depth_only 模式下不再写入 coords/visibs
         data_npz_load = {
-            "coords": result["coords"].cpu().numpy(),
             "extrinsics": result["full_extrinsics"].cpu().numpy(),
             "intrinsics": result["full_intrinsics"].cpu().numpy(),
             "height": result["video_tensor"].shape[-2],
             "width": result["video_tensor"].shape[-1],
             "depths": result["depths"].cpu().numpy().astype(np.float16),
             "unc_metric": result["depth_conf"].astype(np.float16),
-            "visibs": result["visibs"][..., None].cpu().numpy(),
         }
+        if not getattr(args, "depth_only", False):
+            data_npz_load["coords"] = result["coords"].cpu().numpy()
+            data_npz_load["visibs"] = result["visibs"][..., None].cpu().numpy()
         if args.save_video:
             data_npz_load["video"] = result["video_tensor"].cpu().numpy()
         save_path = os.path.join(video_dir, camera_name + ".npz")

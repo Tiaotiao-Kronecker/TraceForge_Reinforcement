@@ -89,10 +89,29 @@ def load_main_npz_for_dense(main_npz_path, downsample=4):
     from PIL import Image
 
     data = np.load(main_npz_path)
-    coords = data["coords"]  # (T, N, 3)
-    depths = data["depths"].astype(np.float32)  # (T, H, W)
-    intrinsics = data["intrinsics"]  # (T, 3, 3)
-    extrinsics = data["extrinsics"]  # (T, 4, 4) w2c
+    coords = data["coords"]        # (T_coords, N, 3)
+    depths = data["depths"].astype(np.float32)  # (T_depth, H, W)
+    intrinsics = data["intrinsics"]            # (T_intr, 3, 3)
+    extrinsics = data["extrinsics"]            # (T_extr, 4, 4) w2c
+
+    # 有些推理配置下（长视频 + future_len 限制），coords/depths 只覆盖首段，
+    # 而 full_intrinsics/full_extrinsics 覆盖整段视频，导致时间维度不一致。
+    # 这里统一按最短的 T 对齐，避免反投影时报 batch 维度不匹配。
+    T_coords = coords.shape[0]
+    T_depths = depths.shape[0]
+    T_intr = intrinsics.shape[0]
+    T_extr = extrinsics.shape[0]
+    T = min(T_coords, T_depths, T_intr, T_extr)
+    if not (T_coords == T_depths == T_intr == T_extr):
+        logger.warning(
+            f"[load_main_npz_for_dense] Time length mismatch: "
+            f"coords={T_coords}, depths={T_depths}, intr={T_intr}, extr={T_extr}; "
+            f"using first {T} frames for dense pointcloud."
+        )
+        coords = coords[:T]
+        depths = depths[:T]
+        intrinsics = intrinsics[:T]
+        extrinsics = extrinsics[:T]
 
     T, N, _ = coords.shape
     H, W = depths.shape[1], depths.shape[2]

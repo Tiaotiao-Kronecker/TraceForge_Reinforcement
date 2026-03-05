@@ -136,6 +136,8 @@ def process_single_traj(traj_id, args, bridge_v2_script, gpu_ids, traj_index, to
         cmd.append("--skip_existing")
     if getattr(args, "grid_size", None) is not None:
         cmd.extend(["--grid_size", str(args.grid_size)])
+    if getattr(args, "depth_only", False):
+        cmd.append("--depth_only")
 
     env = os.environ.copy()
     env["PYTHONPATH"] = _project_root + (os.pathsep + env.get("PYTHONPATH", "")) if env.get("PYTHONPATH") else _project_root
@@ -178,6 +180,9 @@ def main():
     parser.add_argument("--gpu_id", type=str, default=None, help="如 0,1,2,3")
     parser.add_argument("--max_workers", type=int, default=None, help="并行数，默认等于 GPU 数")
     parser.add_argument("--no_parallel", action="store_true", help="串行执行")
+    parser.add_argument("--depth_only", action="store_true", help="仅输出深度相关结果（RGB/深度/位姿），不生成 keypoint 轨迹及 samples/*.npz")
+    parser.add_argument("--scene_group_size", type=int, default=None, help="按轨迹排序后，每 scene_group_size 条视为一个场景")
+    parser.add_argument("--scene_skip_groups", type=int, default=0, help="跳过前多少个场景组（与 scene_group_size 联用）")
     args = parser.parse_args()
 
     base_path = Path(args.base_path).resolve()
@@ -188,11 +193,28 @@ def main():
     if not trajs:
         print(f"未找到 BridgeV2 轨迹: {base_path}")
         return
+    # 按名称排序保证分组稳定
+    trajs = sorted(trajs, key=lambda p: p.name)
     traj_ids = [d.name for d in trajs]
     total_count = len(traj_ids)
     if getattr(args, "start_after", None):
         traj_ids = [t for t in traj_ids if t > args.start_after]
         print(f"续跑：从 {args.start_after} 之后开始，共 {len(traj_ids)} 条待处理（总 {total_count} 条）")
+
+    # 按“每 N 条为一组场景，只取每组第一个”的方式筛选轨迹，
+    # 例如 scene_group_size=5, scene_skip_groups=1 → 从第 2 组开始，每组只取第 1 条。
+    if getattr(args, "scene_group_size", None) is not None and args.scene_group_size > 0:
+        g = args.scene_group_size
+        skip_g = max(0, int(args.scene_skip_groups))
+        selected = []
+        for idx, tid in enumerate(traj_ids):
+            group_idx = idx // g
+            if group_idx < skip_g:
+                continue
+            if idx % g == 0:
+                selected.append(tid)
+        print(f"按 scene_group_size={g}, scene_skip_groups={skip_g} 过滤后，将处理 {len(selected)} 条轨迹（原始 {len(traj_ids)} 条）")
+        traj_ids = selected
     if args.max_trajs is not None and args.max_trajs > 0:
         traj_ids = traj_ids[: args.max_trajs]
         print(f"限制处理前 {len(traj_ids)} 条")
