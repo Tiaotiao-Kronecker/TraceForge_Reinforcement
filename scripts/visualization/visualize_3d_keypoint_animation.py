@@ -94,6 +94,24 @@ def load_main_npz_for_dense(main_npz_path, downsample=4):
     intrinsics = data["intrinsics"]  # (T, 3, 3)
     extrinsics = data["extrinsics"]  # (T, 4, 4) w2c
 
+    # 检查时间维度是否一致
+    T_coords = coords.shape[0]
+    T_depths = depths.shape[0]
+    T_intr = intrinsics.shape[0]
+    T_extr = extrinsics.shape[0]
+    T = min(T_coords, T_depths, T_intr, T_extr)
+
+    if not (T_coords == T_depths == T_intr == T_extr):
+        logger.warning(
+            f"[load_main_npz_for_dense] Time length mismatch: "
+            f"coords={T_coords}, depths={T_depths}, intr={T_intr}, extr={T_extr}; "
+            f"using first {T} frames for dense pointcloud."
+        )
+        coords = coords[:T]
+        depths = depths[:T]
+        intrinsics = intrinsics[:T]
+        extrinsics = extrinsics[:T]
+
     T, N, _ = coords.shape
     H, W = depths.shape[1], depths.shape[2]
     c2w = np.linalg.inv(extrinsics)  # (T, 4, 4)
