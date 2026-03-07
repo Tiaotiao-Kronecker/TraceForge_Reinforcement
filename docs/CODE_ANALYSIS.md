@@ -1,7 +1,7 @@
 # TraceForge 代码架构分析
 
 > 版本：external-geom-20260305 分支
-> 更新时间：2026-03-05
+> 更新时间：2026-03-07
 
 ## 一、核心功能与数据流
 
@@ -271,3 +271,91 @@ python scripts/batch_inference/infer.py \
 **修改完成时间：** 2026-03-06  
 **修改内容：** 支持 .npy 深度文件 + H5 内外参读取
 
+
+## 六、自定义修改记录（2026-03-07）
+
+### 6.1 DROID 批处理脚本分流：纯 VGGT 与 external 分离
+
+**新增/调整脚本：**
+- `scripts/batch_inference/batch_droid.py`：默认纯 VGGT 流程（仅 RGB），不再传入 `--depth_path` / `--external_geom_npz`
+- `scripts/batch_inference/batch_droid_external.py`：external 几何直通（外部深度 + 内外参）
+
+**关键变化：**
+1. 数据集扫描逻辑调整  
+   - 纯 VGGT 脚本只要求 `rgb_stereo_valid` 可用
+   - external 脚本要求 RGB + depth + 外部几何（NPZ/H5）同时可用
+2. DROID 相机目录兼容  
+   - 允许直接传相机目录；若根目录无帧，自动回退读取 `left/`
+3. 批处理稳定性增强  
+   - 新增 `--task_timeout`、`--only_incomplete`
+   - 每相机日志输出到 `trajectory/_logs/*.log`
+   - 单 GPU 单 worker 串行，避免单卡并发过载
+
+
+### 6.2 infer.py 参数语义与输出命名更新
+
+**文件：** `scripts/batch_inference/infer.py`
+
+**关键变化：**
+1. `--video_name` 新参数  
+   - 显式控制输出目录/文件名前缀
+2. 输出命名优先级  
+   - `--video_name` > `--camera_name`(当提供 `--external_geom_npz`) > 输入路径名
+3. `--external_geom_npz` 语义扩展  
+   - `depth_pose_method=external`：使用外部内外参并跳过 VGGT
+   - `depth_pose_method=vggt4`：仅用外部外参替换 VGGT 外参（深度仍由 VGGT 估计）
+4. 帧对齐增强  
+   - 外部内外参按 stride 同步抽帧，避免与 RGB/Depth 采样错位
+   - `original_filenames` 与有效帧数不一致时自动截断对齐
+5. 失败治理  
+   - 批量模式统计失败视频数；若存在失败，进程以非零退出码结束（`sys.exit(1)`）
+
+
+### 6.3 video_depth_pose_utils.py 深度位姿封装更新
+
+**文件：** `utils/video_depth_pose_utils.py`
+
+**关键变化：**
+1. 新增外部几何加载函数  
+   - `_load_external_extrinsics()`：读取外部外参（NPZ/H5）
+   - `_load_external_geom()`：读取外部内外参（NPZ/H5）
+2. `VGGT4Wrapper` 支持“外部外参替换”  
+   - 在 VGGT 深度估计保留的前提下，用外部外参替换模型外参
+   - 自动处理帧数不一致（截断到可用长度）
+3. `ExternalGeomWrapper` 重构  
+   - 统一复用 `_load_external_geom()`
+   - 时间维自动对齐到 `min(video, depth, geom)`
+   - 输入未归一化时自动缩放到 `[0, 1]`
+
+
+### 6.4 可视化帧数对齐修复
+
+**文件：** `scripts/visualization/visualize_3d_keypoint_animation.py`
+
+**修改：**
+- 在重建稠密点云前，将 `intrinsics` / `extrinsics` 截断到 `coords` 的时间长度 `T`
+- 避免相机参数帧数长于轨迹帧数时的索引错位
+
+
+### 6.5 当前推荐使用方式（DROID）
+
+**纯 VGGT（仅 RGB）：**
+```bash
+python scripts/batch_inference/batch_droid.py \
+  --base_path /path/to/droid_raw \
+  --gpu_id 0,1,2,3 \
+  --grid_size 80 \
+  --frame_drop_rate 5 \
+  --only_incomplete
+```
+
+**external 几何直通（RGB + 深度 + 外部几何）：**
+```bash
+python scripts/batch_inference/batch_droid_external.py \
+  --base_path /path/to/droid_raw \
+  --gpu_id 0,1,2,3 \
+  --grid_size 80 \
+  --frame_drop_rate 5 \
+  --geom_source auto \
+  --only_incomplete
+```

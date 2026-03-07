@@ -1,23 +1,14 @@
 #!/usr/bin/env python3
 """
-DROID数据集批量推理脚本：处理多个数据集，每个数据集3个相机，使用多GPU并行
+DROID 数据集批量推理（外部几何直通版）：
+使用外部深度 + 外部内外参，跳过 VGGT，并支持多 GPU 均匀负载。
 
 用法:
-    python scripts/batch_inference/batch_droid.py \
+    python scripts/batch_inference/batch_droid_external.py \
         --base_path /home/zoyo/projects/droid_preprocess_pipeline/droid_raw \
         --gpu_id 0,1,2,3,4,5,6,7 \
         --frame_drop_rate 5 \
         --grid_size 80
-
-    测试（只跑前2个数据集）:
-    python scripts/batch_inference/batch_droid.py \
-        --base_path /home/zoyo/projects/droid_preprocess_pipeline/droid_raw \
-        --gpu_id 0,1 \
-        --max_datasets 2 \
-        --frame_drop_rate 300
-
-说明:
-    该脚本默认走 TraceForge 的纯 VGGT 流程（仅 RGB），不再传入外部深度或外参。
 """
 
 import os
@@ -35,21 +26,47 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 CAMERAS = ["hand_camera", "varied_camera_1", "varied_camera_2"]
-FRAME_EXTS = ("*.jpg", "*.jpeg", "*.png")
+RGB_EXTS = ("*.jpg", "*.jpeg", "*.png")
+DEPTH_EXTS = ("*.npy", "*.png", "*.jpg", "*.jpeg")
 
 
-def has_frame_files(dir_path: Path) -> bool:
-    """检查目录下是否有图像帧文件。"""
+def has_files(dir_path: Path, patterns) -> bool:
+    """检查目录下是否存在匹配文件。"""
     if not dir_path.is_dir():
         return False
-    for pattern in FRAME_EXTS:
+    for pattern in patterns:
         if any(dir_path.glob(pattern)):
             return True
     return False
 
 
-def find_droid_datasets(base_path):
-    """扫描DROID数据集目录，返回有效数据集列表"""
+def resolve_geom_path(dataset_path: Path, camera_name: str, geom_source: str) -> Path | None:
+    npz_path = dataset_path / f"external_geom_{camera_name}_left.npz"
+    h5_path = dataset_path / "trajectory_valid.h5"
+
+    if geom_source == "npz":
+        return npz_path if npz_path.exists() else None
+    if geom_source == "h5":
+        return h5_path if h5_path.exists() else None
+    if npz_path.exists():
+        return npz_path
+    if h5_path.exists():
+        return h5_path
+    return None
+
+
+def resolve_depth_path(dataset_path: Path, camera_name: str) -> Path:
+    depth_nested = dataset_path / "depth" / camera_name / "depth"
+    depth_flat = dataset_path / "depth" / camera_name
+    if has_files(depth_nested, DEPTH_EXTS):
+        return depth_nested
+    if has_files(depth_flat, DEPTH_EXTS):
+        return depth_flat
+    return depth_nested
+
+
+def find_droid_datasets(base_path, geom_source):
+    """扫描 DROID 数据集目录，返回有效数据集列表。"""
     base = Path(base_path).resolve()
     if not base.is_dir():
         return []
@@ -59,16 +76,19 @@ def find_droid_datasets(base_path):
         if not d.is_dir():
             continue
 
-        # 纯VGGT流程只要求RGB目录结构存在
-        rgb_dir = d / "rgb_stereo_valid"
-        if not rgb_dir.is_dir():
+        rgb_root = d / "rgb_stereo_valid"
+        depth_root = d / "depth"
+        if not rgb_root.is_dir() or not depth_root.is_dir():
             continue
 
-        # 检查是否至少有一个相机的数据
         has_camera = False
         for cam in CAMERAS:
-            cam_root = rgb_dir / cam
-            if has_frame_files(cam_root) or has_frame_files(cam_root / "left"):
+            video_path = rgb_root / cam
+            depth_path = resolve_depth_path(d, cam)
+            geom_path = resolve_geom_path(d, cam, geom_source)
+            has_rgb = has_files(video_path, RGB_EXTS) or has_files(video_path / "left", RGB_EXTS)
+            has_depth = has_files(depth_path, DEPTH_EXTS)
+            if has_rgb and has_depth and geom_path is not None:
                 has_camera = True
                 break
 
@@ -96,42 +116,44 @@ def is_camera_output_complete(dataset_path: Path, camera_name: str) -> bool:
 
 
 def process_single_camera(dataset_path, camera_name, args, gpu_id, task_index, total_tasks, print_lock):
-    """处理单个数据集的单个相机"""
+    """处理单个数据集的单个相机。"""
     dataset_name = dataset_path.name
     task_name = f"{dataset_name}/{camera_name}"
 
     with print_lock:
         print(f"[{task_index}/{total_tasks}] 开始 {task_name} (GPU {gpu_id})")
 
-    # 构建路径
-    # 传相机目录本身；infer.py 内部会在必要时自动回退到 left 子目录读取帧
     video_path = dataset_path / "rgb_stereo_valid" / camera_name
+    depth_path = resolve_depth_path(dataset_path, camera_name)
+    geom_path = resolve_geom_path(dataset_path, camera_name, args.geom_source)
     trajectory_root = dataset_path / "trajectory"
     camera_out_dir = trajectory_root / camera_name
     logs_dir = trajectory_root / "_logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
-    task_log = logs_dir / f"{camera_name}.log"
+    task_log = logs_dir / f"{camera_name}_external.log"
 
-    # 检查路径是否存在
-    if (not video_path.is_dir()) or (not has_frame_files(video_path) and not has_frame_files(video_path / "left")):
+    has_rgb = has_files(video_path, RGB_EXTS) or has_files(video_path / "left", RGB_EXTS)
+    has_depth = has_files(depth_path, DEPTH_EXTS)
+    if (not has_rgb) or (not has_depth) or geom_path is None:
         with print_lock:
-            print(f"⚠️  [{task_index}/{total_tasks}] {task_name} 跳过（路径不存在）")
-        return (True, task_name, 0, None)  # 标记为成功但跳过
+            print(f"⚠️  [{task_index}/{total_tasks}] {task_name} 跳过（缺少 RGB/深度/外部几何）")
+        return (True, task_name, 0, None)
 
-    # 覆盖旧结果：每个相机目录单独清理
     if camera_out_dir.exists():
         shutil.rmtree(camera_out_dir)
     camera_out_dir.parent.mkdir(parents=True, exist_ok=True)
 
-    # Python路径
     python_bin = "/usr/local/miniconda3/envs/traceforge/bin/python"
     if not os.path.exists(python_bin):
         python_bin = sys.executable
 
-    # 构建命令
     infer_script = os.path.join(_project_root, "scripts/batch_inference/infer.py")
     cmd = [
         python_bin, infer_script,
+        "--depth_pose_method", "external",
+        "--external_geom_npz", str(geom_path),
+        "--camera_name", camera_name,
+        "--depth_path", str(depth_path),
         "--video_path", str(video_path),
         "--video_name", camera_name,
         "--out_dir", str(trajectory_root),
@@ -140,7 +162,6 @@ def process_single_camera(dataset_path, camera_name, args, gpu_id, task_index, t
         "--grid_size", str(args.grid_size),
     ]
 
-    # 环境变量
     env = os.environ.copy()
     env["PYTHONPATH"] = _project_root
     env["CUDA_HOME"] = "/usr/local/cuda-12.8"
@@ -203,8 +224,8 @@ def process_tasks_on_gpu(gpu_id, gpu_tasks, args, total_tasks, print_lock):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DROID数据集批量推理（多数据集×3相机）")
-    parser.add_argument("--base_path", type=str, required=True, help="DROID数据集根目录")
+    parser = argparse.ArgumentParser(description="DROID 批量推理（external 几何直通）")
+    parser.add_argument("--base_path", type=str, required=True, help="DROID 数据集根目录")
     parser.add_argument("--gpu_id", type=str, default="0,1,2,3,4,5,6,7", help="GPU IDs，如 0,1,2,3")
     parser.add_argument("--frame_drop_rate", type=int, default=5, help="帧间隔")
     parser.add_argument("--grid_size", type=int, default=80, help="网格大小")
@@ -212,6 +233,13 @@ def main():
     parser.add_argument("--max_workers", type=int, default=None, help="并行 worker 数，默认等于 GPU 数")
     parser.add_argument("--task_timeout", type=int, default=0, help="单任务超时秒数；<=0 表示不设超时")
     parser.add_argument("--only_incomplete", action="store_true", default=False, help="仅处理输出不完整的相机任务")
+    parser.add_argument(
+        "--geom_source",
+        type=str,
+        default="auto",
+        choices=["auto", "npz", "h5"],
+        help="外部几何来源：auto(优先 external_geom_*.npz, 回退 trajectory_valid.h5)",
+    )
     args = parser.parse_args()
 
     base_path = Path(args.base_path).resolve()
@@ -219,10 +247,9 @@ def main():
         print(f"错误：数据集目录不存在: {base_path}")
         return
 
-    # 扫描数据集
-    datasets = find_droid_datasets(base_path)
+    datasets = find_droid_datasets(base_path, args.geom_source)
     if not datasets:
-        print(f"未找到有效的DROID数据集: {base_path}")
+        print(f"未找到有效的 DROID 数据集: {base_path}")
         return
 
     if args.max_datasets is not None and args.max_datasets > 0:
@@ -231,7 +258,6 @@ def main():
 
     print(f"找到 {len(datasets)} 个数据集")
 
-    # 创建任务列表：(dataset_path, camera_name)
     tasks = []
     for dataset in datasets:
         for camera in CAMERAS:
@@ -244,7 +270,6 @@ def main():
         print("没有需要处理的任务（可能都已完整）")
         return
 
-    # GPU配置
     gpu_ids = [int(x.strip()) for x in args.gpu_id.split(",")]
     if not gpu_ids:
         print("错误：未提供有效 GPU ID")
@@ -260,7 +285,6 @@ def main():
     task_times = []
     start_time = time.time()
 
-    # 将任务按 worker GPU 轮转分配；每个 GPU worker 串行执行，避免单卡并发过载
     tasks_by_gpu = {gpu: [] for gpu in worker_gpus}
     for i, (dataset, camera) in enumerate(tasks, 1):
         gpu = worker_gpus[(i - 1) % len(worker_gpus)]

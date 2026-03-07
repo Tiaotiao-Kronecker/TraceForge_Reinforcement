@@ -114,6 +114,8 @@ def load_main_npz_for_dense(main_npz_path, downsample=4):
 
     T, N, _ = coords.shape
     H, W = depths.shape[1], depths.shape[2]
+    intrinsics = intrinsics[:T]  # 对齐到 T 帧
+    extrinsics = extrinsics[:T]  # 对齐到 T 帧
     c2w = np.linalg.inv(extrinsics)  # (T, 4, 4)
 
     # 加载 RGB：优先 NPZ 内 video，否则从 images 文件夹按帧加载

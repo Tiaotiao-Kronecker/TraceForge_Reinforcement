@@ -12,6 +12,7 @@ from rich import print
 import argparse
 from loguru import logger
 import json
+import sys
 
 from utils.video_depth_pose_utils import video_depth_pose_dict
 
@@ -47,18 +48,31 @@ def parse_args():
         "--external_geom_npz",
         type=str,
         default=None,
-        help="When depth_pose_method='external', path to NPZ/H5 with external intrinsics and extrinsics.",
+        help=(
+            "Path to NPZ/H5 with external geometry. "
+            "For --depth_pose_method external: uses external intrinsics+extrinsics and skips VGGT. "
+            "For --depth_pose_method vggt4: only replaces VGGT extrinsics."
+        ),
     )
     parser.add_argument(
         "--camera_name",
         type=str,
         default="hand_camera",
-        help="Camera name for H5 file (e.g., hand_camera, varied_camera_1). Used with depth_pose_method='external'.",
+        help=(
+            "Camera name for H5 file (e.g., hand_camera, varied_camera_1). "
+            "Used with --external_geom_npz."
+        ),
     )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num_iters", type=int, default=6)
     parser.add_argument("--fps", type=int, default=1)
     parser.add_argument("--out_dir", type=str, default="outputs")
+    parser.add_argument(
+        "--video_name",
+        type=str,
+        default=None,
+        help="Optional output video name override. If set, output folder/file names use this value.",
+    )
     parser.add_argument("--max_num_frames", type=int, default=384)
     parser.add_argument("--save_video", action="store_true", default=False)
     parser.add_argument(
@@ -581,6 +595,24 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
 
     video_length = len(video_tensor)
 
+    # 外部几何按 stride 采样对齐（外部几何通常是全量帧，需要和 RGB/深度同步）
+    _original_extrs = None
+    _original_intrs = None
+    if hasattr(model_depth_pose, 'external_extrs') and model_depth_pose.external_extrs is not None and stride > 1:
+        _original_extrs = model_depth_pose.external_extrs
+        model_depth_pose.external_extrs = _original_extrs[::stride]
+        logger.info(
+            f"外部外参按 stride={stride} 采样: "
+            f"{_original_extrs.shape[0]} -> {model_depth_pose.external_extrs.shape[0]} 帧"
+        )
+    if hasattr(model_depth_pose, 'external_intrs') and model_depth_pose.external_intrs is not None and stride > 1:
+        _original_intrs = model_depth_pose.external_intrs
+        model_depth_pose.external_intrs = _original_intrs[::stride]
+        logger.info(
+            f"外部内参按 stride={stride} 采样: "
+            f"{_original_intrs.shape[0]} -> {model_depth_pose.external_intrs.shape[0]} 帧"
+        )
+
     # obtain video depth and pose
     (
         video_ten, depth_npy, depth_conf, extrs_npy, intrs_npy
@@ -592,11 +624,24 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
     )
 
     # Keep depth_conf for visualization NPZ
-    # VGGT wrapper 返回的是 torch.Tensor，而 ExternalGeomWrapper 返回的是 numpy.ndarray
     if isinstance(depth_conf, torch.Tensor):
         depth_conf_npy = depth_conf.squeeze().cpu().numpy()
     else:
         depth_conf_npy = np.asarray(depth_conf).squeeze()
+
+    # 恢复外部几何（避免影响后续视频处理）
+    if _original_extrs is not None:
+        model_depth_pose.external_extrs = _original_extrs
+    if _original_intrs is not None:
+        model_depth_pose.external_intrs = _original_intrs
+
+    video_length = video_ten.shape[0]
+    if len(original_filenames) != video_length:
+        logger.warning(
+            f"原始文件名数量({len(original_filenames)})与有效帧数({video_length})不一致，"
+            f"按前 {video_length} 帧对齐。"
+        )
+        original_filenames = original_filenames[:video_length]
 
     frame_H, frame_W = video_ten.shape[-2:]
 
@@ -883,6 +928,14 @@ def _collect_and_sort_frame_files(video_path, extensions):
     files = []
     for ext in extensions:
         files.extend(glob.glob(os.path.join(video_path, f"*.{ext}")))
+
+    # 兼容 DROID 相机目录结构：若相机根目录无帧文件，回退读取 left 子目录。
+    if not files:
+        left_dir = os.path.join(video_path, "left")
+        if os.path.isdir(left_dir):
+            for ext in extensions:
+                files.extend(glob.glob(os.path.join(left_dir, f"*.{ext}")))
+
     files.sort(key=_frame_sort_key)
     return files
 
@@ -897,6 +950,8 @@ def load_video_and_mask(video_path, mask_dir=None, fps=1, max_num_frames=384, is
 
         # IMPORTANT: Subsample the file list BEFORE loading to save memory
         img_files = img_files[::fps]
+        if max_num_frames is not None and max_num_frames > 0:
+            img_files = img_files[:max_num_frames]
 
         video_tensor = []
         for img_file in tqdm.tqdm(img_files, desc="Loading images" if not is_depth else "Loading depth"):
@@ -931,14 +986,18 @@ def load_video_and_mask(video_path, mask_dir=None, fps=1, max_num_frames=384, is
         # For video files, subsample after loading
         video_tensor = video_tensor[::fps]
         original_filenames = original_filenames[::fps]
+        if max_num_frames is not None and max_num_frames > 0:
+            video_tensor = video_tensor[:max_num_frames]
+            original_filenames = original_filenames[:max_num_frames]
 
     if not is_depth:
         video_tensor = video_tensor.permute(
             0, 3, 1, 2
         )  # Convert to tensor and permute to (N, C, H, W)
     video_tensor = video_tensor.float()
-    video_tensor = video_tensor[:max_num_frames]
-    original_filenames = original_filenames[:max_num_frames]
+    if max_num_frames is not None and max_num_frames > 0:
+        video_tensor = video_tensor[:max_num_frames]
+        original_filenames = original_filenames[:max_num_frames]
     video_length = len(video_tensor)
     logger.debug(f"Loaded video with {video_length} frames from {video_path}")
     frame_h, frame_w = video_tensor.shape[-2:]
@@ -1080,9 +1139,15 @@ if __name__ == "__main__":
         depth_folders = [args.depth_path]
 
     # Process each video
+    failed_videos = 0
     for video_path, depth_path in zip(video_folders, depth_folders):
-        # 使用 camera_name 作为输出目录名（external 模式）
-        if args.depth_pose_method == 'external' and hasattr(args, 'camera_name'):
+        # 输出目录命名优先级：
+        # 1) 显式 --video_name
+        # 2) 传入外部外参时使用 --camera_name
+        # 3) 默认使用输入路径名
+        if args.video_name:
+            video_name = args.video_name
+        elif getattr(args, 'external_geom_npz', None) and hasattr(args, 'camera_name'):
             video_name = args.camera_name
         else:
             video_name = os.path.basename(video_path.rstrip("/"))
@@ -1181,10 +1246,14 @@ if __name__ == "__main__":
             logger.error(f"Failed to process {video_name}: {str(e)}")
             logger.error(f"Exception type: {type(e).__name__}")
             logger.error(f"Full traceback:\n{traceback.format_exc()}")
+            failed_videos += 1
             continue
 
     # Cleanup
     del model_3dtracker
     del model_depth_pose
     torch.cuda.empty_cache()
+    if failed_videos > 0:
+        logger.error(f"Batch processing completed with failures: {failed_videos} video(s) failed.")
+        sys.exit(1)
     logger.info("Batch processing completed!")

@@ -39,6 +39,81 @@ def align_video_depth_scale(pred_depth, known_depth):
     return aligned_depth, scale
 
 
+def _load_external_extrinsics(geom_path, camera_name="hand_camera"):
+    """
+    从 NPZ 或 H5 文件加载外部外参。
+    返回: (T, 4, 4) numpy array, float32
+    """
+    if not os.path.exists(geom_path):
+        raise FileNotFoundError(f"external_geom_npz not found: {geom_path}")
+
+    if geom_path.endswith('.h5'):
+        import h5py
+        with h5py.File(geom_path, 'r') as f:
+            extr_key = f"observation/camera/extrinsics/{camera_name}_left"
+            if extr_key not in f:
+                available = list(f['observation/camera/extrinsics'].keys()) if 'observation/camera/extrinsics' in f else []
+                raise KeyError(
+                    f"H5 file must contain '{extr_key}'. "
+                    f"Available cameras: {available}"
+                )
+            extrs = f[extr_key][:].astype(np.float32)  # (T, 4, 4)
+    else:
+        data = np.load(geom_path)
+        if "extrinsics" not in data:
+            data.close()
+            raise KeyError("NPZ file must contain 'extrinsics' array.")
+        extrs = data["extrinsics"].astype(np.float32)  # (T, 4, 4)
+        data.close()
+
+    logger.info(f"加载外部外参: {geom_path}, 共 {extrs.shape[0]} 帧")
+    return extrs
+
+
+def _load_external_geom(geom_path, camera_name="hand_camera"):
+    """
+    从 NPZ/H5 加载外部内外参，返回:
+        intrs: (T, 3, 3) float32
+        extrs: (T, 4, 4) float32
+    """
+    if not os.path.exists(geom_path):
+        raise FileNotFoundError(f"external_geom_npz not found: {geom_path}")
+
+    if geom_path.endswith(".h5"):
+        import h5py
+
+        intr_key = f"observation/camera/intrinsics/{camera_name}_left"
+        extr_key = f"observation/camera/extrinsics/{camera_name}_left"
+        with h5py.File(geom_path, "r") as f:
+            if intr_key not in f or extr_key not in f:
+                available = []
+                if "observation/camera/intrinsics" in f:
+                    available = list(f["observation/camera/intrinsics"].keys())
+                raise KeyError(
+                    f"H5 file must contain '{intr_key}' and '{extr_key}'. "
+                    f"Available cameras: {available}"
+                )
+            intrs = f[intr_key][:].astype(np.float32)
+            extrs = f[extr_key][:].astype(np.float32)
+    else:
+        data = np.load(geom_path)
+        if "intrinsics" not in data or "extrinsics" not in data:
+            data.close()
+            raise KeyError(
+                f"NPZ file must contain 'intrinsics' and 'extrinsics' arrays: {geom_path}"
+            )
+        intrs = data["intrinsics"].astype(np.float32)
+        extrs = data["extrinsics"].astype(np.float32)
+        data.close()
+
+    if intrs.shape[0] != extrs.shape[0]:
+        raise ValueError(
+            f"external geom intrinsics/extrinsics length mismatch: {intrs.shape[0]} vs {extrs.shape[0]}"
+        )
+    logger.info(f"加载外部几何: {geom_path}, 共 {intrs.shape[0]} 帧")
+    return intrs, extrs
+
+
 class BaseVideoDepthPoseWrapper:
     def __init__(self, args):
         self.args = args
@@ -66,24 +141,33 @@ class VGGT4Wrapper(BaseVideoDepthPoseWrapper):
         super().__init__(args)
         self.model = self.load_model()
 
+        # 可选：加载外部外参（用于替换 VGGT 预估的外参）
+        geom_path = getattr(args, "external_geom_npz", None)
+        if geom_path is not None:
+            camera_name = getattr(args, "camera_name", "hand_camera")
+            self.external_extrs = _load_external_extrinsics(geom_path, camera_name)
+            logger.info(f"已加载外部外参，将替换 VGGT 外参（深度仍由 VGGT 预估）")
+        else:
+            self.external_extrs = None
+
     def load_model(self, checkpoint_path="Yuxihenry/SpatialTrackerV2_Front"):
         import time
         import os
-        
+
         max_retries = 5
         retry_delay = 2  # 初始延迟2秒
-        
+
         # 检查缓存是否存在
         cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
         model_cache_name = checkpoint_path.replace("/", "--")
         model_cache_path = os.path.join(cache_dir, f"models--{model_cache_name}")
-        
+
         # 如果缓存存在，尝试使用local_files_only=True强制只使用本地文件
         use_local_only = os.path.exists(model_cache_path)
-        
+
         if use_local_only:
             logger.info(f"检测到模型缓存，尝试仅使用本地文件加载: {checkpoint_path}")
-        
+
         # 尝试加载模型（带重试）
         for attempt in range(max_retries):
             try:
@@ -99,7 +183,7 @@ class VGGT4Wrapper(BaseVideoDepthPoseWrapper):
                 else:
                     # 缓存不存在，需要从网络下载
                     model = VGGT4Track.from_pretrained(checkpoint_path)
-                
+
                 logger.debug(f"load vggt4 from {checkpoint_path}")
                 model = model.eval()
                 model = model.to(self.device)
@@ -145,6 +229,35 @@ class VGGT4Wrapper(BaseVideoDepthPoseWrapper):
 
             extrs_npy[:, :3, 3] *= scale
 
+        # 外部外参替换：用外部准确外参替换 VGGT 预估的外参，深度保留 VGGT 的
+        if self.external_extrs is not None:
+            T_vggt = extrs_npy.shape[0]
+            T_ext = self.external_extrs.shape[0]
+
+            if T_ext < T_vggt:
+                logger.warning(
+                    f"[VGGT4Wrapper] 外部外参帧数({T_ext}) < VGGT帧数({T_vggt})，"
+                    f"截取前 {T_ext} 帧"
+                )
+                extrs_npy = self.external_extrs[:T_ext].copy()
+                depth_npy = depth_npy[:T_ext]
+                if isinstance(depth_conf, np.ndarray):
+                    depth_conf = depth_conf[:T_ext]
+                else:
+                    depth_conf = depth_conf[:T_ext]
+                intrs_npy = intrs_npy[:T_ext]
+                video_ten = video_ten[:T_ext]
+            elif T_ext > T_vggt:
+                logger.info(
+                    f"[VGGT4Wrapper] 外部外参帧数({T_ext}) > VGGT帧数({T_vggt})，"
+                    f"取前 {T_vggt} 帧外参"
+                )
+                extrs_npy = self.external_extrs[:T_vggt].copy()
+            else:
+                extrs_npy = self.external_extrs[:T_vggt].copy()
+
+            logger.info(f"已用外部外参替换 VGGT 外参，共 {extrs_npy.shape[0]} 帧")
+
         if stationary_camera:
             extrs_npy = np.repeat(extrs_npy[0:1], extrs_npy.shape[0], axis=0)
 
@@ -153,20 +266,7 @@ class VGGT4Wrapper(BaseVideoDepthPoseWrapper):
 
 class ExternalGeomWrapper(BaseVideoDepthPoseWrapper):
     """
-    使用外部提供的几何（深度 + 相机内外参），完全不调用 VGGT。
-
-    预期：
-    - known_depth: (T, H, W) torch tensor，单位为米（m），由 --depth_path 加载
-    - args.external_geom_npz: NPZ 文件路径，至少包含：
-        - intrinsics: (T_ext, 3, 3)
-        - extrinsics: (T_ext, 4, 4)  # camera-to-world 或 world-to-camera 由上游约定
-
-    返回：
-    - video_ten: (T_use, 3, H, W) torch tensor，值域 [0,1]，仅做简单归一化，不做 VGGT 的 resize/crop
-    - depth_npy: (T_use, H, W) numpy array，单位米
-    - depth_conf: (T_use, H, W) numpy array，简单取 (depth>0) 作为置信度
-    - extrs_npy: (T_use, 4, 4) numpy array，直接来自外部 NPZ（按上游约定）
-    - intrs_npy: (T_use, 3, 3) numpy array
+    使用外部深度 + 外部内外参，完全跳过 VGGT。
     """
 
     def __init__(self, args):
@@ -175,93 +275,54 @@ class ExternalGeomWrapper(BaseVideoDepthPoseWrapper):
         if geom_path is None:
             raise ValueError(
                 "depth_pose_method='external' requires --external_geom_npz "
-                "pointing to an NPZ or H5 file with intrinsics and extrinsics."
+                "pointing to NPZ/H5 with intrinsics and extrinsics."
             )
-        if not os.path.exists(geom_path):
-            raise FileNotFoundError(
-                f"external_geom_npz not found: {geom_path}"
-            )
-
-        # 检测文件类型并加载
-        if geom_path.endswith('.h5'):
-            # H5 文件：从 trajectory_valid.h5 读取
-            import h5py
-            camera_name = getattr(args, "camera_name", "hand_camera")
-            with h5py.File(geom_path, 'r') as f:
-                intr_key = f"observation/camera/intrinsics/{camera_name}_left"
-                extr_key = f"observation/camera/extrinsics/{camera_name}_left"
-                if intr_key not in f or extr_key not in f:
-                    raise KeyError(
-                        f"H5 file must contain '{intr_key}' and '{extr_key}'. "
-                        f"Available cameras: {list(f['observation/camera/intrinsics'].keys())}"
-                    )
-                self.intrs_npy_full = f[intr_key][:].astype(np.float32)  # (T, 3, 3)
-                self.extrs_npy_full = f[extr_key][:].astype(np.float32)  # (T, 4, 4)
-        else:
-            # NPZ 文件：保持原有逻辑
-            data = np.load(geom_path)
-            if "intrinsics" not in data or "extrinsics" not in data:
-                data.close()
-                raise KeyError(
-                    f"NPZ file must contain 'intrinsics' and 'extrinsics' arrays."
-                )
-            self.intrs_npy_full = data["intrinsics"]  # (T_ext, 3, 3)
-            self.extrs_npy_full = data["extrinsics"]  # (T_ext, 4, 4)
-            data.close()
+        camera_name = getattr(args, "camera_name", "hand_camera")
+        self.external_intrs, self.external_extrs = _load_external_geom(geom_path, camera_name)
 
     def __call__(self, video_tensor, known_depth=None, stationary_camera=False, replace_with_known_depth=True):
         if known_depth is None:
             raise ValueError(
-                "depth_pose_method='external' requires known_depth via --depth_path "
-                "(external depth)."
+                "depth_pose_method='external' requires known_depth via --depth_path."
             )
 
-        # video_tensor: (T, 3, H, W), 已归一化到 [0,1] (load_video_and_mask 已处理)
         if not isinstance(video_tensor, torch.Tensor):
             video_tensor = torch.from_numpy(video_tensor)
-        video_ten = video_tensor.float().to(self.device)  # (T, 3, H, W), [0,1]
-        T_vid = video_ten.shape[0]
+        video_ten = video_tensor.float()
+        # 兼容上游未归一化输入
+        if torch.max(video_ten) > 1.5:
+            video_ten = video_ten / 255.0
+        video_ten = video_ten.to(self.device)
+        t_vid = video_ten.shape[0]
 
-        # 外部深度：假定单位为米 (m)
         if not isinstance(known_depth, torch.Tensor):
             known_depth = torch.from_numpy(known_depth)
-        depth = known_depth.float().cpu().numpy()  # (T_depth, H, W)
-        T_depth = depth.shape[0]
+        depth_npy = known_depth.float().cpu().numpy()
+        t_depth = depth_npy.shape[0]
 
-        T_ext = self.intrs_npy_full.shape[0]
-        T_ext2 = self.extrs_npy_full.shape[0]
-        if T_ext != T_ext2:
-            raise ValueError(
-                f"external_geom_npz intrinsics/extrinsics length mismatch: "
-                f"{T_ext} vs {T_ext2}"
-            )
-
-        # 取三者最短长度对齐时间维度
-        T_use = min(T_vid, T_depth, T_ext)
-        if T_use == 0:
+        t_geom = self.external_extrs.shape[0]
+        t_use = min(t_vid, t_depth, t_geom)
+        if t_use <= 0:
             raise ValueError(
                 f"depth_pose_method='external' got zero usable frames: "
-                f"T_vid={T_vid}, T_depth={T_depth}, T_ext={T_ext}"
+                f"video={t_vid}, depth={t_depth}, geom={t_geom}"
             )
-
-        if not (T_vid == T_depth == T_ext):
+        if not (t_vid == t_depth == t_geom):
             logger.warning(
                 f"[ExternalGeomWrapper] Time length mismatch: "
-                f"video={T_vid}, depth={T_depth}, geom={T_ext}; "
-                f"using first {T_use} frames."
+                f"video={t_vid}, depth={t_depth}, geom={t_geom}; using first {t_use} frames."
             )
 
-        video_ten = video_ten[:T_use]
-        depth = depth[:T_use]
-        intrs_npy = self.intrs_npy_full[:T_use]
-        extrs_npy = self.extrs_npy_full[:T_use]
-
-        depth_conf = (depth > 0).astype(np.float32)
+        video_ten = video_ten[:t_use]
+        depth_npy = depth_npy[:t_use]
+        intrs_npy = self.external_intrs[:t_use]
+        extrs_npy = self.external_extrs[:t_use]
+        depth_conf = (depth_npy > 0).astype(np.float32)
 
         if stationary_camera:
             extrs_npy = np.repeat(extrs_npy[0:1], extrs_npy.shape[0], axis=0)
 
-        return video_ten, depth, depth_conf, extrs_npy, intrs_npy
+        return video_ten, depth_npy, depth_conf, extrs_npy, intrs_npy
 
 
 video_depth_pose_dict = {
