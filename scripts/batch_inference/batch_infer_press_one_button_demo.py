@@ -21,9 +21,10 @@ Press-one-button demo 数据集批量推理脚本。
 2. `infer_bridge_v2.py` 的“单条样本多相机推理并保存标准 TraceForge 输出”逻辑。
 
 推荐多卡使用方式：
-- 通过 `--num_shards 8 --shard_index {0..7}` 将 120 个 episode 切成 8 份；
-- 每个 shard 由一个独立进程负责，并通过 `CUDA_VISIBLE_DEVICES` 绑定到单卡；
-- 每个进程只加载一次 3D tracker，避免 `batch_infer.py` 按 episode 重启子进程造成的重复加载。
+- 默认使用 `--gpu_id 0,1,...` 启动动态调度；
+- 每张卡对应一个常驻 worker，只加载一次 3D tracker；
+- worker 从共享任务队列中按 `episode/camera` 粒度领取下一个任务，直到队列清空；
+- 如需兼容旧的平均分片方式，可切回 `--gpu_schedule_mode static`。
 
 默认输出方式：
 - 就地写回到每个 episode 下的 `trajectory/<camera_name>/...`；
@@ -35,10 +36,12 @@ from __future__ import annotations
 import argparse
 import copy
 import os
+import queue
 import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -64,6 +67,15 @@ DEFAULT_CAMERAS = [
     "varied_camera_2",
     "varied_camera_3",
 ]
+
+
+@dataclass(frozen=True)
+class CameraTask:
+    task_index: int
+    total_tasks: int
+    episode_dir: Path
+    out_episode_dir: Path
+    camera_name: str
 
 
 def parse_camera_names(camera_names: str) -> list[str]:
@@ -100,6 +112,13 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Comma-separated GPU IDs, e.g. 0,1,2,3. If set, run multi-GPU in one command.",
+    )
+    parser.add_argument(
+        "--gpu_schedule_mode",
+        type=str,
+        default="dynamic",
+        choices=["dynamic", "static"],
+        help="In --gpu_id mode, choose dynamic camera-task scheduling or legacy static sharding.",
     )
     parser.add_argument(
         "--camera_names",
@@ -421,6 +440,49 @@ def copy_episode_lang(episode_dir: Path, out_episode_dir: Path) -> None:
     target.write_text(lang_path.read_text(encoding="utf-8"), encoding="utf-8")
 
 
+def build_camera_tasks(
+    episodes: list[Path],
+    *,
+    args: argparse.Namespace,
+    out_dir: Path | None,
+) -> list[CameraTask]:
+    pending: list[tuple[Path, Path, str]] = []
+
+    for episode_dir in episodes:
+        out_episode_dir = resolve_episode_output_dir(
+            episode_dir,
+            args=args,
+            out_root=out_dir,
+        )
+        for camera_name in args.camera_names:
+            rgb_dir = episode_dir / "rgb" / camera_name
+            depth_dir = episode_dir / "depth" / camera_name
+            if not _has_files(rgb_dir, (".png", ".jpg", ".jpeg")):
+                logger.warning(f"{episode_dir.name}/{camera_name}: skip, RGB missing")
+                continue
+            if not _has_files(depth_dir, (".npy", ".png")):
+                logger.warning(f"{episode_dir.name}/{camera_name}: skip, depth missing")
+                continue
+            if args.skip_existing and camera_output_complete(out_episode_dir, camera_name):
+                logger.info(f"{episode_dir.name}/{camera_name}: skip_existing")
+                continue
+            pending.append((episode_dir, out_episode_dir, camera_name))
+
+    total_tasks = len(pending)
+    tasks: list[CameraTask] = []
+    for task_index, (episode_dir, out_episode_dir, camera_name) in enumerate(pending, start=1):
+        tasks.append(
+            CameraTask(
+                task_index=task_index,
+                total_tasks=total_tasks,
+                episode_dir=episode_dir,
+                out_episode_dir=out_episode_dir,
+                camera_name=camera_name,
+            )
+        )
+    return tasks
+
+
 def build_camera_args(
     base_args: argparse.Namespace,
     episode_dir: Path,
@@ -484,6 +546,49 @@ def save_result(
     logger.info(f"Saved {main_npz_path}")
 
 
+def run_camera_task(
+    *,
+    task: CameraTask,
+    args: argparse.Namespace,
+    model_3dtracker,
+    save_lock: threading.Lock | None = None,
+) -> bool:
+    if args.copy_lang and not (task.out_episode_dir / "lang.txt").is_file():
+        copy_episode_lang(task.episode_dir, task.out_episode_dir)
+
+    camera_args = build_camera_args(args, task.episode_dir, task.camera_name)
+    logger.info(
+        f"{task.episode_dir.name}/{task.camera_name}: run "
+        f"(device={camera_args.device}, depth_pose_method={camera_args.depth_pose_method})"
+    )
+
+    try:
+        model_depth_pose = infer.video_depth_pose_dict[camera_args.depth_pose_method](camera_args)
+        result = infer.process_single_video(
+            str(task.episode_dir / "rgb" / task.camera_name),
+            str(task.episode_dir / "depth" / task.camera_name),
+            camera_args,
+            model_3dtracker,
+            model_depth_pose,
+        )
+        save_result(
+            out_episode_dir=task.out_episode_dir,
+            camera_name=task.camera_name,
+            result=result,
+            args=camera_args,
+            save_lock=save_lock,
+        )
+        return True
+    except Exception as exc:
+        logger.exception(f"{task.episode_dir.name}/{task.camera_name} failed: {exc}")
+        return False
+    finally:
+        if "model_depth_pose" in locals():
+            del model_depth_pose
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def run_episode(
     *,
     episode_dir: Path,
@@ -495,9 +600,7 @@ def run_episode(
     success_count = 0
     fail_count = 0
 
-    if args.copy_lang:
-        copy_episode_lang(episode_dir, out_episode_dir)
-
+    pending_cameras: list[str] = []
     for camera_name in args.camera_names:
         rgb_dir = episode_dir / "rgb" / camera_name
         depth_dir = episode_dir / "depth" / camera_name
@@ -507,44 +610,87 @@ def run_episode(
         if not _has_files(depth_dir, (".npy", ".png")):
             logger.warning(f"{episode_dir.name}/{camera_name}: skip, depth missing")
             continue
-
         if args.skip_existing and camera_output_complete(out_episode_dir, camera_name):
             logger.info(f"{episode_dir.name}/{camera_name}: skip_existing")
             continue
+        pending_cameras.append(camera_name)
 
-        camera_args = build_camera_args(args, episode_dir, camera_name)
-        logger.info(
-            f"{episode_dir.name}/{camera_name}: run "
-            f"(device={camera_args.device}, depth_pose_method={camera_args.depth_pose_method})"
+    tasks = [
+        CameraTask(
+            task_index=idx,
+            total_tasks=len(pending_cameras),
+            episode_dir=episode_dir,
+            out_episode_dir=out_episode_dir,
+            camera_name=camera_name,
         )
+        for idx, camera_name in enumerate(pending_cameras, start=1)
+    ]
+    if args.copy_lang and not tasks:
+        copy_episode_lang(episode_dir, out_episode_dir)
 
-        try:
-            model_depth_pose = infer.video_depth_pose_dict[camera_args.depth_pose_method](camera_args)
-            result = infer.process_single_video(
-                str(rgb_dir),
-                str(depth_dir),
-                camera_args,
-                model_3dtracker,
-                model_depth_pose,
-            )
-            save_result(
-                out_episode_dir=out_episode_dir,
-                camera_name=camera_name,
-                result=result,
-                args=camera_args,
-                save_lock=save_lock,
-            )
+    for task in tasks:
+        ok = run_camera_task(
+            task=task,
+            args=args,
+            model_3dtracker=model_3dtracker,
+            save_lock=save_lock,
+        )
+        if ok:
             success_count += 1
-        except Exception as exc:
+        else:
             fail_count += 1
-            logger.exception(f"{episode_dir.name}/{camera_name} failed: {exc}")
-        finally:
-            if "model_depth_pose" in locals():
-                del model_depth_pose
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
     return success_count, fail_count
+
+
+def process_camera_tasks_on_gpu(
+    *,
+    gpu_id: int,
+    task_queue: queue.Queue[CameraTask],
+    args: argparse.Namespace,
+    save_lock: threading.Lock,
+) -> tuple[int, int, float]:
+    worker_args = copy.deepcopy(args)
+    worker_args.device = f"cuda:{gpu_id}"
+
+    logger.info(f"[GPU {gpu_id}] start dynamic worker on {worker_args.device}")
+    worker_start = time.time()
+    model_3dtracker = infer.load_model(worker_args.checkpoint).to(worker_args.device)
+
+    total_camera_success = 0
+    total_camera_fail = 0
+    try:
+        while True:
+            try:
+                task = task_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            logger.info(
+                f"[GPU {gpu_id}] "
+                f"[{task.task_index}/{task.total_tasks}] {task.episode_dir.name}/{task.camera_name}"
+            )
+            ok = run_camera_task(
+                task=task,
+                args=worker_args,
+                model_3dtracker=model_3dtracker,
+                save_lock=save_lock,
+            )
+            if ok:
+                total_camera_success += 1
+            else:
+                total_camera_fail += 1
+    finally:
+        del model_3dtracker
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    elapsed = time.time() - worker_start
+    logger.info(
+        f"[GPU {gpu_id}] dynamic worker done in {elapsed/60:.1f} min "
+        f"(camera_success={total_camera_success}, camera_fail={total_camera_fail})"
+    )
+    return total_camera_success, total_camera_fail, elapsed
 
 
 def process_episodes_on_gpu(
@@ -640,14 +786,31 @@ def main() -> None:
     )
     if gpu_ids:
         logger.info(f"gpu_ids={gpu_ids}")
+        logger.info(f"gpu_schedule_mode={args.gpu_schedule_mode}")
     logger.info(
         f"frame_drop_rate={args.frame_drop_rate}, future_len={args.future_len}, grid_size={args.grid_size}"
     )
     logger.info("=" * 80)
 
-    if args.dry_run and not gpu_ids:
-        for idx, episode in enumerate(episodes_for_run, start=1):
-            logger.info(f"[dry_run {idx:03d}/{len(episodes_for_run):03d}] {episode}")
+    dynamic_tasks: list[CameraTask] | None = None
+    if gpu_ids and args.gpu_schedule_mode == "dynamic":
+        dynamic_tasks = build_camera_tasks(
+            episodes_for_run,
+            args=args,
+            out_dir=out_dir,
+        )
+        logger.info(f"dynamic camera tasks={len(dynamic_tasks)}")
+
+    if args.dry_run:
+        if dynamic_tasks is not None:
+            for task in dynamic_tasks:
+                logger.info(
+                    f"[dry_run {task.task_index:03d}/{task.total_tasks:03d}] "
+                    f"{task.episode_dir.name}/{task.camera_name} -> {task.out_episode_dir}"
+                )
+        else:
+            for idx, episode in enumerate(episodes_for_run, start=1):
+                logger.info(f"[dry_run {idx:03d}/{len(episodes_for_run):03d}] {episode}")
         return
 
     total_camera_success = 0
@@ -658,45 +821,90 @@ def main() -> None:
             logger.warning(
                 "gpu_id mode ignores the incoming shard settings and manages sharding internally."
             )
-
         worker_count = len(gpu_ids)
-        log_dir = resolve_launcher_log_dir(
-            base_path=base_path,
-            args=args,
-            out_root=out_dir,
-        )
-        log_dir.mkdir(parents=True, exist_ok=True)
-
-        episodes_per_worker = [len(episodes_for_run[i::worker_count]) for i in range(worker_count)]
-        for worker_index, gpu in enumerate(gpu_ids):
-            logger.info(
-                f"[GPU {gpu}] assigned {episodes_per_worker[worker_index]} episodes "
-                f"(worker shard {worker_index}/{worker_count})"
+        if args.gpu_schedule_mode == "static":
+            log_dir = resolve_launcher_log_dir(
+                base_path=base_path,
+                args=args,
+                out_root=out_dir,
             )
+            log_dir.mkdir(parents=True, exist_ok=True)
 
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            future_map = {
-                executor.submit(
-                    launch_worker_process,
-                    gpu_id=gpu,
-                    worker_index=worker_index,
-                    worker_count=worker_count,
-                    args=args,
-                    log_dir=log_dir,
-                ): gpu
-                for worker_index, gpu in enumerate(gpu_ids)
-            }
-            for future in as_completed(future_map):
-                gpu = future_map[future]
-                try:
-                    ok, _elapsed, _err = future.result()
-                    if ok:
-                        total_camera_success += 1
-                    else:
+            episodes_per_worker = [len(episodes_for_run[i::worker_count]) for i in range(worker_count)]
+            for worker_index, gpu in enumerate(gpu_ids):
+                logger.info(
+                    f"[GPU {gpu}] assigned {episodes_per_worker[worker_index]} episodes "
+                    f"(worker shard {worker_index}/{worker_count})"
+                )
+
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_map = {
+                    executor.submit(
+                        launch_worker_process,
+                        gpu_id=gpu,
+                        worker_index=worker_index,
+                        worker_count=worker_count,
+                        args=args,
+                        log_dir=log_dir,
+                    ): gpu
+                    for worker_index, gpu in enumerate(gpu_ids)
+                }
+                for future in as_completed(future_map):
+                    gpu = future_map[future]
+                    try:
+                        ok, _elapsed, _err = future.result()
+                        if ok:
+                            total_camera_success += 1
+                        else:
+                            total_camera_fail += 1
+                    except Exception as exc:
                         total_camera_fail += 1
-                except Exception as exc:
-                    total_camera_fail += 1
-                    logger.exception(f"[GPU {gpu}] launcher thread failed: {exc}")
+                        logger.exception(f"[GPU {gpu}] launcher thread failed: {exc}")
+        else:
+            assert dynamic_tasks is not None
+            if not dynamic_tasks:
+                logger.info("No pending camera tasks after filtering.")
+                logger.info("=" * 80)
+                return
+            if args.copy_lang:
+                for episode_dir in episodes_for_run:
+                    copy_episode_lang(
+                        episode_dir,
+                        resolve_episode_output_dir(
+                            episode_dir,
+                            args=args,
+                            out_root=out_dir,
+                        ),
+                    )
+
+            save_lock = threading.Lock()
+            task_queue: queue.Queue[CameraTask] = queue.Queue()
+            for task in dynamic_tasks:
+                task_queue.put(task)
+
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_map = {
+                    executor.submit(
+                        process_camera_tasks_on_gpu,
+                        gpu_id=gpu,
+                        task_queue=task_queue,
+                        args=args,
+                        save_lock=save_lock,
+                    ): gpu
+                    for gpu in gpu_ids
+                }
+                for future in as_completed(future_map):
+                    gpu = future_map[future]
+                    try:
+                        success_count, fail_count, _elapsed = future.result()
+                        total_camera_success += success_count
+                        total_camera_fail += fail_count
+                    except Exception as exc:
+                        logger.exception(f"[GPU {gpu}] dynamic worker failed: {exc}")
+            remaining_tasks = task_queue.qsize()
+            if remaining_tasks > 0:
+                total_camera_fail += remaining_tasks
+                logger.error(f"Dynamic scheduler left {remaining_tasks} camera tasks unprocessed.")
     else:
         logger.info(f"Loading 3D tracker once on {args.device}")
         model_3dtracker = infer.load_model(args.checkpoint).to(args.device)
@@ -723,10 +931,16 @@ def main() -> None:
 
     logger.info("=" * 80)
     if gpu_ids:
-        logger.info(
-            f"Done launcher mode. workers_ok={total_camera_success}, "
-            f"workers_failed={total_camera_fail}"
-        )
+        if args.gpu_schedule_mode == "static":
+            logger.info(
+                f"Done launcher mode. workers_ok={total_camera_success}, "
+                f"workers_failed={total_camera_fail}"
+            )
+        else:
+            logger.info(
+                f"Done dynamic gpu mode. camera_success={total_camera_success}, "
+                f"camera_fail={total_camera_fail}"
+            )
     else:
         logger.info(
             f"Done. shard={args.shard_index}/{args.num_shards}, "

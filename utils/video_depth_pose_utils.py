@@ -5,6 +5,7 @@ from loguru import logger
 
 from models.SpaTrackV2.models.vggt4track.models.vggt_moe import VGGT4Track
 from models.SpaTrackV2.models.vggt4track.utils.load_fn import preprocess_image
+from utils.extrinsics_utils import invert_extrinsics_batch, normalize_extrinsics_to_w2c
 
 
 def align_depth_scale(pred_depth, known_depth):
@@ -140,7 +141,7 @@ class BaseVideoDepthPoseWrapper:
             video_ten: (T, 3, H, W), torch tensor, range [0, 1], processed (resized) video tensor, will be used in 3D tracking as well
             depth_npy: (T, H, W), numpy array
             depth_conf: (T, H, W), numpy array
-            extrs_npy: (T, 4, 4), numpy array, in camera-to-world format
+            extrs_npy: (T, 4, 4), numpy array, in world-to-camera format
             intrs_npy: (T, 3, 3), numpy array
         """
         raise NotImplementedError
@@ -155,8 +156,16 @@ class VGGT4Wrapper(BaseVideoDepthPoseWrapper):
         geom_path = getattr(args, "external_geom_npz", None)
         if geom_path is not None:
             camera_name = getattr(args, "camera_name", "hand_camera")
-            self.external_extrs = _load_external_extrinsics(geom_path, camera_name)
-            logger.info(f"已加载外部外参，将替换 VGGT 外参（深度仍由 VGGT 预估）")
+            extr_mode = getattr(args, "external_extr_mode", "w2c")
+            external_extrs_raw = _load_external_extrinsics(geom_path, camera_name)
+            self.external_extrs = normalize_extrinsics_to_w2c(
+                external_extrs_raw,
+                extr_mode=extr_mode,
+                context="VGGT4Wrapper external extrinsics",
+            )
+            logger.info(
+                f"已加载外部外参并统一到 w2c，将替换 VGGT 外参（深度仍由 VGGT 预估）"
+            )
         else:
             self.external_extrs = None
 
@@ -225,6 +234,12 @@ class VGGT4Wrapper(BaseVideoDepthPoseWrapper):
         intrs_npy = intrinsic.squeeze().cpu().numpy()
         video_ten = video_tensor_processed.squeeze()
 
+        # VGGT poses_pred is camera-to-world; TraceForge downstream consumes w2c.
+        extrs_npy = invert_extrinsics_batch(
+            extrs_npy,
+            context="VGGT4Wrapper poses_pred (convert c2w -> w2c)",
+        )
+
         if known_depth is not None:
             known_depth = torch.nn.functional.interpolate(
                 known_depth[:, None, :, :], size=depth_npy.shape[1:], mode="bilinear", align_corners=False
@@ -290,27 +305,14 @@ class ExternalGeomWrapper(BaseVideoDepthPoseWrapper):
         camera_name = getattr(args, "camera_name", "hand_camera")
         extr_mode = getattr(args, "external_extr_mode", "w2c")
         self.external_intrs, external_extrs_raw = _load_external_geom(geom_path, camera_name)
-
-        # 规范化为 TraceForge 内部约定的 w2c（world→camera）矩阵
-        if extr_mode == "w2c":
-            self.external_extrs = external_extrs_raw.astype(np.float32)
-            logger.info("[ExternalGeomWrapper] external_extr_mode='w2c'，按 world→camera 直接使用外参。")
-        elif extr_mode == "c2w":
-            # 用户提供的是 camera→world，需要求逆得到 world→camera
-            try:
-                c2w = external_extrs_raw.astype(np.float32)
-                w2c = np.linalg.inv(c2w)
-            except np.linalg.LinAlgError as e:
-                raise ValueError(
-                    "Failed to invert external extrinsics when external_extr_mode='c2w'. "
-                    "Please check that all 4x4 matrices are valid rigid transforms."
-                ) from e
-            self.external_extrs = w2c
-            logger.info("[ExternalGeomWrapper] external_extr_mode='c2w'，已对外参求逆并转换为 world→camera 形式。")
-        else:
-            raise ValueError(
-                f"Unknown external_extr_mode='{extr_mode}'. Expected 'w2c' or 'c2w'."
-            )
+        self.external_extrs = normalize_extrinsics_to_w2c(
+            external_extrs_raw,
+            extr_mode=extr_mode,
+            context="ExternalGeomWrapper external extrinsics",
+        )
+        logger.info(
+            f"[ExternalGeomWrapper] external_extr_mode='{extr_mode}'，外参已统一为 world→camera (w2c)。"
+        )
 
     def __call__(self, video_tensor, known_depth=None, stationary_camera=False, replace_with_known_depth=True):
         if known_depth is None:

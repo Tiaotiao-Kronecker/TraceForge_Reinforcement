@@ -818,8 +818,7 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
             points_xy = query_frame_points[:, 1:3]  # Extract x, y coordinates
             query_points_per_frame[frame_idx] = points_xy
 
-    # Process each query frame independently with 16-frame tracking
-    extrs_npy = np.linalg.inv(extrs_npy)
+    # All wrappers now return w2c directly; keep that convention unchanged.
 
     # Store results for each query frame
     query_frame_results = {}
