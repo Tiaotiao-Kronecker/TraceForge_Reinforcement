@@ -104,6 +104,17 @@ def resize_depth_bilinear(depth: np.ndarray, new_shape: Tuple[int, int]) -> np.n
     depth_resized[is_valid_resized <= 1e-6] = 0.0
     return depth_resized
 
+def _remove_batch_dim(coords, visibs):
+    if coords.ndim != 4 or visibs.ndim != 3:
+        raise ValueError(
+            f"Expected batched tracker outputs, got coords={coords.shape}, visibs={visibs.shape}"
+        )
+    if coords.shape[0] != 1 or visibs.shape[0] != 1:
+        raise ValueError(
+            f"inference() expects batch size 1, got coords={coords.shape}, visibs={visibs.shape}"
+        )
+    return coords[0], visibs[0]
+
 @torch.no_grad()
 def inference(
     *,
@@ -172,4 +183,4 @@ def inference(
 
     coords, visib_logits = preds.coords, preds.visibs
     visibs = torch.sigmoid(visib_logits) >= vis_threshold
-    return coords.squeeze(), visibs.squeeze()
+    return _remove_batch_dim(coords, visibs)

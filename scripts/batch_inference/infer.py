@@ -45,6 +45,15 @@ def parse_args():
     )
     parser.add_argument('--depth_pose_method', type=str, default='vggt4', choices=video_depth_pose_dict.keys())
     parser.add_argument(
+        "--external_extr_mode",
+        type=str,
+        default="w2c",
+        choices=["w2c", "c2w"],
+        help="For depth_pose_method='external': how to interpret extrinsics in external_geom_npz. "
+             "'w2c' means matrices map world→camera (TraceForge default, will be used directly); "
+             "'c2w' means matrices map camera→world and will be inverted internally to obtain w2c.",
+    )
+    parser.add_argument(
         "--external_geom_npz",
         type=str,
         default=None,
@@ -242,6 +251,98 @@ def retarget_trajectories(
     valid_mask[:L] = True
     return retargeted, valid_mask
 
+
+def filter_anomalous_trajectories(
+    traj: np.ndarray,
+    direction_threshold: float = 0.3,
+    accel_threshold: float = 3.0,
+) -> np.ndarray:
+    """
+    Filter out anomalous trajectories based on velocity direction consistency and acceleration.
+
+    Detects false trajectories caused by depth instability using two criteria:
+    1. Random direction changes (back-and-forth jumps)
+    2. Sudden velocity changes (high acceleration)
+
+    Args:
+        traj: (N, T, 3) trajectory array
+        direction_threshold: Threshold for mean cosine similarity (default: 0.3)
+        accel_threshold: IQR multiplier for acceleration outlier detection (default: 3.0)
+
+    Returns:
+        filtered_traj: (N, T, 3) with anomalous trajectories set to inf
+    """
+    # FILTERING DISABLED - return original trajectory
+    return traj
+
+    N, T, D = traj.shape
+    if T < 3:
+        return traj
+
+    # Compute valid mask (non-inf points)
+    valid = np.isfinite(traj).all(axis=-1)  # (N, T)
+
+    # Compute direction consistency and acceleration for each trajectory
+    mean_cos_sim = np.ones(N)  # Default to 1 (consistent)
+    max_accel = np.zeros(N)
+
+    for i in range(N):
+        valid_idx = np.where(valid[i])[0]
+        if len(valid_idx) < 3:
+            continue
+
+        # Compute velocity vectors
+        vel = np.diff(traj[i, valid_idx], axis=0)  # (T_valid-1, 3)
+        vel_norm = np.linalg.norm(vel, axis=1, keepdims=True)
+
+        # Skip if velocities are too small (static points)
+        valid_vel = vel_norm.flatten() > 1e-4
+        if np.sum(valid_vel) < 2:
+            continue
+
+        vel = vel[valid_vel]
+        vel_norm = vel_norm[valid_vel]
+
+        # 1. Direction consistency
+        vel_normalized = vel / (vel_norm + 1e-8)
+        cos_sim = np.sum(vel_normalized[:-1] * vel_normalized[1:], axis=1)
+        mean_cos_sim[i] = np.mean(cos_sim) if len(cos_sim) > 0 else 1.0
+
+        # 2. Acceleration (second-order difference)
+        if len(vel) >= 2:
+            accel = np.diff(vel, axis=0)  # (T_valid-2, 3)
+            accel_norm = np.linalg.norm(accel, axis=1)
+            max_accel[i] = np.max(accel_norm) if len(accel_norm) > 0 else 0
+
+    # Filter by direction consistency
+    outliers_direction = mean_cos_sim < direction_threshold
+
+    # Filter by acceleration using IQR
+    valid_accel = max_accel[max_accel > 0]
+    outliers_accel = np.zeros(N, dtype=bool)
+    if len(valid_accel) >= 4:
+        q25, q75 = np.percentile(valid_accel, [25, 75])
+        iqr = q75 - q25
+        if iqr > 1e-6:
+            upper_bound = q75 + accel_threshold * iqr
+            outliers_accel = max_accel > upper_bound
+
+    # Combine filters (OR logic)
+    outliers = outliers_direction | outliers_accel
+
+    # Filter trajectories
+    filtered_traj = traj.copy()
+    filtered_traj[outliers] = np.inf
+
+    n_dir = np.sum(outliers_direction)
+    n_accel = np.sum(outliers_accel)
+    n_total = np.sum(outliers)
+    if n_total > 0:
+        logger.info(f"Filtered {n_total}/{N} trajectories (direction: {n_dir}, accel: {n_accel}, overlap: {n_dir + n_accel - n_total})")
+
+    return filtered_traj
+
+
 def save_single_query_frame(
     video_name,
     output_dir,
@@ -306,6 +407,21 @@ def save_single_query_frame(
         sample_data["traj_2d"] = coords_np[:, :, :2].transpose(1, 0, 2).astype(np.float32)
         sample_data["traj"] = coords_np.transpose(1, 0, 2).astype(np.float32)
 
+    # Filter anomalous trajectories
+    sample_data["traj"] = filter_anomalous_trajectories(sample_data["traj"])
+
+    # Pad trajectories to future_len
+    current_len = sample_data["traj"].shape[1]
+    if current_len < future_len:
+        pad_len = future_len - current_len
+        pad_shape = (sample_data["traj"].shape[0], pad_len, sample_data["traj"].shape[2])
+        pad_array = np.full(pad_shape, np.inf, dtype=sample_data["traj"].dtype)
+        sample_data["traj"] = np.concatenate([sample_data["traj"], pad_array], axis=1)
+
+        pad_shape_2d = (sample_data["traj_2d"].shape[0], pad_len, sample_data["traj_2d"].shape[2])
+        pad_array_2d = np.full(pad_shape_2d, np.inf, dtype=sample_data["traj_2d"].dtype)
+        sample_data["traj_2d"] = np.concatenate([sample_data["traj_2d"], pad_array_2d], axis=1)
+
     query_frame_img = video_segment[0]
     query_frame_depth = frame_data["depths_segment"].cpu().numpy()[0]
 
@@ -331,9 +447,10 @@ def save_single_query_frame(
     depth_raw_path = os.path.join(depth_dir, depth_raw_filename)
     np.savez(depth_raw_path, depth=query_frame_depth)
 
-    retargeted, valid_mask = retarget_trajectories(sample_data["traj"], max_length=future_len)
-    sample_data["traj"] = retargeted
-    sample_data["valid_steps"] = valid_mask
+    # Retarget disabled - use original trajectory
+    # retargeted, valid_mask = retarget_trajectories(sample_data["traj"], max_length=future_len)
+    # sample_data["traj"] = retargeted
+    # sample_data["valid_steps"] = valid_mask
 
     sample_filename = f"{video_name}_{query_frame_idx}.npz"
     sample_path = os.path.join(samples_dir, sample_filename)
@@ -483,6 +600,21 @@ def save_structured_data(
                 )
                 sample_data["traj"] = coords_np.transpose(1, 0, 2).astype(np.float32)
 
+            # Filter anomalous trajectories
+            sample_data["traj"] = filter_anomalous_trajectories(sample_data["traj"])
+
+            # Pad trajectories to future_len
+            current_len = sample_data["traj"].shape[1]
+            if current_len < args.future_len:
+                pad_len = args.future_len - current_len
+                pad_shape = (sample_data["traj"].shape[0], pad_len, sample_data["traj"].shape[2])
+                pad_array = np.full(pad_shape, np.inf, dtype=sample_data["traj"].dtype)
+                sample_data["traj"] = np.concatenate([sample_data["traj"], pad_array], axis=1)
+
+                pad_shape_2d = (sample_data["traj_2d"].shape[0], pad_len, sample_data["traj_2d"].shape[2])
+                pad_array_2d = np.full(pad_shape_2d, np.inf, dtype=sample_data["traj_2d"].dtype)
+                sample_data["traj_2d"] = np.concatenate([sample_data["traj_2d"], pad_array_2d], axis=1)
+
             # Only save image and depth for the query frame itself, not the entire segment
             query_frame_img = video_segment[
                 0
@@ -523,10 +655,11 @@ def save_structured_data(
                 depth_raw_filename = f"{video_name}_{query_frame_idx}_raw.npz"
                 depth_raw_path = os.path.join(depth_dir, depth_raw_filename)
                 np.savez(depth_raw_path, depth=query_frame_depth)
-            
-            retargeted, valid_mask = retarget_trajectories(sample_data["traj"], max_length=args.future_len)
-            sample_data["traj"] = retargeted
-            sample_data["valid_steps"] = valid_mask
+
+            # Retarget disabled - use original trajectory
+            # retargeted, valid_mask = retarget_trajectories(sample_data["traj"], max_length=args.future_len)
+            # sample_data["traj"] = retargeted
+            # sample_data["valid_steps"] = valid_mask
 
             # Save sample NPZ for this query frame
             sample_filename = f"{video_name}_{query_frame_idx}.npz"

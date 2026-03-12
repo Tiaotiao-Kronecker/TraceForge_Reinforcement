@@ -40,7 +40,15 @@ def load_sample_npz(npz_path):
     """加载单个 sample NPZ"""
     data = np.load(npz_path)
     traj = data["traj"]  # (N, T, 3)
-    valid_steps = data["valid_steps"]  # (T,)
+
+    # 兼容没有 valid_steps 的情况（禁用retarget后）
+    if "valid_steps" in data:
+        valid_steps = data["valid_steps"]  # (T,)
+    else:
+        # 根据inf值自动生成valid_steps
+        # 如果某个时间步的所有轨迹都不是inf，则认为该步有效
+        valid_steps = ~np.all(np.isinf(traj), axis=(0, 2))  # (T,)
+
     keypoints = data["keypoints"]  # (N, 2)
     frame_index = int(data["frame_index"][0])
     data.close()

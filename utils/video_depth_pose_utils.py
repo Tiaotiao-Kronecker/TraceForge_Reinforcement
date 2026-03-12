@@ -82,19 +82,29 @@ def _load_external_geom(geom_path, camera_name="hand_camera"):
     if geom_path.endswith(".h5"):
         import h5py
 
-        intr_key = f"observation/camera/intrinsics/{camera_name}_left"
-        extr_key = f"observation/camera/extrinsics/{camera_name}_left"
+        # Try two formats: with _left suffix (droid) and without (other datasets)
+        intr_key_with_suffix = f"observation/camera/intrinsics/{camera_name}_left"
+        extr_key_with_suffix = f"observation/camera/extrinsics/{camera_name}_left"
+        intr_key_no_suffix = f"observation/camera/intrinsics/{camera_name}"
+        extr_key_no_suffix = f"observation/camera/extrinsics/{camera_name}"
+
         with h5py.File(geom_path, "r") as f:
-            if intr_key not in f or extr_key not in f:
+            # Try with _left suffix first
+            if intr_key_with_suffix in f and extr_key_with_suffix in f:
+                intrs = f[intr_key_with_suffix][:].astype(np.float32)
+                extrs = f[extr_key_with_suffix][:].astype(np.float32)
+            # Try without suffix
+            elif intr_key_no_suffix in f and extr_key_no_suffix in f:
+                intrs = f[intr_key_no_suffix][:].astype(np.float32)
+                extrs = f[extr_key_no_suffix][:].astype(np.float32)
+            else:
                 available = []
                 if "observation/camera/intrinsics" in f:
                     available = list(f["observation/camera/intrinsics"].keys())
                 raise KeyError(
-                    f"H5 file must contain '{intr_key}' and '{extr_key}'. "
+                    f"H5 file must contain either '{intr_key_with_suffix}' or '{intr_key_no_suffix}'. "
                     f"Available cameras: {available}"
                 )
-            intrs = f[intr_key][:].astype(np.float32)
-            extrs = f[extr_key][:].astype(np.float32)
     else:
         data = np.load(geom_path)
         if "intrinsics" not in data or "extrinsics" not in data:
@@ -278,7 +288,29 @@ class ExternalGeomWrapper(BaseVideoDepthPoseWrapper):
                 "pointing to NPZ/H5 with intrinsics and extrinsics."
             )
         camera_name = getattr(args, "camera_name", "hand_camera")
-        self.external_intrs, self.external_extrs = _load_external_geom(geom_path, camera_name)
+        extr_mode = getattr(args, "external_extr_mode", "w2c")
+        self.external_intrs, external_extrs_raw = _load_external_geom(geom_path, camera_name)
+
+        # 规范化为 TraceForge 内部约定的 w2c（world→camera）矩阵
+        if extr_mode == "w2c":
+            self.external_extrs = external_extrs_raw.astype(np.float32)
+            logger.info("[ExternalGeomWrapper] external_extr_mode='w2c'，按 world→camera 直接使用外参。")
+        elif extr_mode == "c2w":
+            # 用户提供的是 camera→world，需要求逆得到 world→camera
+            try:
+                c2w = external_extrs_raw.astype(np.float32)
+                w2c = np.linalg.inv(c2w)
+            except np.linalg.LinAlgError as e:
+                raise ValueError(
+                    "Failed to invert external extrinsics when external_extr_mode='c2w'. "
+                    "Please check that all 4x4 matrices are valid rigid transforms."
+                ) from e
+            self.external_extrs = w2c
+            logger.info("[ExternalGeomWrapper] external_extr_mode='c2w'，已对外参求逆并转换为 world→camera 形式。")
+        else:
+            raise ValueError(
+                f"Unknown external_extr_mode='{extr_mode}'. Expected 'w2c' or 'c2w'."
+            )
 
     def __call__(self, video_tensor, known_depth=None, stationary_camera=False, replace_with_known_depth=True):
         if known_depth is None:
