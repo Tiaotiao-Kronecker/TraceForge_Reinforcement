@@ -139,7 +139,224 @@ def parse_args():
         default=20,
         help="Grid size for uniform keypoint sampling (grid_size x grid_size points per frame). Default is 20 (400 points).",
     )
+    parser.add_argument(
+        "--filter_level",
+        type=str,
+        default="standard",
+        choices=["none", "basic", "standard", "strict"],
+        help="Trajectory filtering level: none(no filter), basic(basic checks), standard(recommended), strict(high quality)",
+    )
+    parser.add_argument(
+        "--min_valid_frames",
+        type=int,
+        default=None,
+        help="Minimum valid frames per trajectory (overrides filter_level default)",
+    )
+    parser.add_argument(
+        "--visibility_threshold",
+        type=float,
+        default=None,
+        help="Minimum visibility ratio (overrides filter_level default)",
+    )
+    parser.add_argument(
+        "--min_depth",
+        type=float,
+        default=0.01,
+        help="Minimum depth value in meters",
+    )
+    parser.add_argument(
+        "--max_depth",
+        type=float,
+        default=10.0,
+        help="Maximum depth value in meters",
+    )
+    parser.add_argument(
+        "--boundary_margin",
+        type=int,
+        default=None,
+        help="Projection boundary margin in pixels (overrides filter_level default)",
+    )
+    parser.add_argument(
+        "--depth_change_threshold",
+        type=float,
+        default=None,
+        help="Depth change std threshold in meters (overrides filter_level default)",
+    )
     return parser.parse_args()
+
+def compute_traj_valid_mask(
+    traj: np.ndarray,
+    visibs: np.ndarray = None,
+    image_width: int = 1280,
+    image_height: int = 720,
+    min_valid_frames: int = 3,
+    min_depth: float = 0.01,
+    max_depth: float = 10.0,
+    boundary_margin: int = 50,
+    visibility_threshold: float = 0.5,
+    check_depth_smoothness: bool = True,
+    depth_change_threshold: float = 0.5,
+) -> np.ndarray:
+    """Compute trajectory validity mask (spatial dimension)"""
+    N, T, _ = traj.shape
+    valid_mask = np.ones(N, dtype=bool)
+
+    # 1. Valid frames filter
+    valid_frames = np.isfinite(traj).all(axis=-1)
+    valid_counts = valid_frames.sum(axis=1)
+    valid_mask &= (valid_counts >= min_valid_frames)
+
+    # 2. Depth validity filter
+    depth_values = traj[:, :, 2]
+    for i in range(N):
+        if not valid_mask[i]:
+            continue
+        valid_depths = depth_values[i, valid_frames[i]]
+        if len(valid_depths) > 0:
+            if (valid_depths < min_depth).any() or (valid_depths > max_depth).any():
+                valid_mask[i] = False
+
+    # 3. Projection boundary filter
+    u_values = traj[:, :, 0]
+    v_values = traj[:, :, 1]
+    for i in range(N):
+        if not valid_mask[i]:
+            continue
+        valid_u = u_values[i, valid_frames[i]]
+        valid_v = v_values[i, valid_frames[i]]
+        if len(valid_u) > 0:
+            u_in_bounds = (valid_u >= -boundary_margin) & (valid_u <= image_width + boundary_margin)
+            v_in_bounds = (valid_v >= -boundary_margin) & (valid_v <= image_height + boundary_margin)
+            if not (u_in_bounds.all() and v_in_bounds.all()):
+                valid_mask[i] = False
+
+    # 4. Visibility filter
+    if visibs is not None:
+        if visibs.shape[0] == T and visibs.shape[1] == N:
+            visibs = visibs.T
+        for i in range(N):
+            if not valid_mask[i] or valid_counts[i] == 0:
+                continue
+            vis_count = (visibs[i] & valid_frames[i]).sum()
+            vis_ratio = vis_count / valid_counts[i]
+            if vis_ratio < visibility_threshold:
+                valid_mask[i] = False
+
+    # 5. Depth smoothness filter
+    if check_depth_smoothness:
+        for i in range(N):
+            if not valid_mask[i]:
+                continue
+            valid_depths = depth_values[i, valid_frames[i]]
+            if len(valid_depths) > 1:
+                depth_diff = np.diff(valid_depths)
+                if np.std(depth_diff) > depth_change_threshold:
+                    valid_mask[i] = False
+
+    return valid_mask
+
+
+def resolve_traj_filter_config(filter_args) -> dict:
+    """Resolve effective trajectory filtering settings from CLI args."""
+    level = getattr(filter_args, "filter_level", "none") if filter_args is not None else "none"
+    defaults = {
+        "basic": {
+            "enabled": True,
+            "min_valid_frames": 3,
+            "min_depth": 0.01,
+            "max_depth": 10.0,
+            "boundary_margin": 50,
+            "visibility_threshold": 0.0,
+            "check_depth_smoothness": False,
+            "depth_change_threshold": 0.5,
+            "use_visibility": False,
+        },
+        "standard": {
+            "enabled": True,
+            "min_valid_frames": 3,
+            "min_depth": 0.01,
+            "max_depth": 10.0,
+            "boundary_margin": 50,
+            "visibility_threshold": 0.5,
+            "check_depth_smoothness": True,
+            "depth_change_threshold": 0.5,
+            "use_visibility": True,
+        },
+        "strict": {
+            "enabled": True,
+            "min_valid_frames": 5,
+            "min_depth": 0.01,
+            "max_depth": 10.0,
+            "boundary_margin": 20,
+            "visibility_threshold": 0.6,
+            "check_depth_smoothness": True,
+            "depth_change_threshold": 0.3,
+            "use_visibility": True,
+        },
+        "none": {
+            "enabled": False,
+            "min_valid_frames": 0,
+            "min_depth": 0.01,
+            "max_depth": 10.0,
+            "boundary_margin": 50,
+            "visibility_threshold": 0.0,
+            "check_depth_smoothness": False,
+            "depth_change_threshold": 0.5,
+            "use_visibility": False,
+        },
+    }
+    config = defaults[level].copy()
+    if filter_args is None:
+        return config
+
+    overrides = {
+        "min_valid_frames": getattr(filter_args, "min_valid_frames", None),
+        "visibility_threshold": getattr(filter_args, "visibility_threshold", None),
+        "min_depth": getattr(filter_args, "min_depth", None),
+        "max_depth": getattr(filter_args, "max_depth", None),
+        "boundary_margin": getattr(filter_args, "boundary_margin", None),
+        "depth_change_threshold": getattr(filter_args, "depth_change_threshold", None),
+    }
+    for key, value in overrides.items():
+        if value is not None:
+            config[key] = value
+    return config
+
+
+def build_traj_valid_mask(
+    traj: np.ndarray,
+    visibs: np.ndarray | None,
+    image_width: int,
+    image_height: int,
+    filter_args,
+) -> np.ndarray:
+    """Build the per-trajectory validity mask stored in sample NPZ files."""
+    config = resolve_traj_filter_config(filter_args)
+    if not config["enabled"]:
+        return np.ones(traj.shape[0], dtype=bool)
+
+    visibs_for_filter = None
+    if config["use_visibility"] and visibs is not None:
+        visibs_for_filter = np.asarray(visibs)
+        if visibs_for_filter.ndim == 3 and visibs_for_filter.shape[-1] == 1:
+            visibs_for_filter = visibs_for_filter.squeeze(-1)
+        if visibs_for_filter.shape[0] == traj.shape[1] and visibs_for_filter.shape[1] == traj.shape[0]:
+            visibs_for_filter = visibs_for_filter.T
+        visibs_for_filter = visibs_for_filter.astype(bool, copy=False)
+
+    return compute_traj_valid_mask(
+        traj,
+        visibs=visibs_for_filter,
+        image_width=image_width,
+        image_height=image_height,
+        min_valid_frames=config["min_valid_frames"],
+        min_depth=config["min_depth"],
+        max_depth=config["max_depth"],
+        boundary_margin=config["boundary_margin"],
+        visibility_threshold=config["visibility_threshold"],
+        check_depth_smoothness=config["check_depth_smoothness"],
+        depth_change_threshold=config["depth_change_threshold"],
+    )
 
 def retarget_trajectories(
     trajectory: np.ndarray,
@@ -350,6 +567,7 @@ def save_single_query_frame(
     frame_data,
     future_len: int,
     grid_size: int,
+    filter_args=None,
 ):
     """Save single query frame result"""
     video_output_dir = os.path.join(output_dir, video_name)
@@ -409,6 +627,14 @@ def save_single_query_frame(
 
     # Filter anomalous trajectories
     sample_data["traj"] = filter_anomalous_trajectories(sample_data["traj"])
+
+    sample_data["traj_valid_mask"] = build_traj_valid_mask(
+        traj=sample_data["traj"],
+        visibs=visibs_np,
+        image_width=frame_w,
+        image_height=frame_h,
+        filter_args=filter_args,
+    )
 
     # Pad trajectories to future_len
     current_len = sample_data["traj"].shape[1]
@@ -475,6 +701,7 @@ def save_structured_data(
     query_frame_results=None,
     future_len: int = 128,
     grid_size: int = 20,
+    filter_args=None,
 ):
     """Save data in the structured format"""
 
@@ -495,181 +722,19 @@ def save_structured_data(
         saved_count = 0
 
         for query_frame_idx, frame_data in query_frame_results.items():
-            coords_np = frame_data["coords"].cpu().numpy()  # (T, grid_size*grid_size, 3)
-
-            # Save RGB images for this segment
-            video_segment = frame_data["video_segment"].cpu().numpy() * 255
-            video_segment = video_segment.astype(np.uint8).transpose(
-                0, 2, 3, 1
-            )  # (T, H, W, 3)
-
-
-            # Save sample data for this query frame
-            coords_np = frame_data["coords"].cpu().numpy()  # (T, grid_size*grid_size, 3) where T <= future_len
-            visibs_np = frame_data["visibs"].cpu().numpy()  # (T, grid_size*grid_size)
-            intrinsics_np = frame_data["intrinsics_segment"].cpu().numpy()  # (T, 3, 3)
-            extrinsics_np = frame_data["extrinsics_segment"].cpu().numpy()  # (T, 4, 4)
-
-            # Debug: Check shapes
-            logger.debug(
-                f"Query frame {query_frame_idx}: coords_np shape = {coords_np.shape}"
-            )
-            logger.debug(
-                f"Query frame {query_frame_idx}: visibs_np shape = {visibs_np.shape}"
-            )
-
-            # Handle edge cases where coords might not have expected dimensions
-            if len(coords_np.shape) != 3:
-                logger.error(
-                    f"Unexpected coords shape for frame {query_frame_idx}: {coords_np.shape}"
-                )
-                continue
-
-            # Get actual number of frames in this segment
-            actual_frames = coords_np.shape[0]
-
-            # Create sample data for this query frame
-            sample_data = {}
-
-            # Grid points (grid_size x grid_size points) for this query frame
-            frame_h, frame_w = video_segment.shape[1:3]
-            y_coords = np.linspace(0, frame_h - 1, grid_size)
-            x_coords = np.linspace(0, frame_w - 1, grid_size)
-            xx, yy = np.meshgrid(x_coords, y_coords)
-            keypoints = np.stack([xx.flatten(), yy.flatten()], axis=1)  # (grid_size*grid_size, 2)
-
-            sample_data["image_path"] = np.array(
-                [f"images/{video_name}_{query_frame_idx}.png"], dtype="<U50"
-            )
-            sample_data["frame_index"] = np.array([query_frame_idx])
-            sample_data["keypoints"] = keypoints.astype(np.float32)  # (grid_size*grid_size, 2)
-
-            # trajectories: (grid_size*grid_size, T, 3) - grid_size*grid_size tracks, T frames (T <= future_len), xyz coordinates
             try:
-                sample_data["traj"] = coords_np.transpose(1, 0, 2).astype(
-                    np.float32
-                )  # (grid_size*grid_size, T, 3)
-            except ValueError as e:
-                logger.error(
-                    f"Error transposing coords for frame {query_frame_idx}: {e}"
+                save_single_query_frame(
+                    video_name=video_name,
+                    output_dir=output_dir,
+                    query_frame_idx=query_frame_idx,
+                    frame_data=frame_data,
+                    future_len=future_len,
+                    grid_size=grid_size,
+                    filter_args=filter_args,
                 )
-                logger.error(f"coords_np shape: {coords_np.shape}")
-                # Skip this frame and continue
-                continue
-
-            # Project 3D coordinates to 2D for traj_2d
-            camera_views_segment = []
-            for t in range(len(intrinsics_np)):
-                camera_views_segment.append(
-                    {
-                        "c2w": np.linalg.inv(extrinsics_np[t]),
-                        "K": intrinsics_np[t],
-                        "height": frame_h,
-                        "width": frame_w,
-                    }
-                )
-
-            # Use the first frame's camera for consistent projection
-            fixed_camera_view = camera_views_segment[0]
-
-            # Project to 2D using the same camera view
-            coords_3d_for_projection = coords_np  # (T, grid_size*grid_size, 3)
-            try:
-                tracks2d_fixed = project_tracks_3d_to_2d(
-                    tracks3d=coords_3d_for_projection,
-                    camera_views=[fixed_camera_view] * len(coords_3d_for_projection),
-                )  # (T, grid_size*grid_size, 2)
-                tracks3d_fixed = project_tracks_3d_to_3d(
-                    tracks3d=coords_3d_for_projection,
-                    camera_views=[fixed_camera_view] * len(coords_3d_for_projection),
-                )  # (T, grid_size*grid_size, 3)
-
-                sample_data["traj_2d"] = tracks2d_fixed.transpose(1, 0, 2).astype(
-                    np.float32
-                )  # (grid_size*grid_size, T, 2)
-                sample_data["traj"] = tracks3d_fixed.transpose(1, 0, 2).astype(
-                    np.float32
-                )  # (grid_size*grid_size, T, 3)
+                saved_count += 1
             except Exception as e:
-                logger.error(
-                    f"Error projecting tracks for frame {query_frame_idx}: {e}"
-                )
-                # Fallback: use original coordinates
-                sample_data["traj_2d"] = (
-                    coords_np[:, :, :2].transpose(1, 0, 2).astype(np.float32)
-                )
-                sample_data["traj"] = coords_np.transpose(1, 0, 2).astype(np.float32)
-
-            # Filter anomalous trajectories
-            sample_data["traj"] = filter_anomalous_trajectories(sample_data["traj"])
-
-            # Pad trajectories to future_len
-            current_len = sample_data["traj"].shape[1]
-            if current_len < args.future_len:
-                pad_len = args.future_len - current_len
-                pad_shape = (sample_data["traj"].shape[0], pad_len, sample_data["traj"].shape[2])
-                pad_array = np.full(pad_shape, np.inf, dtype=sample_data["traj"].dtype)
-                sample_data["traj"] = np.concatenate([sample_data["traj"], pad_array], axis=1)
-
-                pad_shape_2d = (sample_data["traj_2d"].shape[0], pad_len, sample_data["traj_2d"].shape[2])
-                pad_array_2d = np.full(pad_shape_2d, np.inf, dtype=sample_data["traj_2d"].dtype)
-                sample_data["traj_2d"] = np.concatenate([sample_data["traj_2d"], pad_array_2d], axis=1)
-
-            # Only save image and depth for the query frame itself, not the entire segment
-            query_frame_img = video_segment[
-                0
-            ]  # First frame in segment is the query frame
-            query_frame_depth = (
-                frame_data["depths_segment"].cpu().numpy()[0]
-            )  # First depth
-
-            img_filename = f"{video_name}_{query_frame_idx}.png"
-            img_path = os.path.join(images_dir, img_filename)
-            if not os.path.exists(img_path):  # Avoid duplicate saves
-                Image.fromarray(query_frame_img).save(img_path)
-
-            # Save depth image for query frame only
-            depth_filename = f"{video_name}_{query_frame_idx}.png"
-            depth_path = os.path.join(depth_dir, depth_filename)
-            if not os.path.exists(depth_path):  # Avoid duplicate saves
-                # Save depth as 16-bit PNG with normalization for better visualization
-                # Normalize depth to use full 16-bit range (0-65535) for better contrast
-                # The raw depth values are saved in NPZ for accurate reconstruction
-                depth_valid = query_frame_depth[query_frame_depth > 0]
-                if len(depth_valid) > 0:
-                    depth_min = depth_valid.min()
-                    depth_max = depth_valid.max()
-                    # Normalize to 0-65535 range, with a small margin to avoid clipping
-                    if depth_max > depth_min:
-                        depth_normalized = ((query_frame_depth - depth_min) / (depth_max - depth_min) * 65535.0).clip(0, 65535).astype(np.uint16)
-                    else:
-                        # If all values are the same, set to a middle value
-                        depth_normalized = np.full_like(query_frame_depth, 32767, dtype=np.uint16)
-                else:
-                    # No valid depth values
-                    depth_normalized = np.zeros_like(query_frame_depth, dtype=np.uint16)
-                
-                Image.fromarray(depth_normalized, mode="I;16").save(depth_path)
-
-                # save depth raw value as npz (for accurate reconstruction)
-                depth_raw_filename = f"{video_name}_{query_frame_idx}_raw.npz"
-                depth_raw_path = os.path.join(depth_dir, depth_raw_filename)
-                np.savez(depth_raw_path, depth=query_frame_depth)
-
-            # Retarget disabled - use original trajectory
-            # retargeted, valid_mask = retarget_trajectories(sample_data["traj"], max_length=args.future_len)
-            # sample_data["traj"] = retargeted
-            # sample_data["valid_steps"] = valid_mask
-
-            # Save sample NPZ for this query frame
-            sample_filename = f"{video_name}_{query_frame_idx}.npz"
-            sample_path = os.path.join(samples_dir, sample_filename)
-            np.savez(sample_path, **sample_data)
-
-            logger.info(
-                f"Saved query frame {query_frame_idx} with {grid_size * grid_size} trajectories tracked for {actual_frames} frames"
-            )
-            saved_count += 1
+                logger.error(f"Failed to save query frame {query_frame_idx}: {e}")
 
         logger.info(f"Saved {saved_count} frames")
 
@@ -920,6 +985,7 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
                 frame_data=query_frame_results[start_frame],
                 future_len=args.future_len,
                 grid_size=args.grid_size,
+                filter_args=args,
             )
 
         # Clear cache after inference to free memory
@@ -1351,6 +1417,7 @@ if __name__ == "__main__":
                 query_frame_results=result.get("query_frame_results"),
                 future_len=args.future_len,
                 grid_size=args.grid_size,
+                filter_args=args,
             )
 
             # Always save traditional visualization NPZ in video directory root

@@ -127,6 +127,49 @@ def parse_args():
         help="每帧网格采样点数 grid_size x grid_size",
     )
     parser.add_argument(
+        "--filter_level",
+        type=str,
+        default="standard",
+        choices=["none", "basic", "standard", "strict"],
+        help="sample traj_valid_mask 的轨迹过滤级别",
+    )
+    parser.add_argument(
+        "--min_valid_frames",
+        type=int,
+        default=None,
+        help="最小有效帧数（覆盖 filter_level 默认值）",
+    )
+    parser.add_argument(
+        "--visibility_threshold",
+        type=float,
+        default=None,
+        help="最小可见比例（覆盖 filter_level 默认值）",
+    )
+    parser.add_argument(
+        "--min_depth",
+        type=float,
+        default=0.01,
+        help="最小深度值（米）",
+    )
+    parser.add_argument(
+        "--max_depth",
+        type=float,
+        default=10.0,
+        help="最大深度值（米）",
+    )
+    parser.add_argument(
+        "--boundary_margin",
+        type=int,
+        default=None,
+        help="投影边界容差（像素，覆盖 filter_level 默认值）",
+    )
+    parser.add_argument(
+        "--depth_change_threshold",
+        type=float,
+        default=None,
+        help="深度变化标准差阈值（米，覆盖 filter_level 默认值）",
+    )
+    parser.add_argument(
         "--max_cameras",
         type=int,
         default=3,
@@ -260,8 +303,6 @@ def run_traj(
             continue
 
         out_dir_str = str(out_traj_dir)
-        # save_structured_data 内部使用 args.future_len，需注入
-        infer.args = args
         infer.save_structured_data(
             video_name=camera_name,
             output_dir=out_dir_str,
@@ -278,6 +319,7 @@ def run_traj(
             query_frame_results=result.get("query_frame_results"),
             future_len=args.future_len,
             grid_size=args.grid_size,
+            filter_args=args,
         )
 
         video_dir = os.path.join(out_dir_str, camera_name)
