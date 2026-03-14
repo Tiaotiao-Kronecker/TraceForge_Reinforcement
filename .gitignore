@@ -1,8 +1,30 @@
-**/__pycache__
-**/*.pyc
-**/*.egg-info
-third_party/pointops2/build
-third_party/pointops2/dist
-checkpoints/
-test*/
-.env
+# Data directories
+data/
+output*/
+bridgeV2_*/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Checkpoints (keep directory structure but ignore large files)
+checkpoints/*.pth
+checkpoints/*.pt
+!checkpoints/.gitkeep
+
+# Temporary files
+*.tmp
+*.log
