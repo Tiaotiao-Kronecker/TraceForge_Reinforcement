@@ -1,95 +1,75 @@
 #!/usr/bin/env python3
 """
-Batch Process Result Checker
+Batch Process Result Checker (uvz/depth-colored trajectory overlay).
 
-This script checks the output of batch processing for point tracking results.
-It validates the directory structure, checks data integrity, and creates
-visualizations of keypoints and trajectories overlaid on images.
-
-Expected structure:
-<output_root>/
-  <video_name>/
-    images/
-      <video_name>_0.png      # Frame at index 0
-      <video_name>_5.png      # Frame at index 5
-      ...
-    samples/
-      <video_name>_0.npz      # Sample for frame 0
-      <video_name>_5.npz      # Sample for frame 5
-      ...
+Supports both TraceForge `v2` and `legacy` layouts.
 """
 
-import os
+from __future__ import annotations
+
 import argparse
-import numpy as np
-import matplotlib.pyplot as plt
-from PIL import Image
-from pathlib import Path
-import glob
-from collections import defaultdict
+import sys
 import warnings
-warnings.filterwarnings('ignore')
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from utils.traceforge_artifact_utils import (
+    SceneReader,
+    detect_output_layout,
+    list_sample_query_frames,
+    normalize_sample_data,
+)
+
+warnings.filterwarnings("ignore")
 
 
 class BatchProcessChecker:
-    def __init__(self, output_root, max_videos_to_check=3, max_samples_per_video=3):
-        """
-        Initialize the checker.
-
-        Args:
-            output_root (str): Root directory containing batch processing results
-            max_videos_to_check (int): Maximum number of videos to check
-            max_samples_per_video (int): Maximum number of samples per video to visualize
-        """
+    def __init__(self, output_root: str, max_videos_to_check: int = 3, max_samples_per_video: int = 3):
         self.output_root = Path(output_root)
         self.max_videos_to_check = max_videos_to_check
         self.max_samples_per_video = max_samples_per_video
-        self.errors = []
-        self.warnings = []
+        self.errors: list[str] = []
+        self.warnings: list[str] = []
 
-    def log_error(self, message):
-        """Log an error message."""
+    def log_error(self, message: str) -> None:
         self.errors.append(message)
-        print(f"❌ ERROR: {message}")
+        print(f"ERROR: {message}")
 
-    def log_warning(self, message):
-        """Log a warning message."""
+    def log_warning(self, message: str) -> None:
         self.warnings.append(message)
-        print(f"⚠️  WARNING: {message}")
+        print(f"WARNING: {message}")
 
-    def log_info(self, message):
-        """Log an info message."""
-        print(f"ℹ️  {message}")
+    def log_info(self, message: str) -> None:
+        print(f"INFO: {message}")
 
-    def log_success(self, message):
-        """Log a success message."""
-        print(f"✅ {message}")
+    def log_success(self, message: str) -> None:
+        print(f"OK: {message}")
 
-    def check_overall_structure(self):
-        """Check the overall directory structure."""
-        print("\n" + "="*60)
+    def iter_video_dirs(self) -> list[Path]:
+        return [d for d in self.output_root.iterdir() if d.is_dir() and d.name != "visualizations"]
+
+    def check_overall_structure(self) -> bool:
+        print("\n" + "=" * 60)
         print("CHECKING OVERALL STRUCTURE")
-        print("="*60)
+        print("=" * 60)
 
         if not self.output_root.exists():
             self.log_error(f"Output root directory does not exist: {self.output_root}")
             return False
 
-        # Find all video directories
-        video_dirs = [d for d in self.output_root.iterdir() if d.is_dir()]
-
+        video_dirs = self.iter_video_dirs()
         if not video_dirs:
             self.log_error(f"No video directories found in {self.output_root}")
             return False
 
         self.log_success(f"Found {len(video_dirs)} video directories")
-
-        # Check structure for each video directory
-        valid_videos = []
-        for video_dir in video_dirs:
-            if self.check_video_structure(video_dir):
-                valid_videos.append(video_dir)
-
+        valid_videos = [video_dir for video_dir in video_dirs if self.check_video_structure(video_dir)]
         if not valid_videos:
             self.log_error("No valid video directories found")
             return False
@@ -97,414 +77,254 @@ class BatchProcessChecker:
         self.log_success(f"{len(valid_videos)}/{len(video_dirs)} video directories have valid structure")
         return True
 
-    def check_video_structure(self, video_dir):
-        """Check structure for a single video directory."""
+    def check_video_structure(self, video_dir: Path) -> bool:
         video_name = video_dir.name
-
-        # Check for required subdirectories
-        images_dir = video_dir / "images"
         samples_dir = video_dir / "samples"
-
-        if not images_dir.exists():
-            self.log_warning(f"Missing images directory in {video_name}")
-            return False
-
-        if not samples_dir.exists():
+        if not samples_dir.is_dir():
             self.log_warning(f"Missing samples directory in {video_name}")
             return False
 
-        # Check for files in directories
-        image_files = list(images_dir.glob("*.png"))
         sample_files = list(samples_dir.glob("*.npz"))
-
-        if not image_files:
-            self.log_warning(f"No PNG files found in {video_name}/images/")
-            return False
-
         if not sample_files:
             self.log_warning(f"No NPZ files found in {video_name}/samples/")
             return False
 
-        # Check naming consistency
-        image_indices = set()
-        sample_indices = set()
+        layout = detect_output_layout(video_dir)
+        if layout == "v2":
+            required = ["scene.h5", "scene_meta.json", "scene_rgb.mp4"]
+            missing = [name for name in required if not (video_dir / name).is_file()]
+            if missing:
+                self.log_warning(f"Missing v2 artifacts in {video_name}: {missing}")
+                return False
+        else:
+            images_dir = video_dir / "images"
+            if not images_dir.is_dir():
+                self.log_warning(f"Missing images directory in {video_name}")
+                return False
+            if not list(images_dir.glob("*.png")):
+                self.log_warning(f"No PNG files found in {video_name}/images/")
+                return False
 
-        for img_file in image_files:
-            if img_file.stem.startswith(f"{video_name}_"):
-                try:
-                    idx = int(img_file.stem.split("_")[-1])
-                    image_indices.add(idx)
-                except ValueError:
-                    self.log_warning(f"Invalid image file name format: {img_file.name}")
-
-        for sample_file in sample_files:
-            if sample_file.stem.startswith(f"{video_name}_"):
-                try:
-                    idx = int(sample_file.stem.split("_")[-1])
-                    sample_indices.add(idx)
-                except ValueError:
-                    self.log_warning(f"Invalid sample file name format: {sample_file.name}")
-
-        # Check if indices match
-        if image_indices != sample_indices:
-            missing_images = sample_indices - image_indices
-            missing_samples = image_indices - sample_indices
-            if missing_images:
-                self.log_warning(f"Missing images for indices in {video_name}: {sorted(missing_images)}")
-            if missing_samples:
-                self.log_warning(f"Missing samples for indices in {video_name}: {sorted(missing_samples)}")
-
-        self.log_info(f"Video {video_name}: {len(image_files)} images, {len(sample_files)} samples")
+        self.log_info(f"Video {video_name}: layout={layout}, samples={len(sample_files)}")
         return True
 
-    def load_and_validate_sample(self, sample_path):
-        """Load and validate a sample file."""
+    def load_and_validate_sample(self, sample_path: Path) -> dict | None:
         try:
-            data = np.load(sample_path)
+            sample = normalize_sample_data(sample_path)
+            traj = sample["traj_uvz"].astype(np.float32)
+            keypoints = sample["keypoints"].astype(np.float32)
+            traj_valid_mask = sample["traj_valid_mask"].astype(bool, copy=False)
+            segment_frame_indices = np.asarray(sample["segment_frame_indices"], dtype=np.int32)
 
-            # Check required fields
-            required_fields = ['keypoints', 'traj', 'valid_steps', 'image_path', 'frame_index']
-            missing_fields = [field for field in required_fields if field not in data.files]
+            if sample.get("frame_aligned", False) and len(segment_frame_indices) < traj.shape[1]:
+                traj = traj[:, : len(segment_frame_indices)]
 
-            if missing_fields:
-                self.log_warning(f"Missing fields in {sample_path.name}: {missing_fields}")
-                return None
-
-            # Validate data shapes and types
-            keypoints = data['keypoints']  # [K, 2]
-            traj = data['traj']           # [K, T, 3] - now 3D with x, y, depth
-            valid_steps = data['valid_steps']  # scalar or boolean array
+            keypoints = keypoints[traj_valid_mask]
+            traj = traj[traj_valid_mask]
+            valid_steps = np.ones(traj.shape[1], dtype=bool)
+            if sample["layout"] == "legacy" and not sample.get("frame_aligned", False):
+                valid_steps = np.asarray(sample.get("valid_steps", valid_steps)).astype(bool, copy=False)[: traj.shape[1]]
 
             if keypoints.ndim != 2 or keypoints.shape[1] != 2:
                 self.log_warning(f"Invalid keypoints shape in {sample_path.name}: {keypoints.shape}")
                 return None
-
             if traj.ndim != 3 or traj.shape[0] != len(keypoints) or traj.shape[2] != 3:
-                self.log_warning(f"Invalid trajectory shape in {sample_path.name}: {traj.shape} (expected 3D with x,y,depth)")
+                self.log_warning(f"Invalid uvz trajectory shape in {sample_path.name}: {traj.shape}")
                 return None
 
-            return data
-
-        except Exception as e:
-            self.log_error(f"Failed to load sample {sample_path.name}: {e}")
+            return {
+                "keypoints": keypoints,
+                "traj": traj,
+                "valid_steps": valid_steps,
+                "query_frame_index": int(sample["query_frame_index"]),
+            }
+        except Exception as exc:
+            self.log_error(f"Failed to load sample {sample_path.name}: {exc}")
             return None
 
-    def check_keypoints_in_bounds(self, keypoints, image_shape, sample_name):
-        """Check if keypoints are within image bounds."""
+    def check_keypoints_in_bounds(self, keypoints: np.ndarray, image_shape: tuple[int, ...], sample_name: str) -> bool:
         h, w = image_shape[:2]
-
-        # Check x coordinates (width)
-        x_coords = keypoints[:, 0]
-        x_out_of_bounds = np.logical_or(x_coords < 0, x_coords >= w)
-
-        # Check y coordinates (height)
-        y_coords = keypoints[:, 1]
-        y_out_of_bounds = np.logical_or(y_coords < 0, y_coords >= h)
-
-        out_of_bounds = np.logical_or(x_out_of_bounds, y_out_of_bounds)
-
+        x_out_of_bounds = (keypoints[:, 0] < 0) | (keypoints[:, 0] >= w)
+        y_out_of_bounds = (keypoints[:, 1] < 0) | (keypoints[:, 1] >= h)
+        out_of_bounds = x_out_of_bounds | y_out_of_bounds
         if np.any(out_of_bounds):
-            n_out = np.sum(out_of_bounds)
-            self.log_warning(f"{sample_name}: {n_out}/{len(keypoints)} keypoints out of bounds")
+            self.log_warning(f"{sample_name}: {int(np.sum(out_of_bounds))}/{len(keypoints)} keypoints out of bounds")
             return False
-        else:
-            self.log_info(f"{sample_name}: All keypoints within bounds")
-            return True
+        self.log_info(f"{sample_name}: All keypoints within bounds")
+        return True
 
-    def create_visualization(self, image_path, data, output_path, video_name, frame_idx):
-        """Create visualization with keypoints and trajectories overlaid."""
+    def create_visualization(
+        self,
+        image: np.ndarray,
+        data: dict,
+        output_path: Path,
+        video_name: str,
+        frame_idx: int,
+    ) -> bool:
         try:
-            # Load image
-            image = np.array(Image.open(image_path))
             h, w = image.shape[:2]
+            keypoints = data["keypoints"]
+            traj = data["traj"]
+            valid_steps = np.asarray(data["valid_steps"]).astype(bool, copy=False)
 
-            keypoints = data['keypoints']
-            traj = data['traj']  # Now 3D: [K, T, 3] where last dimension is depth
-
-            # Handle valid_steps - could be scalar or boolean array
-            valid_steps_raw = data['valid_steps']
-            if hasattr(valid_steps_raw, 'shape') and valid_steps_raw.shape:
-                # It's an array - count True values or use length
-                if valid_steps_raw.dtype == bool:
-                    valid_steps = int(np.sum(valid_steps_raw))
-                else:
-                    valid_steps = int(len(valid_steps_raw))
-            else:
-                # It's a scalar
-                valid_steps = int(valid_steps_raw)
-            # Create figure with subplots
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
-
-            # Use a single color for all keypoints
             keypoint_color = plt.cm.tab20(0)
 
-            # Plot 1: Keypoints overlay
             ax1.imshow(image)
-            ax1.set_title(f'{video_name} Frame {frame_idx} - Keypoints')
-
+            ax1.set_title(f"{video_name} Frame {frame_idx} - Keypoints")
             for kp in keypoints:
-                ax1.scatter(kp[0], kp[1], c=[keypoint_color], s=50, alpha=0.8, edgecolors='white', linewidths=1)
-
+                ax1.scatter(kp[0], kp[1], c=[keypoint_color], s=50, alpha=0.8, edgecolors="white", linewidths=1)
             ax1.set_xlim(0, w)
-            ax1.set_ylim(h, 0)  # Flip y-axis for image coordinates
-            ax1.axis('off')
+            ax1.set_ylim(h, 0)
+            ax1.axis("off")
 
-            # Plot 2: Trajectories overlay with depth-based coloring
             ax2.imshow(image)
-            ax2.set_title(f'{video_name} Frame {frame_idx} - 3D Trajectories (Depth as Color)')
-            for i, (kp, trajectory) in enumerate(zip(keypoints, traj)):
-                # Plot current keypoint
-                ax2.scatter(kp[0], kp[1], c=['red'], s=100, alpha=0.9,
-                          edgecolors='white', linewidths=2, marker='o')
+            ax2.set_title(f"{video_name} Frame {frame_idx} - UVZ Trajectories (Depth as Color)")
+            for kp, trajectory in zip(keypoints, traj):
+                ax2.scatter(kp[0], kp[1], c=["red"], s=100, alpha=0.9, edgecolors="white", linewidths=2, marker="o")
+                valid_traj = trajectory[valid_steps[: trajectory.shape[0]]]
+                finite_mask = np.isfinite(valid_traj).all(axis=1)
+                valid_traj = valid_traj[finite_mask]
+                if len(valid_traj) < 2:
+                    continue
 
-                # Plot trajectory (only valid steps)
-                # If valid_steps is boolean array, use it as mask; otherwise use as count
-                if hasattr(data['valid_steps'], 'shape') and data['valid_steps'].shape and data['valid_steps'].dtype == bool:
-                    # Use boolean mask
-                    valid_mask_steps = data['valid_steps']
-                    valid_traj = trajectory[valid_mask_steps]
+                x_coords = valid_traj[:, 0]
+                y_coords = valid_traj[:, 1]
+                depth_values = valid_traj[:, 2]
+                depth_min = float(np.min(depth_values))
+                depth_max = float(np.max(depth_values))
+                if depth_max > depth_min:
+                    depth_normalized = (depth_values - depth_min) / (depth_max - depth_min)
                 else:
-                    # Use as count
-                    valid_traj = trajectory[:valid_steps]
+                    depth_normalized = np.full_like(depth_values, 0.5)
 
-                # Filter out invalid points (marked with -inf or nan)
-                if len(valid_traj) > 0:
-                    valid_mask = ~(np.isinf(valid_traj).any(axis=1) | np.isnan(valid_traj).any(axis=1))
-                    if np.any(valid_mask):
-                        valid_traj_filtered = valid_traj[valid_mask]
-
-                        if len(valid_traj_filtered) > 1:
-                            # Extract x, y coordinates and depth values
-                            x_coords = valid_traj_filtered[:, 0]
-                            y_coords = valid_traj_filtered[:, 1]
-                            depth_values = valid_traj_filtered[:, 2]
-
-                            # Normalize depth values for color mapping
-                            if len(depth_values) > 0 and not np.all(np.isnan(depth_values)):
-                                # Remove any remaining nan values in depth
-                                valid_depth_mask = ~np.isnan(depth_values)
-                                if np.any(valid_depth_mask):
-                                    valid_depths = depth_values[valid_depth_mask]
-                                    depth_min, depth_max = valid_depths.min(), valid_depths.max()
-
-                                    if depth_max > depth_min:
-                                        # Global normalization for consistent coloring
-                                        depth_normalized = np.full_like(depth_values, 0.5)  # default middle value
-                                        depth_normalized[valid_depth_mask] = (valid_depths - depth_min) / (depth_max - depth_min)
-                                    else:
-                                        depth_normalized = np.ones_like(depth_values) * 0.5
-
-                                    # Create line segments with colors based on depth
-                                    for j in range(len(x_coords) - 1):
-                                        # Skip if either point has invalid depth
-                                        if np.isnan(depth_normalized[j]) or np.isnan(depth_normalized[j+1]):
-                                            segment_color = 'blue'
-                                        else:
-                                            # Use average depth of segment for color
-                                            segment_depth = (depth_normalized[j] + depth_normalized[j+1]) / 2
-                                            segment_color = plt.cm.viridis(segment_depth)
-
-                                        ax2.plot([x_coords[j], x_coords[j+1]],
-                                               [y_coords[j], y_coords[j+1]],
-                                               color=segment_color, alpha=0.8, linewidth=2)
-
-                                    # Mark trajectory end with color based on final depth
-                                    if not np.isnan(depth_normalized[-1]):
-                                        final_color = plt.cm.viridis(depth_normalized[-1])
-                                    else:
-                                        final_color = 'red'
-                                    ax2.scatter(x_coords[:], y_coords[:],
-                                              c=[final_color], s=50, alpha=0.9, marker='x', linewidths=2)
-                                else:
-                                    # All depth values are invalid
-                                    ax2.plot(x_coords, y_coords, color='blue', alpha=0.7, linewidth=2)
-                                    ax2.scatter(x_coords[:], y_coords[:],
-                                              c=['blue'], s=50, alpha=0.7, marker='x', linewidths=2)
-                            else:
-                                # No valid depth values
-                                ax2.plot(x_coords, y_coords, color='blue', alpha=0.7, linewidth=2)
-                                ax2.scatter(x_coords[:], y_coords[:],
-                                          c=['blue'], s=50, alpha=0.7, marker='x', linewidths=2)
+                for idx in range(len(x_coords) - 1):
+                    segment_depth = 0.5 * (depth_normalized[idx] + depth_normalized[idx + 1])
+                    ax2.plot(
+                        [x_coords[idx], x_coords[idx + 1]],
+                        [y_coords[idx], y_coords[idx + 1]],
+                        color=plt.cm.viridis(segment_depth),
+                        alpha=0.8,
+                        linewidth=2,
+                    )
+                ax2.scatter(x_coords, y_coords, c=plt.cm.viridis(depth_normalized), s=40, alpha=0.9, marker="x", linewidths=2)
 
             ax2.set_xlim(0, w)
-            ax2.set_ylim(h, 0)  # Flip y-axis for image coordinates
-            ax2.axis('off')
+            ax2.set_ylim(h, 0)
+            ax2.axis("off")
 
-            # Add colorbar for depth visualization
             sm = plt.cm.ScalarMappable(cmap=plt.cm.viridis, norm=plt.Normalize(vmin=0, vmax=1))
             sm.set_array([])
             cbar = plt.colorbar(sm, ax=ax2, shrink=0.8, aspect=20)
-            cbar.set_label('Normalized Depth (0=Near, 1=Far)', rotation=270, labelpad=15)
+            cbar.set_label("Normalized Depth (0=Near, 1=Far)", rotation=270, labelpad=15)
 
-            # Add info text
-            info_text = f"Keypoints: {len(keypoints)}\nValid steps: {valid_steps}"
-            fig.text(0.02, 0.98, info_text, fontsize=10, verticalalignment='top',
-                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            info_text = f"Keypoints: {len(keypoints)}\nValid steps: {int(np.sum(valid_steps))}"
+            fig.text(
+                0.02,
+                0.98,
+                info_text,
+                fontsize=10,
+                verticalalignment="top",
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+            )
 
             plt.tight_layout()
-            plt.savefig(output_path, dpi=150, bbox_inches='tight')
+            plt.savefig(output_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
-
             self.log_success(f"Created visualization: {output_path}")
             return True
-
-        except Exception as e:
-            self.log_error(f"Failed to create visualization for {video_name} frame {frame_idx}: {e}")
+        except Exception as exc:
+            self.log_error(f"Failed to create visualization for {video_name} frame {frame_idx}: {exc}")
             return False
 
-    def check_and_visualize_data(self):
-        """Check data integrity and create visualizations."""
-        print("\n" + "="*60)
+    def check_and_visualize_data(self) -> None:
+        print("\n" + "=" * 60)
         print("CHECKING DATA AND CREATING VISUALIZATIONS")
-        print("="*60)
+        print("=" * 60)
 
-        # Find video directories
-        video_dirs = [d for d in self.output_root.iterdir() if d.is_dir()]
-        video_dirs = sorted(video_dirs)[:self.max_videos_to_check]
-
-        # Create output directory for visualizations
+        video_dirs = sorted(self.iter_video_dirs())[: self.max_videos_to_check]
         vis_output_dir = self.output_root / "visualizations"
         vis_output_dir.mkdir(exist_ok=True)
 
         for video_dir in video_dirs:
             video_name = video_dir.name
             self.log_info(f"Processing video: {video_name}")
-
-            # Get sample files
             samples_dir = video_dir / "samples"
-            images_dir = video_dir / "images"
-
-            if not samples_dir.exists() or not images_dir.exists():
+            if not samples_dir.is_dir():
                 continue
 
-            sample_files = sorted(list(samples_dir.glob("*.npz")))[:self.max_samples_per_video]
+            sample_files = sorted(samples_dir.glob("*.npz"))[: self.max_samples_per_video]
+            with SceneReader(video_dir) as scene_reader:
+                for sample_file in sample_files:
+                    data = self.load_and_validate_sample(sample_file)
+                    if data is None:
+                        continue
 
-            for sample_file in sample_files:
-                # Extract frame index
-                try:
-                    frame_idx = int(sample_file.stem.split("_")[-1])
-                except ValueError:
-                    continue
+                    frame_idx = int(data["query_frame_index"])
+                    try:
+                        image = scene_reader.get_rgb_frame(frame_idx)
+                        self.check_keypoints_in_bounds(data["keypoints"], image.shape, f"{video_name}_{frame_idx}")
+                        vis_path = vis_output_dir / f"{video_name}_frame_{frame_idx}_visualization.png"
+                        self.create_visualization(image, data, vis_path, video_name, frame_idx)
+                    except Exception as exc:
+                        self.log_error(f"Failed to process {video_name} frame {frame_idx}: {exc}")
 
-                # Load sample data
-                data = self.load_and_validate_sample(sample_file)
-                if data is None:
-                    continue
-
-                # Find corresponding image
-                image_file = images_dir / f"{video_name}_{frame_idx}.png"
-                if not image_file.exists():
-                    self.log_warning(f"Missing image file: {image_file}")
-                    continue
-
-                try:
-                    # Load image to check bounds
-                    image = np.array(Image.open(image_file))
-
-                    # Check keypoints bounds
-                    self.check_keypoints_in_bounds(data['keypoints'], image.shape,
-                                                 f"{video_name}_{frame_idx}")
-
-                    # Create visualization
-                    vis_filename = f"{video_name}_frame_{frame_idx}_visualization.png"
-                    vis_path = vis_output_dir / vis_filename
-
-                    self.create_visualization(image_file, data, vis_path, video_name, frame_idx)
-
-                except Exception as e:
-                    self.log_error(f"Failed to process {video_name} frame {frame_idx}: {e}")
-                    continue
-
-    def generate_summary_report(self):
-        """Generate a summary report."""
-        print("\n" + "="*60)
+    def generate_summary_report(self) -> None:
+        print("\n" + "=" * 60)
         print("SUMMARY REPORT")
-        print("="*60)
-
+        print("=" * 60)
         print(f"Output directory: {self.output_root}")
 
-        # Count directories and files
-        video_dirs = [d for d in self.output_root.iterdir() if d.is_dir() and d.name != "visualizations"]
-        total_images = 0
-        total_samples = 0
-
-        for video_dir in video_dirs:
-            images_dir = video_dir / "images"
-
-            if images_dir.exists():
-                total_images += len(list(images_dir.glob("*.png")))
-
-            samples_dir = video_dir / "samples"
-            if samples_dir.exists():
-                total_samples += len(list(samples_dir.glob("*.npz")))
+        video_dirs = self.iter_video_dirs()
+        total_samples = sum(len(list((video_dir / "samples").glob("*.npz"))) for video_dir in video_dirs if (video_dir / "samples").is_dir())
+        total_query_frames = sum(len(list_sample_query_frames(video_dir, video_dir.name)) for video_dir in video_dirs)
 
         print(f"Total videos: {len(video_dirs)}")
-        print(f"Total images: {total_images}")
         print(f"Total samples: {total_samples}")
+        print(f"Total query frames: {total_query_frames}")
         print(f"Videos checked: {min(len(video_dirs), self.max_videos_to_check)}")
 
         if self.errors:
-            print(f"\n❌ ERRORS ({len(self.errors)}):")
+            print(f"\nERRORS ({len(self.errors)}):")
             for error in self.errors:
                 print(f"  - {error}")
-
         if self.warnings:
-            print(f"\n⚠️  WARNINGS ({len(self.warnings)}):")
+            print(f"\nWARNINGS ({len(self.warnings)}):")
             for warning in self.warnings:
                 print(f"  - {warning}")
-
         if not self.errors and not self.warnings:
-            print("\n🎉 All checks passed successfully!")
+            print("\nAll checks passed successfully.")
 
-        # Check if visualizations were created
         vis_dir = self.output_root / "visualizations"
         if vis_dir.exists():
             vis_files = list(vis_dir.glob("*.png"))
-            print(f"\n📊 Created {len(vis_files)} visualization files in: {vis_dir}")
+            print(f"\nCreated {len(vis_files)} visualization files in: {vis_dir}")
 
-    def run_checks(self):
-        """Run all checks."""
-        print("🔍 Starting batch process result checker...")
-
-        # Step 1: Check overall structure
+    def run_checks(self) -> bool:
+        print("Starting batch process result checker...")
         if not self.check_overall_structure():
             self.log_error("Structure check failed. Stopping.")
             self.generate_summary_report()
             return False
-
-        # Step 2: Check data and create visualizations
         self.check_and_visualize_data()
-
-        # Step 3: Generate summary
         self.generate_summary_report()
-
         return len(self.errors) == 0
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Check batch processing results")
     parser.add_argument("output_root", help="Root directory containing batch processing results")
-    parser.add_argument("--max-videos", type=int, default=3,
-                       help="Maximum number of videos to check (default: 3)")
-    parser.add_argument("--max-samples", type=int, default=3,
-                       help="Maximum number of samples per video to visualize (default: 3)")
-
+    parser.add_argument("--max-videos", type=int, default=3, help="Maximum number of videos to check")
+    parser.add_argument("--max-samples", type=int, default=3, help="Maximum number of samples per video to visualize")
     args = parser.parse_args()
 
     checker = BatchProcessChecker(
         args.output_root,
         max_videos_to_check=args.max_videos,
-        max_samples_per_video=args.max_samples
+        max_samples_per_video=args.max_samples,
     )
-
     success = checker.run_checks()
-
-    if success:
-        print("\n✅ All checks completed successfully!")
-        exit(0)
-    else:
-        print("\n❌ Some checks failed. See errors above.")
-        exit(1)
+    raise SystemExit(0 if success else 1)
 
 
 if __name__ == "__main__":

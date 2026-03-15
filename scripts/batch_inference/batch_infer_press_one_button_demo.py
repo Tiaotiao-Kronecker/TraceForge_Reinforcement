@@ -60,6 +60,7 @@ if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
 import infer
+from utils.traceforge_artifact_utils import is_traceforge_output_complete
 
 
 DEFAULT_CAMERAS = [
@@ -180,7 +181,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip_existing",
         action="store_true",
-        help="Skip a camera if images/samples/main npz already exist",
+        help="Skip a camera if its TraceForge output is already complete",
     )
     parser.add_argument(
         "--dry_run",
@@ -226,6 +227,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=1)
     parser.add_argument("--max_num_frames", type=int, default=384)
     parser.add_argument("--save_video", action="store_true", default=False)
+    parser.add_argument(
+        "--output_layout",
+        type=str,
+        default="v2",
+        choices=["v2", "legacy"],
+        help="Artifact layout to write for each camera output.",
+    )
+    parser.add_argument(
+        "--save_visibility",
+        action="store_true",
+        default=False,
+        help="Store per-query visibility arrays in sample NPZ files.",
+    )
     parser.add_argument("--horizon", type=int, default=16)
     parser.add_argument(
         "--use_all_trajectories",
@@ -531,6 +545,7 @@ def build_worker_cmd(
         "--future_len", str(args.future_len),
         "--max_frames_per_video", str(args.max_frames_per_video),
         "--grid_size", str(args.grid_size),
+        "--output_layout", args.output_layout,
         "--filter_level", args.filter_level,
         "--min_depth", str(args.min_depth),
         "--max_depth", str(args.max_depth),
@@ -549,6 +564,8 @@ def build_worker_cmd(
         cmd.append("--copy_lang")
     if args.save_video:
         cmd.append("--save_video")
+    if args.save_visibility:
+        cmd.append("--save_visibility")
     if args.dry_run:
         cmd.append("--dry_run")
     if args.min_valid_frames is not None:
@@ -653,12 +670,7 @@ def shard_episodes(episodes: list[Path], num_shards: int, shard_index: int) -> l
 
 def camera_output_complete(out_episode_dir: Path, camera_name: str) -> bool:
     camera_dir = out_episode_dir / camera_name
-    images_dir = camera_dir / "images"
-    samples_dir = camera_dir / "samples"
-    main_npz = camera_dir / f"{camera_name}.npz"
-    has_images = images_dir.is_dir() and any(images_dir.iterdir())
-    has_samples = samples_dir.is_dir() and any(samples_dir.iterdir())
-    return has_images and has_samples and main_npz.is_file()
+    return is_traceforge_output_complete(camera_dir)
 
 
 def copy_episode_lang(episode_dir: Path, out_episode_dir: Path) -> None:
@@ -727,6 +739,7 @@ def build_camera_args(
 
 def save_result(
     *,
+    episode_dir: Path,
     out_episode_dir: Path,
     camera_name: str,
     result: dict,
@@ -753,27 +766,17 @@ def save_result(
             future_len=args.future_len,
             grid_size=args.grid_size,
             filter_args=args,
+            full_video_tensor=result["full_video_tensor"],
+            full_depths=result["full_depths"],
+            full_intrinsics=result["full_intrinsics"],
+            full_extrinsics=result["full_extrinsics"],
+            depth_conf=result["depth_conf"],
+            video_source_path=str(episode_dir / "rgb" / camera_name),
+            depth_source_path=str(episode_dir / "depth" / camera_name),
         )
     finally:
         if save_lock is not None:
             save_lock.release()
-
-    camera_dir = out_episode_dir / camera_name
-    main_npz_path = camera_dir / f"{camera_name}.npz"
-    data_npz = {
-        "coords": result["coords"].cpu().numpy(),
-        "extrinsics": result["full_extrinsics"].cpu().numpy(),
-        "intrinsics": result["full_intrinsics"].cpu().numpy(),
-        "height": result["video_tensor"].shape[-2],
-        "width": result["video_tensor"].shape[-1],
-        "depths": result["depths"].cpu().numpy().astype(np.float16),
-        "unc_metric": result["depth_conf"].astype(np.float16),
-        "visibs": result["visibs"][..., None].cpu().numpy(),
-    }
-    if args.save_video:
-        data_npz["video"] = result["video_tensor"].cpu().numpy()
-    np.savez(main_npz_path, **data_npz)
-    logger.info(f"Saved {main_npz_path}")
 
 
 def run_camera_task(
@@ -802,6 +805,7 @@ def run_camera_task(
             model_depth_pose,
         )
         save_result(
+            episode_dir=task.episode_dir,
             out_episode_dir=task.out_episode_dir,
             camera_name=task.camera_name,
             result=result,

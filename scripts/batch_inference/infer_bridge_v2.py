@@ -56,6 +56,7 @@ if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
 import infer
+from utils.traceforge_artifact_utils import is_traceforge_output_complete
 
 
 # 需要复制到输出目录的 BridgeV2 元数据文件
@@ -97,6 +98,19 @@ def parse_args():
     parser.add_argument("--mask_dir", type=str, default=None)
     parser.add_argument("--max_num_frames", type=int, default=384)
     parser.add_argument("--save_video", action="store_true", default=False)
+    parser.add_argument(
+        "--output_layout",
+        type=str,
+        default=infer.V2_LAYOUT if hasattr(infer, "V2_LAYOUT") else "v2",
+        choices=["v2", "legacy"],
+        help="Artifact layout to write for each camera output.",
+    )
+    parser.add_argument(
+        "--save_visibility",
+        action="store_true",
+        default=False,
+        help="Store per-query visibility arrays in sample NPZ files.",
+    )
     parser.add_argument("--horizon", type=int, default=16)
     parser.add_argument(
         "--use_all_trajectories",
@@ -237,22 +251,9 @@ def copy_bridge_v2_meta(traj_dir: Path, out_traj_dir: Path):
 
 
 def camera_output_complete(out_traj_dir: Path, camera_name: str) -> bool:
-    """判断某相机输出是否已存在且完整（images 与 samples 均有文件）。"""
+    """判断某相机输出是否已存在且完整。"""
     cam_dir = out_traj_dir / camera_name
-    images_dir = cam_dir / "images"
-    samples_dir = cam_dir / "samples"
-    try:
-        has_images = (
-            images_dir.is_dir()
-            and any((images_dir / f).is_file() for f in os.listdir(images_dir))
-        )
-        has_samples = (
-            samples_dir.is_dir()
-            and any((samples_dir / f).is_file() for f in os.listdir(samples_dir))
-        )
-    except OSError:
-        return False
-    return has_images and has_samples
+    return is_traceforge_output_complete(cam_dir)
 
 
 def run_traj(
@@ -320,24 +321,14 @@ def run_traj(
             future_len=args.future_len,
             grid_size=args.grid_size,
             filter_args=args,
+            full_video_tensor=result["full_video_tensor"],
+            full_depths=result["full_depths"],
+            full_intrinsics=result["full_intrinsics"],
+            full_extrinsics=result["full_extrinsics"],
+            depth_conf=result["depth_conf"],
+            video_source_path=video_path,
+            depth_source_path=depth_path,
         )
-
-        video_dir = os.path.join(out_dir_str, camera_name)
-        data_npz_load = {
-            "coords": result["coords"].cpu().numpy(),
-            "extrinsics": result["full_extrinsics"].cpu().numpy(),
-            "intrinsics": result["full_intrinsics"].cpu().numpy(),
-            "height": result["video_tensor"].shape[-2],
-            "width": result["video_tensor"].shape[-1],
-            "depths": result["depths"].cpu().numpy().astype(np.float16),
-            "unc_metric": result["depth_conf"].astype(np.float16),
-            "visibs": result["visibs"][..., None].cpu().numpy(),
-        }
-        if args.save_video:
-            data_npz_load["video"] = result["video_tensor"].cpu().numpy()
-        save_path = os.path.join(video_dir, camera_name + ".npz")
-        np.savez(save_path, **data_npz_load)
-        logger.info(f"Saved {save_path}")
 
 
 def main():

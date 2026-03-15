@@ -13,8 +13,18 @@ import argparse
 from loguru import logger
 import json
 import sys
+from pathlib import Path
 
 from utils.video_depth_pose_utils import video_depth_pose_dict
+from utils.traceforge_artifact_utils import (
+    LEGACY_LAYOUT,
+    V2_LAYOUT,
+    is_traceforge_output_complete,
+    path_kind,
+    write_scene_h5,
+    write_scene_meta,
+    write_scene_rgb_mp4,
+)
 
 from datasets.data_ops import _filter_one_depth
 from concurrent.futures import ThreadPoolExecutor
@@ -84,6 +94,19 @@ def parse_args():
     )
     parser.add_argument("--max_num_frames", type=int, default=384)
     parser.add_argument("--save_video", action="store_true", default=False)
+    parser.add_argument(
+        "--output_layout",
+        type=str,
+        default=V2_LAYOUT,
+        choices=[V2_LAYOUT, LEGACY_LAYOUT],
+        help="Artifact layout: v2(scene cache + samples) or legacy(main NPZ + query frame images/depth).",
+    )
+    parser.add_argument(
+        "--save_visibility",
+        action="store_true",
+        default=False,
+        help="Store per-query visibility arrays in sample NPZ files.",
+    )
     parser.add_argument(
         "--horizon",
         type=int,
@@ -560,7 +583,98 @@ def filter_anomalous_trajectories(
     return filtered_traj
 
 
-def save_single_query_frame(
+def _tensor_to_numpy(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def _tensor_video_to_uint8_hwc(video_tensor):
+    video_np = _tensor_to_numpy(video_tensor)
+    if video_np.ndim != 4 or video_np.shape[1] not in (1, 3):
+        raise ValueError(f"Expected video tensor with shape (T,3,H,W), got {video_np.shape}")
+    video_np = np.clip(np.round(video_np * 255.0), 0, 255).astype(np.uint8)
+    return video_np.transpose(0, 2, 3, 1)
+
+
+def _build_grid_keypoints(frame_h: int, frame_w: int, grid_size: int) -> np.ndarray:
+    y_coords = np.linspace(0, frame_h - 1, grid_size)
+    x_coords = np.linspace(0, frame_w - 1, grid_size)
+    xx, yy = np.meshgrid(x_coords, y_coords)
+    return np.stack([xx.flatten(), yy.flatten()], axis=1).astype(np.float32)
+
+
+def build_query_frame_sample_data(
+    *,
+    query_frame_idx: int,
+    frame_data,
+    grid_size: int,
+    filter_args=None,
+    save_visibility: bool = False,
+):
+    coords_np = _tensor_to_numpy(frame_data["coords"])
+    visibs_np = _tensor_to_numpy(frame_data["visibs"])
+    if visibs_np.ndim == 3 and visibs_np.shape[-1] == 1:
+        visibs_np = visibs_np.squeeze(-1)
+    video_segment = _tensor_video_to_uint8_hwc(frame_data["video_segment"])
+    intrinsics_np = _tensor_to_numpy(frame_data["intrinsics_segment"]).astype(np.float32)
+    extrinsics_np = _tensor_to_numpy(frame_data["extrinsics_segment"]).astype(np.float32)
+    depths_segment = _tensor_to_numpy(frame_data["depths_segment"]).astype(np.float32)
+
+    frame_h, frame_w = video_segment.shape[1:3]
+    keypoints = _build_grid_keypoints(frame_h, frame_w, grid_size)
+    fixed_camera_view = {
+        "c2w": np.linalg.inv(extrinsics_np[0]),
+        "K": intrinsics_np[0],
+        "height": frame_h,
+        "width": frame_w,
+    }
+
+    try:
+        tracks2d_fixed = project_tracks_3d_to_2d(
+            tracks3d=coords_np,
+            camera_views=[fixed_camera_view] * len(coords_np),
+        ).transpose(1, 0, 2).astype(np.float32)
+        traj_uvz = project_tracks_3d_to_3d(
+            tracks3d=coords_np,
+            camera_views=[fixed_camera_view] * len(coords_np),
+        ).transpose(1, 0, 2).astype(np.float32)
+    except Exception as e:
+        logger.error(f"Error projecting tracks for frame {query_frame_idx}: {e}")
+        tracks2d_fixed = coords_np[:, :, :2].transpose(1, 0, 2).astype(np.float32)
+        traj_uvz = coords_np.transpose(1, 0, 2).astype(np.float32)
+
+    traj_uvz = filter_anomalous_trajectories(traj_uvz)
+    traj_valid_mask = build_traj_valid_mask(
+        traj=traj_uvz,
+        visibs=visibs_np,
+        image_width=frame_w,
+        image_height=frame_h,
+        filter_args=filter_args,
+    )
+    sample_payload = {
+        "traj_uvz": traj_uvz.astype(np.float32),
+        "traj_2d": tracks2d_fixed.astype(np.float32),
+        "keypoints": keypoints,
+        "query_frame_index": np.array([query_frame_idx], dtype=np.int32),
+        "segment_frame_indices": query_frame_idx + np.arange(traj_uvz.shape[1], dtype=np.int32),
+        "traj_valid_mask": traj_valid_mask.astype(bool),
+    }
+    if save_visibility:
+        visibility = visibs_np
+        if visibility.shape[0] == traj_uvz.shape[1] and visibility.shape[1] == traj_uvz.shape[0]:
+            visibility = visibility.T
+        sample_payload["visibility"] = visibility.astype(np.float16)
+
+    return {
+        "sample_payload": sample_payload,
+        "query_frame_img": video_segment[0],
+        "query_frame_depth": depths_segment[0],
+    }
+
+
+def save_single_query_frame_legacy(
+    *,
     video_name,
     output_dir,
     query_frame_idx,
@@ -569,94 +683,54 @@ def save_single_query_frame(
     grid_size: int,
     filter_args=None,
 ):
-    """Save single query frame result"""
     video_output_dir = os.path.join(output_dir, video_name)
     images_dir = os.path.join(video_output_dir, "images")
     depth_dir = os.path.join(video_output_dir, "depth")
     samples_dir = os.path.join(video_output_dir, "samples")
-
     for dir_path in [images_dir, depth_dir, samples_dir]:
         os.makedirs(dir_path, exist_ok=True)
 
-    coords_np = frame_data["coords"].cpu().numpy()
-    visibs_np = frame_data["visibs"].cpu().numpy()
-    video_segment = frame_data["video_segment"].cpu().numpy() * 255
-    video_segment = video_segment.astype(np.uint8).transpose(0, 2, 3, 1)
-    intrinsics_np = frame_data["intrinsics_segment"].cpu().numpy()
-    extrinsics_np = frame_data["extrinsics_segment"].cpu().numpy()
-
-    frame_h, frame_w = video_segment.shape[1:3]
-    y_coords = np.linspace(0, frame_h - 1, grid_size)
-    x_coords = np.linspace(0, frame_w - 1, grid_size)
-    xx, yy = np.meshgrid(x_coords, y_coords)
-    keypoints = np.stack([xx.flatten(), yy.flatten()], axis=1)
-
-    sample_data = {
-        "image_path": np.array([f"images/{video_name}_{query_frame_idx}.png"], dtype="<U50"),
-        "frame_index": np.array([query_frame_idx]),
-        "keypoints": keypoints.astype(np.float32),
-    }
-
-    camera_views_segment = []
-    for t in range(len(intrinsics_np)):
-        camera_views_segment.append({
-            "c2w": np.linalg.inv(extrinsics_np[t]),
-            "K": intrinsics_np[t],
-            "height": frame_h,
-            "width": frame_w,
-        })
-
-    fixed_camera_view = camera_views_segment[0]
-    coords_3d_for_projection = coords_np
-
-    try:
-        tracks2d_fixed = project_tracks_3d_to_2d(
-            tracks3d=coords_3d_for_projection,
-            camera_views=[fixed_camera_view] * len(coords_3d_for_projection),
-        )
-        tracks3d_fixed = project_tracks_3d_to_3d(
-            tracks3d=coords_3d_for_projection,
-            camera_views=[fixed_camera_view] * len(coords_3d_for_projection),
-        )
-        sample_data["traj_2d"] = tracks2d_fixed.transpose(1, 0, 2).astype(np.float32)
-        sample_data["traj"] = tracks3d_fixed.transpose(1, 0, 2).astype(np.float32)
-    except Exception as e:
-        logger.error(f"Error projecting tracks for frame {query_frame_idx}: {e}")
-        sample_data["traj_2d"] = coords_np[:, :, :2].transpose(1, 0, 2).astype(np.float32)
-        sample_data["traj"] = coords_np.transpose(1, 0, 2).astype(np.float32)
-
-    # Filter anomalous trajectories
-    sample_data["traj"] = filter_anomalous_trajectories(sample_data["traj"])
-
-    sample_data["traj_valid_mask"] = build_traj_valid_mask(
-        traj=sample_data["traj"],
-        visibs=visibs_np,
-        image_width=frame_w,
-        image_height=frame_h,
+    bundle = build_query_frame_sample_data(
+        query_frame_idx=query_frame_idx,
+        frame_data=frame_data,
+        grid_size=grid_size,
         filter_args=filter_args,
+        save_visibility=getattr(filter_args, "save_visibility", False),
     )
+    sample_payload = bundle["sample_payload"]
+    traj = sample_payload["traj_uvz"]
+    traj_2d = sample_payload["traj_2d"]
+    current_len = traj.shape[1]
+    valid_steps = np.zeros(future_len, dtype=bool)
+    valid_steps[:current_len] = True
 
-    # Pad trajectories to future_len
-    current_len = sample_data["traj"].shape[1]
     if current_len < future_len:
         pad_len = future_len - current_len
-        pad_shape = (sample_data["traj"].shape[0], pad_len, sample_data["traj"].shape[2])
-        pad_array = np.full(pad_shape, np.inf, dtype=sample_data["traj"].dtype)
-        sample_data["traj"] = np.concatenate([sample_data["traj"], pad_array], axis=1)
+        traj = np.concatenate(
+            [traj, np.full((traj.shape[0], pad_len, traj.shape[2]), np.inf, dtype=traj.dtype)],
+            axis=1,
+        )
+        traj_2d = np.concatenate(
+            [traj_2d, np.full((traj_2d.shape[0], pad_len, traj_2d.shape[2]), np.inf, dtype=traj_2d.dtype)],
+            axis=1,
+        )
 
-        pad_shape_2d = (sample_data["traj_2d"].shape[0], pad_len, sample_data["traj_2d"].shape[2])
-        pad_array_2d = np.full(pad_shape_2d, np.inf, dtype=sample_data["traj_2d"].dtype)
-        sample_data["traj_2d"] = np.concatenate([sample_data["traj_2d"], pad_array_2d], axis=1)
+    sample_data = {
+        "image_path": np.array([f"images/{video_name}_{query_frame_idx}.png"], dtype="<U64"),
+        "frame_index": np.array([query_frame_idx], dtype=np.int32),
+        "keypoints": sample_payload["keypoints"],
+        "traj": traj.astype(np.float32),
+        "traj_2d": traj_2d.astype(np.float32),
+        "traj_valid_mask": sample_payload["traj_valid_mask"],
+        "valid_steps": valid_steps,
+    }
+    if "visibility" in sample_payload:
+        sample_data["visibility"] = sample_payload["visibility"]
 
-    query_frame_img = video_segment[0]
-    query_frame_depth = frame_data["depths_segment"].cpu().numpy()[0]
+    img_path = os.path.join(images_dir, f"{video_name}_{query_frame_idx}.png")
+    Image.fromarray(bundle["query_frame_img"]).save(img_path)
 
-    img_filename = f"{video_name}_{query_frame_idx}.png"
-    img_path = os.path.join(images_dir, img_filename)
-    Image.fromarray(query_frame_img).save(img_path)
-
-    depth_filename = f"{video_name}_{query_frame_idx}.png"
-    depth_path = os.path.join(depth_dir, depth_filename)
+    query_frame_depth = bundle["query_frame_depth"]
     depth_valid = query_frame_depth[query_frame_depth > 0]
     if len(depth_valid) > 0:
         depth_min = depth_valid.min()
@@ -667,22 +741,47 @@ def save_single_query_frame(
             depth_normalized = np.full_like(query_frame_depth, 32767, dtype=np.uint16)
     else:
         depth_normalized = np.zeros_like(query_frame_depth, dtype=np.uint16)
-    Image.fromarray(depth_normalized, mode="I;16").save(depth_path)
+    Image.fromarray(depth_normalized, mode="I;16").save(
+        os.path.join(depth_dir, f"{video_name}_{query_frame_idx}.png")
+    )
+    np.savez(os.path.join(depth_dir, f"{video_name}_{query_frame_idx}_raw.npz"), depth=query_frame_depth)
+    np.savez(os.path.join(samples_dir, f"{video_name}_{query_frame_idx}.npz"), **sample_data)
+    logger.info(f"Saved legacy query frame {query_frame_idx}")
 
-    depth_raw_filename = f"{video_name}_{query_frame_idx}_raw.npz"
-    depth_raw_path = os.path.join(depth_dir, depth_raw_filename)
-    np.savez(depth_raw_path, depth=query_frame_depth)
 
-    # Retarget disabled - use original trajectory
-    # retargeted, valid_mask = retarget_trajectories(sample_data["traj"], max_length=future_len)
-    # sample_data["traj"] = retargeted
-    # sample_data["valid_steps"] = valid_mask
+def save_single_query_frame_v2(
+    *,
+    video_name,
+    output_dir,
+    query_frame_idx,
+    frame_data,
+    grid_size: int,
+    filter_args=None,
+):
+    video_output_dir = os.path.join(output_dir, video_name)
+    samples_dir = os.path.join(video_output_dir, "samples")
+    os.makedirs(samples_dir, exist_ok=True)
 
-    sample_filename = f"{video_name}_{query_frame_idx}.npz"
-    sample_path = os.path.join(samples_dir, sample_filename)
-    np.savez(sample_path, **sample_data)
+    bundle = build_query_frame_sample_data(
+        query_frame_idx=query_frame_idx,
+        frame_data=frame_data,
+        grid_size=grid_size,
+        filter_args=filter_args,
+        save_visibility=getattr(filter_args, "save_visibility", False),
+    )
+    sample_payload = bundle["sample_payload"]
+    sample_data = {
+        "traj_uvz": sample_payload["traj_uvz"],
+        "keypoints": sample_payload["keypoints"],
+        "query_frame_index": sample_payload["query_frame_index"],
+        "segment_frame_indices": sample_payload["segment_frame_indices"],
+        "traj_valid_mask": sample_payload["traj_valid_mask"],
+    }
+    if "visibility" in sample_payload:
+        sample_data["visibility"] = sample_payload["visibility"]
 
-    logger.info(f"Saved query frame {query_frame_idx}")
+    np.savez(os.path.join(samples_dir, f"{video_name}_{query_frame_idx}.npz"), **sample_data)
+    logger.info(f"Saved v2 query frame {query_frame_idx}")
 
 
 def save_structured_data(
@@ -702,41 +801,96 @@ def save_structured_data(
     future_len: int = 128,
     grid_size: int = 20,
     filter_args=None,
+    *,
+    full_video_tensor=None,
+    full_depths=None,
+    full_intrinsics=None,
+    full_extrinsics=None,
+    depth_conf=None,
+    video_source_path: str | None = None,
+    depth_source_path: str | None = None,
 ):
-    """Save data in the structured format"""
+    """Save TraceForge inference artifacts."""
+    del intrinsics, extrinsics, query_points_per_frame, horizon, use_all_trajectories
 
-    # Create output directories
-    video_output_dir = os.path.join(output_dir, video_name)
-    images_dir = os.path.join(video_output_dir, "images")
-    depth_dir = os.path.join(video_output_dir, "depth")
-    samples_dir = os.path.join(video_output_dir, "samples")
+    layout = getattr(filter_args, "output_layout", V2_LAYOUT) if filter_args is not None else V2_LAYOUT
+    video_output_dir = Path(output_dir) / video_name
+    video_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save structured data in the new format
-    for dir_path in [images_dir, depth_dir, samples_dir]:
-        os.makedirs(dir_path, exist_ok=True)
+    if query_frame_results is None:
+        logger.warning(f"No query frame results to save for {video_name}")
+        return
 
-    # If we have query_frame_results, save each query frame's results independently
-    if query_frame_results is not None:
-        logger.info(f"Processing {len(query_frame_results)} query frame results")
+    logger.info(f"Saving {len(query_frame_results)} query frame results using layout={layout}")
+    if layout == V2_LAYOUT:
+        if full_video_tensor is None or full_depths is None or full_intrinsics is None or full_extrinsics is None:
+            raise ValueError("v2 output requires full_video_tensor/full_depths/full_intrinsics/full_extrinsics")
 
-        saved_count = 0
-
+        full_video_uint8 = _tensor_video_to_uint8_hwc(full_video_tensor)
+        write_scene_h5(
+            video_output_dir / "scene.h5",
+            depths=_tensor_to_numpy(full_depths).astype(np.float32),
+            intrinsics=_tensor_to_numpy(full_intrinsics).astype(np.float32),
+            extrinsics_w2c=_tensor_to_numpy(full_extrinsics).astype(np.float32),
+        )
+        write_scene_rgb_mp4(video_output_dir / "scene_rgb.mp4", video_frames=full_video_uint8, fps=10)
+        write_scene_meta(
+            video_output_dir / "scene_meta.json",
+            {
+                "layout_version": 2,
+                "video_name": video_name,
+                "frame_count": int(full_video_uint8.shape[0]),
+                "height": int(full_video_uint8.shape[1]),
+                "width": int(full_video_uint8.shape[2]),
+                "extrinsics_mode": "w2c",
+                "frame_drop_rate": int(getattr(filter_args, "frame_drop_rate", 1)),
+                "future_len": int(future_len),
+                "original_filenames": list(map(str, original_filenames)),
+                "rgb_cache_path": "scene_rgb.mp4",
+                "source_rgb_path": video_source_path,
+                "source_rgb_kind": path_kind(video_source_path),
+                "source_depth_path": depth_source_path,
+                "source_depth_kind": path_kind(depth_source_path),
+            },
+        )
         for query_frame_idx, frame_data in query_frame_results.items():
-            try:
-                save_single_query_frame(
-                    video_name=video_name,
-                    output_dir=output_dir,
-                    query_frame_idx=query_frame_idx,
-                    frame_data=frame_data,
-                    future_len=future_len,
-                    grid_size=grid_size,
-                    filter_args=filter_args,
-                )
-                saved_count += 1
-            except Exception as e:
-                logger.error(f"Failed to save query frame {query_frame_idx}: {e}")
+            save_single_query_frame_v2(
+                video_name=video_name,
+                output_dir=output_dir,
+                query_frame_idx=query_frame_idx,
+                frame_data=frame_data,
+                grid_size=grid_size,
+                filter_args=filter_args,
+            )
+        return
 
-        logger.info(f"Saved {saved_count} frames")
+    for query_frame_idx, frame_data in query_frame_results.items():
+        save_single_query_frame_legacy(
+            video_name=video_name,
+            output_dir=output_dir,
+            query_frame_idx=query_frame_idx,
+            frame_data=frame_data,
+            future_len=future_len,
+            grid_size=grid_size,
+            filter_args=filter_args,
+        )
+
+    main_npz = {
+        "coords": _tensor_to_numpy(coords),
+        "extrinsics": _tensor_to_numpy(full_extrinsics if full_extrinsics is not None else extrinsics),
+        "intrinsics": _tensor_to_numpy(full_intrinsics if full_intrinsics is not None else intrinsics),
+        "height": int(_tensor_to_numpy(video_tensor).shape[-2]),
+        "width": int(_tensor_to_numpy(video_tensor).shape[-1]),
+        "depths": _tensor_to_numpy(depths).astype(np.float16),
+        "visibs": _tensor_to_numpy(visibs)[..., None],
+    }
+    if depth_conf is not None:
+        main_npz["unc_metric"] = np.asarray(depth_conf).astype(np.float16)
+    if getattr(filter_args, "save_video", False):
+        main_npz["video"] = _tensor_to_numpy(video_tensor)
+    save_path = video_output_dir / f"{video_name}.npz"
+    np.savez(save_path, **main_npz)
+    logger.info(f"Traditional visualization NPZ saved to {save_path}")
 
 
 def process_single_video(video_path, depth_path, args, model_3dtracker, model_depth_pose, video_name=None, output_dir=None):
@@ -976,18 +1130,6 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
             f"Query frame {start_frame}: tracked {coords_seg.shape[1]} trajectories for {coords_seg.shape[0]} frames"
         )
 
-        # Save immediately after processing each query frame
-        if video_name is not None and output_dir is not None:
-            save_single_query_frame(
-                video_name=video_name,
-                output_dir=output_dir,
-                query_frame_idx=start_frame,
-                frame_data=query_frame_results[start_frame],
-                future_len=args.future_len,
-                grid_size=args.grid_size,
-                filter_args=args,
-            )
-
         # Clear cache after inference to free memory
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1038,7 +1180,9 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
 
     return {
         "video_tensor": video,
+        "full_video_tensor": video_ten,
         "depths": depths,
+        "full_depths": depth_npy.astype(np.float32),
         "coords": coords,
         "visibs": visibs,
         "intrinsics": intrinsics,
@@ -1354,43 +1498,10 @@ if __name__ == "__main__":
         if args.skip_existing:
             output_path = os.path.join(out_dir, video_name)
             if os.path.exists(output_path):
-                # 检查输出目录是否有实际内容（不仅仅是空目录）
-                images_dir = os.path.join(output_path, "images")
-                depth_dir = os.path.join(output_path, "depth")
-                samples_dir = os.path.join(output_path, "samples")
-                
-                # 检查是否有文件（至少检查images和samples目录）
-                has_images = False
-                has_samples = False
-                
-                if os.path.exists(images_dir):
-                    try:
-                        has_images = any(
-                            os.path.isfile(os.path.join(images_dir, f))
-                            for f in os.listdir(images_dir)
-                        )
-                    except (OSError, PermissionError):
-                        pass
-                
-                if os.path.exists(samples_dir):
-                    try:
-                        has_samples = any(
-                            os.path.isfile(os.path.join(samples_dir, f))
-                            for f in os.listdir(samples_dir)
-                        )
-                    except (OSError, PermissionError):
-                        pass
-                
-                # 如果images和samples都有内容，认为输出完整，跳过
-                if has_images and has_samples:
+                if is_traceforge_output_complete(output_path):
                     logger.info(f"Skipping {video_name} - output already exists and is complete")
                     continue
-                else:
-                    # 目录存在但内容不完整，重新处理
-                    logger.warning(f"Output directory for {video_name} exists but is incomplete, will reprocess")
-                    # 可以选择删除不完整的目录，或者直接覆盖
-                    # import shutil
-                    # shutil.rmtree(output_path)
+                logger.warning(f"Output directory for {video_name} exists but is incomplete, will reprocess")
 
         try:
             # Clear CUDA cache before processing each video
@@ -1418,26 +1529,14 @@ if __name__ == "__main__":
                 future_len=args.future_len,
                 grid_size=args.grid_size,
                 filter_args=args,
+                full_video_tensor=result["full_video_tensor"],
+                full_depths=result["full_depths"],
+                full_intrinsics=result["full_intrinsics"],
+                full_extrinsics=result["full_extrinsics"],
+                depth_conf=result["depth_conf"],
+                video_source_path=video_path,
+                depth_source_path=depth_path,
             )
-
-            # Always save traditional visualization NPZ in video directory root
-            video_dir = os.path.join(out_dir, video_name)
-            data_npz_load = {}
-            data_npz_load["coords"] = result["coords"].cpu().numpy()
-            # Use full video camera parameters instead of segmented ones
-            data_npz_load["extrinsics"] = result["full_extrinsics"].cpu().numpy()
-            data_npz_load["intrinsics"] = result["full_intrinsics"].cpu().numpy()
-            data_npz_load["height"] = result["video_tensor"].shape[-2]
-            data_npz_load["width"] = result["video_tensor"].shape[-1]
-            data_npz_load["depths"] = result["depths"].cpu().numpy().astype(np.float16)
-            data_npz_load["unc_metric"] = result["depth_conf"].astype(np.float16)
-            data_npz_load["visibs"] = result["visibs"][..., None].cpu().numpy()
-            if args.save_video:
-                data_npz_load["video"] = result["video_tensor"].cpu().numpy()
-
-            save_path = os.path.join(video_dir, video_name + ".npz")
-            np.savez(save_path, **data_npz_load)
-            logger.info(f"Traditional visualization NPZ saved to {save_path}")
 
         except Exception as e:
             import traceback

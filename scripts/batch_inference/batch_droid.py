@@ -34,6 +34,8 @@ _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+from utils.traceforge_artifact_utils import is_traceforge_output_complete
+
 CAMERAS = ["hand_camera", "varied_camera_1", "varied_camera_2"]
 FRAME_EXTS = ("*.jpg", "*.jpeg", "*.png")
 
@@ -81,18 +83,7 @@ def find_droid_datasets(base_path):
 def is_camera_output_complete(dataset_path: Path, camera_name: str) -> bool:
     """检查单相机输出是否完整。"""
     camera_dir = dataset_path / "trajectory" / camera_name
-    main_npz = camera_dir / f"{camera_name}.npz"
-    images_dir = camera_dir / "images"
-    samples_dir = camera_dir / "samples"
-    depth_dir = camera_dir / "depth"
-
-    if not main_npz.exists() or not images_dir.is_dir() or not samples_dir.is_dir() or not depth_dir.is_dir():
-        return False
-
-    n_images = len(list(images_dir.glob("*.png")))
-    n_samples = len(list(samples_dir.glob("*.npz")))
-    n_depth_raw = len(list(depth_dir.glob("*_raw.npz")))
-    return n_images > 0 and n_images == n_samples == n_depth_raw
+    return is_traceforge_output_complete(camera_dir)
 
 
 def process_single_camera(dataset_path, camera_name, args, gpu_id, task_index, total_tasks, print_lock):
@@ -138,7 +129,10 @@ def process_single_camera(dataset_path, camera_name, args, gpu_id, task_index, t
         "--device", f"cuda:{gpu_id}",
         "--frame_drop_rate", str(args.frame_drop_rate),
         "--grid_size", str(args.grid_size),
+        "--output_layout", args.output_layout,
     ]
+    if args.save_visibility:
+        cmd.append("--save_visibility")
 
     # 环境变量
     env = os.environ.copy()
@@ -212,6 +206,19 @@ def main():
     parser.add_argument("--max_workers", type=int, default=None, help="并行 worker 数，默认等于 GPU 数")
     parser.add_argument("--task_timeout", type=int, default=0, help="单任务超时秒数；<=0 表示不设超时")
     parser.add_argument("--only_incomplete", action="store_true", default=False, help="仅处理输出不完整的相机任务")
+    parser.add_argument(
+        "--output_layout",
+        type=str,
+        default="v2",
+        choices=["v2", "legacy"],
+        help="Artifact layout passed through to infer.py.",
+    )
+    parser.add_argument(
+        "--save_visibility",
+        action="store_true",
+        default=False,
+        help="Store per-query visibility arrays in sample NPZ files.",
+    )
     args = parser.parse_args()
 
     base_path = Path(args.base_path).resolve()
