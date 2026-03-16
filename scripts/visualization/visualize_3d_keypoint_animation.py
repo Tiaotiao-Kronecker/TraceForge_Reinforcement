@@ -201,13 +201,20 @@ def load_sample_world_trajectory(
     traj_valid_mask = sample["traj_valid_mask"].astype(bool, copy=False)
     keypoints = sample["keypoints"].astype(np.float32)
     segment_frame_indices = np.asarray(sample["segment_frame_indices"], dtype=np.int32)
+    traj_supervision_mask = sample.get("traj_supervision_mask")
+    if traj_supervision_mask is not None:
+        traj_supervision_mask = np.asarray(traj_supervision_mask).astype(bool, copy=False)
 
     if sample.get("frame_aligned", False) and len(segment_frame_indices) < traj_uvz.shape[1]:
         traj_uvz = traj_uvz[:, : len(segment_frame_indices)]
+        if traj_supervision_mask is not None:
+            traj_supervision_mask = traj_supervision_mask[:, : len(segment_frame_indices)]
 
     raw_num_tracks = int(traj_uvz.shape[0])
     traj_uvz = traj_uvz[traj_valid_mask]
     keypoints = keypoints[traj_valid_mask]
+    if traj_supervision_mask is not None and len(traj_valid_mask) == traj_supervision_mask.shape[0]:
+        traj_supervision_mask = traj_supervision_mask[traj_valid_mask]
     traj_world = traj_uvz_to_world(traj_uvz, query_intrinsics, query_w2c)
 
     logger.info(
@@ -220,6 +227,7 @@ def load_sample_world_trajectory(
         "query_frame_idx": query_frame_idx,
         "query_w2c": query_w2c,
         "segment_frame_indices": segment_frame_indices,
+        "traj_supervision_mask": traj_supervision_mask,
         "raw_num_tracks": raw_num_tracks,
         "filtered_num_tracks": int(traj_world.shape[0]),
     }
@@ -283,6 +291,7 @@ def main() -> None:
         query_frame_idx = sample_bundle["query_frame_idx"]
         query_w2c = sample_bundle["query_w2c"]
         segment_frame_indices = sample_bundle["segment_frame_indices"]
+        supervision_full = sample_bundle["traj_supervision_mask"]
 
         if (
             args.dense_pointcloud
@@ -298,6 +307,12 @@ def main() -> None:
             traj_valid_mask = sample["traj_valid_mask"].astype(bool, copy=False)
             if len(traj_valid_mask) == keypoint_traj.shape[0]:
                 keypoint_traj = keypoint_traj[traj_valid_mask]
+            supervision_full = sample.get("traj_supervision_mask")
+            if supervision_full is not None:
+                supervision_full = np.asarray(supervision_full).astype(bool, copy=False)
+                if len(traj_valid_mask) == supervision_full.shape[0]:
+                    supervision_full = supervision_full[traj_valid_mask]
+                supervision_full = supervision_full[:, : keypoint_traj.shape[1]]
             traj_full = keypoint_traj.astype(np.float32)
             segment_frame_indices = np.arange(traj_full.shape[1], dtype=np.int32)
             use_legacy_main_dense = True
@@ -318,6 +333,8 @@ def main() -> None:
 
     n_total = int(traj_full.shape[0])
     n_valid = int(traj_full.shape[1])
+    if supervision_full is None or supervision_full.shape != traj_full.shape[:2]:
+        supervision_full = np.isfinite(traj_full).all(axis=-1)
     stride = max(1, args.keypoint_stride)
     if n_total > 500 and stride > 1:
         stride = 1
@@ -335,6 +352,7 @@ def main() -> None:
 
     indices = np.arange(0, n_total, stride)
     traj_sub = traj_full[indices]
+    supervision_sub = supervision_full[indices]
     n_show = len(indices)
     colors = get_track_colors(traj_sub[:, :1, :] if traj_sub.shape[1] > 0 else np.zeros((n_show, 1, 3), dtype=np.float32))
     motion_order, _motion_scores = compute_motion_rank(traj_sub)
@@ -355,20 +373,19 @@ def main() -> None:
     server = viser.ViserServer(port=args.port)
     server.scene.set_up_direction("-y")
 
-    def get_points_at_time(t: int) -> np.ndarray:
+    def get_points_at_time(t: int) -> tuple[np.ndarray, np.ndarray]:
         if n_valid <= 0:
-            return np.zeros((traj_sub.shape[0], 3), dtype=np.float32)
+            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
         t = min(max(int(t), 0), n_valid - 1)
         pts = traj_sub[:, t, :].copy()
-        invalid = ~np.isfinite(pts).all(axis=1)
-        pts[invalid] = 0.0
-        return pts
+        frame_mask = np.isfinite(pts).all(axis=1) & supervision_sub[:, t]
+        return pts[frame_mask], colors[frame_mask]
 
-    points_0 = get_points_at_time(0)
+    points_0, colors_0 = get_points_at_time(0)
     point_cloud_handle = server.scene.add_point_cloud(
         name="keypoints",
         points=points_0,
-        colors=(np.clip(colors * 255.0, 0, 255)).astype(np.uint8),
+        colors=(np.clip(colors_0 * 255.0, 0, 255)).astype(np.uint8),
         point_size=0.03,
         point_shape="rounded",
         precision="float32",
@@ -434,20 +451,22 @@ def main() -> None:
             point_cloud_handle.remove()
         except KeyError:
             pass
+        points_t, colors_t = get_points_at_time(int(gui_time.value))
         point_cloud_handle = server.scene.add_point_cloud(
             name="keypoints",
-            points=get_points_at_time(int(gui_time.value)),
-            colors=(np.clip(colors * 255.0, 0, 255)).astype(np.uint8),
+            points=points_t,
+            colors=(np.clip(colors_t * 255.0, 0, 255)).astype(np.uint8),
             point_size=gui_point_size.value,
             point_shape="rounded",
             precision="float32",
         )
 
     def apply_keypoint_stride() -> None:
-        nonlocal traj_sub, n_show, colors, motion_order
+        nonlocal traj_sub, supervision_sub, n_show, colors, motion_order
         current_stride = max(1, int(gui_keypoint_stride.value))
         current_indices = np.arange(0, n_total, current_stride)
         traj_sub = traj_full[current_indices]
+        supervision_sub = supervision_full[current_indices]
         n_show = len(current_indices)
         gui_keypoint_count.value = n_show
         color_seed = traj_sub[:, :1, :] if traj_sub.shape[1] > 0 else np.zeros((n_show, 1, 3), dtype=np.float32)
@@ -459,8 +478,9 @@ def main() -> None:
 
     def update_display() -> None:
         t = min(int(gui_time.value), max(n_valid - 1, 0))
-        point_cloud_handle.points = get_points_at_time(t)
-        point_cloud_handle.colors = (np.clip(colors * 255.0, 0, 255)).astype(np.uint8)
+        points_t, colors_t = get_points_at_time(t)
+        point_cloud_handle.points = points_t
+        point_cloud_handle.colors = (np.clip(colors_t * 255.0, 0, 255)).astype(np.uint8)
         point_cloud_handle.point_size = gui_point_size.value
         point_cloud_handle.visible = gui_show_keypoints.value
         if dense_point_cloud_handle is None or dense_per_frame is None:
@@ -503,7 +523,12 @@ def main() -> None:
             for j in range(t_end):
                 p0 = traj_sub[i, j, :]
                 p1 = traj_sub[i, j + 1, :]
-                if np.isfinite(p0).all() and np.isfinite(p1).all():
+                if (
+                    supervision_sub[i, j]
+                    and supervision_sub[i, j + 1]
+                    and np.isfinite(p0).all()
+                    and np.isfinite(p1).all()
+                ):
                     all_segs.append([p0, p1])
                     all_cols.append([colors[i], colors[i]])
 

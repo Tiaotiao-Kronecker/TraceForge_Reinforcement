@@ -34,6 +34,7 @@ from utils.threed_utils import (
     project_tracks_3d_to_2d,
     project_tracks_3d_to_3d,
 )
+from utils.traj_filter_utils import build_traj_filter_result, compute_depth_volatility_map
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -170,6 +171,13 @@ def parse_args():
         help="Trajectory filtering level: none(no filter), basic(basic checks), standard(recommended), strict(high quality)",
     )
     parser.add_argument(
+        "--traj_filter_profile",
+        type=str,
+        default="external",
+        choices=["external", "wrist"],
+        help="Trajectory filter profile: external keeps the current strict full-track mask; wrist keeps partial trajectories with per-frame supervision masks.",
+    )
+    parser.add_argument(
         "--min_valid_frames",
         type=int,
         default=None,
@@ -206,180 +214,6 @@ def parse_args():
         help="Depth change std threshold in meters (overrides filter_level default)",
     )
     return parser.parse_args()
-
-def compute_traj_valid_mask(
-    traj: np.ndarray,
-    visibs: np.ndarray = None,
-    image_width: int = 1280,
-    image_height: int = 720,
-    min_valid_frames: int = 3,
-    min_depth: float = 0.01,
-    max_depth: float = 10.0,
-    boundary_margin: int = 50,
-    visibility_threshold: float = 0.5,
-    check_depth_smoothness: bool = True,
-    depth_change_threshold: float = 0.5,
-) -> np.ndarray:
-    """Compute trajectory validity mask (spatial dimension)"""
-    N, T, _ = traj.shape
-    valid_mask = np.ones(N, dtype=bool)
-
-    # 1. Valid frames filter
-    valid_frames = np.isfinite(traj).all(axis=-1)
-    valid_counts = valid_frames.sum(axis=1)
-    valid_mask &= (valid_counts >= min_valid_frames)
-
-    # 2. Depth validity filter
-    depth_values = traj[:, :, 2]
-    for i in range(N):
-        if not valid_mask[i]:
-            continue
-        valid_depths = depth_values[i, valid_frames[i]]
-        if len(valid_depths) > 0:
-            if (valid_depths < min_depth).any() or (valid_depths > max_depth).any():
-                valid_mask[i] = False
-
-    # 3. Projection boundary filter
-    u_values = traj[:, :, 0]
-    v_values = traj[:, :, 1]
-    for i in range(N):
-        if not valid_mask[i]:
-            continue
-        valid_u = u_values[i, valid_frames[i]]
-        valid_v = v_values[i, valid_frames[i]]
-        if len(valid_u) > 0:
-            u_in_bounds = (valid_u >= -boundary_margin) & (valid_u <= image_width + boundary_margin)
-            v_in_bounds = (valid_v >= -boundary_margin) & (valid_v <= image_height + boundary_margin)
-            if not (u_in_bounds.all() and v_in_bounds.all()):
-                valid_mask[i] = False
-
-    # 4. Visibility filter
-    if visibs is not None:
-        if visibs.shape[0] == T and visibs.shape[1] == N:
-            visibs = visibs.T
-        for i in range(N):
-            if not valid_mask[i] or valid_counts[i] == 0:
-                continue
-            vis_count = (visibs[i] & valid_frames[i]).sum()
-            vis_ratio = vis_count / valid_counts[i]
-            if vis_ratio < visibility_threshold:
-                valid_mask[i] = False
-
-    # 5. Depth smoothness filter
-    if check_depth_smoothness:
-        for i in range(N):
-            if not valid_mask[i]:
-                continue
-            valid_depths = depth_values[i, valid_frames[i]]
-            if len(valid_depths) > 1:
-                depth_diff = np.diff(valid_depths)
-                if np.std(depth_diff) > depth_change_threshold:
-                    valid_mask[i] = False
-
-    return valid_mask
-
-
-def resolve_traj_filter_config(filter_args) -> dict:
-    """Resolve effective trajectory filtering settings from CLI args."""
-    level = getattr(filter_args, "filter_level", "none") if filter_args is not None else "none"
-    defaults = {
-        "basic": {
-            "enabled": True,
-            "min_valid_frames": 3,
-            "min_depth": 0.01,
-            "max_depth": 10.0,
-            "boundary_margin": 50,
-            "visibility_threshold": 0.0,
-            "check_depth_smoothness": False,
-            "depth_change_threshold": 0.5,
-            "use_visibility": False,
-        },
-        "standard": {
-            "enabled": True,
-            "min_valid_frames": 3,
-            "min_depth": 0.01,
-            "max_depth": 10.0,
-            "boundary_margin": 50,
-            "visibility_threshold": 0.5,
-            "check_depth_smoothness": True,
-            "depth_change_threshold": 0.5,
-            "use_visibility": True,
-        },
-        "strict": {
-            "enabled": True,
-            "min_valid_frames": 5,
-            "min_depth": 0.01,
-            "max_depth": 10.0,
-            "boundary_margin": 20,
-            "visibility_threshold": 0.6,
-            "check_depth_smoothness": True,
-            "depth_change_threshold": 0.3,
-            "use_visibility": True,
-        },
-        "none": {
-            "enabled": False,
-            "min_valid_frames": 0,
-            "min_depth": 0.01,
-            "max_depth": 10.0,
-            "boundary_margin": 50,
-            "visibility_threshold": 0.0,
-            "check_depth_smoothness": False,
-            "depth_change_threshold": 0.5,
-            "use_visibility": False,
-        },
-    }
-    config = defaults[level].copy()
-    if filter_args is None:
-        return config
-
-    overrides = {
-        "min_valid_frames": getattr(filter_args, "min_valid_frames", None),
-        "visibility_threshold": getattr(filter_args, "visibility_threshold", None),
-        "min_depth": getattr(filter_args, "min_depth", None),
-        "max_depth": getattr(filter_args, "max_depth", None),
-        "boundary_margin": getattr(filter_args, "boundary_margin", None),
-        "depth_change_threshold": getattr(filter_args, "depth_change_threshold", None),
-    }
-    for key, value in overrides.items():
-        if value is not None:
-            config[key] = value
-    return config
-
-
-def build_traj_valid_mask(
-    traj: np.ndarray,
-    visibs: np.ndarray | None,
-    image_width: int,
-    image_height: int,
-    filter_args,
-) -> np.ndarray:
-    """Build the per-trajectory validity mask stored in sample NPZ files."""
-    config = resolve_traj_filter_config(filter_args)
-    if not config["enabled"]:
-        return np.ones(traj.shape[0], dtype=bool)
-
-    visibs_for_filter = None
-    if config["use_visibility"] and visibs is not None:
-        visibs_for_filter = np.asarray(visibs)
-        if visibs_for_filter.ndim == 3 and visibs_for_filter.shape[-1] == 1:
-            visibs_for_filter = visibs_for_filter.squeeze(-1)
-        if visibs_for_filter.shape[0] == traj.shape[1] and visibs_for_filter.shape[1] == traj.shape[0]:
-            visibs_for_filter = visibs_for_filter.T
-        visibs_for_filter = visibs_for_filter.astype(bool, copy=False)
-
-    return compute_traj_valid_mask(
-        traj,
-        visibs=visibs_for_filter,
-        image_width=image_width,
-        image_height=image_height,
-        min_valid_frames=config["min_valid_frames"],
-        min_depth=config["min_depth"],
-        max_depth=config["max_depth"],
-        boundary_margin=config["boundary_margin"],
-        visibility_threshold=config["visibility_threshold"],
-        check_depth_smoothness=config["check_depth_smoothness"],
-        depth_change_threshold=config["depth_change_threshold"],
-    )
 
 def retarget_trajectories(
     trajectory: np.ndarray,
@@ -611,6 +445,8 @@ def build_query_frame_sample_data(
     grid_size: int,
     filter_args=None,
     save_visibility: bool = False,
+    raw_depths_segment: np.ndarray | None = None,
+    depth_volatility_map: np.ndarray | None = None,
 ):
     coords_np = _tensor_to_numpy(frame_data["coords"])
     visibs_np = _tensor_to_numpy(frame_data["visibs"])
@@ -623,6 +459,7 @@ def build_query_frame_sample_data(
 
     frame_h, frame_w = video_segment.shape[1:3]
     keypoints = _build_grid_keypoints(frame_h, frame_w, grid_size)
+    query_frame_depth = depths_segment[0]
     fixed_camera_view = {
         "c2w": np.linalg.inv(extrinsics_np[0]),
         "K": intrinsics_np[0],
@@ -645,12 +482,18 @@ def build_query_frame_sample_data(
         traj_uvz = coords_np.transpose(1, 0, 2).astype(np.float32)
 
     traj_uvz = filter_anomalous_trajectories(traj_uvz)
-    traj_valid_mask = build_traj_valid_mask(
+    traj_filter_result = build_traj_filter_result(
         traj=traj_uvz,
         visibs=visibs_np,
         image_width=frame_w,
         image_height=frame_h,
         filter_args=filter_args,
+        keypoints=keypoints,
+        query_depth=query_frame_depth,
+        raw_depths_segment=raw_depths_segment,
+        intrinsics_segment=intrinsics_np,
+        extrinsics_segment=extrinsics_np,
+        depth_volatility_map=depth_volatility_map,
     )
     sample_payload = {
         "traj_uvz": traj_uvz.astype(np.float32),
@@ -658,7 +501,19 @@ def build_query_frame_sample_data(
         "keypoints": keypoints,
         "query_frame_index": np.array([query_frame_idx], dtype=np.int32),
         "segment_frame_indices": query_frame_idx + np.arange(traj_uvz.shape[1], dtype=np.int32),
-        "traj_valid_mask": traj_valid_mask.astype(bool),
+        "traj_valid_mask": traj_filter_result["traj_valid_mask"].astype(bool),
+        "traj_depth_consistency_ratio": traj_filter_result["traj_depth_consistency_ratio"].astype(np.float16),
+        "traj_stable_depth_consistency_ratio": traj_filter_result["traj_stable_depth_consistency_ratio"].astype(
+            np.float16
+        ),
+        "traj_high_volatility_hit": traj_filter_result["traj_high_volatility_hit"].astype(bool),
+        "traj_volatility_exposure_ratio": traj_filter_result["traj_volatility_exposure_ratio"].astype(np.float16),
+        "traj_compare_frame_count": traj_filter_result["traj_compare_frame_count"].astype(np.uint16),
+        "traj_stable_compare_frame_count": traj_filter_result["traj_stable_compare_frame_count"].astype(np.uint16),
+        "traj_mask_reason_bits": traj_filter_result["traj_mask_reason_bits"].astype(np.uint8),
+        "traj_supervision_mask": traj_filter_result["traj_supervision_mask"].astype(bool),
+        "traj_supervision_prefix_len": traj_filter_result["traj_supervision_prefix_len"].astype(np.uint16),
+        "traj_supervision_count": traj_filter_result["traj_supervision_count"].astype(np.uint16),
     }
     if save_visibility:
         visibility = visibs_np
@@ -669,7 +524,7 @@ def build_query_frame_sample_data(
     return {
         "sample_payload": sample_payload,
         "query_frame_img": video_segment[0],
-        "query_frame_depth": depths_segment[0],
+        "query_frame_depth": query_frame_depth,
     }
 
 
@@ -682,6 +537,8 @@ def save_single_query_frame_legacy(
     future_len: int,
     grid_size: int,
     filter_args=None,
+    full_depths: np.ndarray | None = None,
+    depth_volatility_map: np.ndarray | None = None,
 ):
     video_output_dir = os.path.join(output_dir, video_name)
     images_dir = os.path.join(video_output_dir, "images")
@@ -690,16 +547,25 @@ def save_single_query_frame_legacy(
     for dir_path in [images_dir, depth_dir, samples_dir]:
         os.makedirs(dir_path, exist_ok=True)
 
+    segment_len = int(frame_data["coords"].shape[0])
+    raw_depths_segment = (
+        np.asarray(full_depths[query_frame_idx : query_frame_idx + segment_len], dtype=np.float32)
+        if full_depths is not None
+        else None
+    )
     bundle = build_query_frame_sample_data(
         query_frame_idx=query_frame_idx,
         frame_data=frame_data,
         grid_size=grid_size,
         filter_args=filter_args,
         save_visibility=getattr(filter_args, "save_visibility", False),
+        raw_depths_segment=raw_depths_segment,
+        depth_volatility_map=depth_volatility_map,
     )
     sample_payload = bundle["sample_payload"]
     traj = sample_payload["traj_uvz"]
     traj_2d = sample_payload["traj_2d"]
+    traj_supervision_mask = sample_payload["traj_supervision_mask"]
     current_len = traj.shape[1]
     valid_steps = np.zeros(future_len, dtype=bool)
     valid_steps[:current_len] = True
@@ -714,6 +580,10 @@ def save_single_query_frame_legacy(
             [traj_2d, np.full((traj_2d.shape[0], pad_len, traj_2d.shape[2]), np.inf, dtype=traj_2d.dtype)],
             axis=1,
         )
+        traj_supervision_mask = np.concatenate(
+            [traj_supervision_mask, np.zeros((traj_supervision_mask.shape[0], pad_len), dtype=bool)],
+            axis=1,
+        )
 
     sample_data = {
         "image_path": np.array([f"images/{video_name}_{query_frame_idx}.png"], dtype="<U64"),
@@ -722,6 +592,16 @@ def save_single_query_frame_legacy(
         "traj": traj.astype(np.float32),
         "traj_2d": traj_2d.astype(np.float32),
         "traj_valid_mask": sample_payload["traj_valid_mask"],
+        "traj_depth_consistency_ratio": sample_payload["traj_depth_consistency_ratio"],
+        "traj_stable_depth_consistency_ratio": sample_payload["traj_stable_depth_consistency_ratio"],
+        "traj_high_volatility_hit": sample_payload["traj_high_volatility_hit"],
+        "traj_volatility_exposure_ratio": sample_payload["traj_volatility_exposure_ratio"],
+        "traj_compare_frame_count": sample_payload["traj_compare_frame_count"],
+        "traj_stable_compare_frame_count": sample_payload["traj_stable_compare_frame_count"],
+        "traj_mask_reason_bits": sample_payload["traj_mask_reason_bits"],
+        "traj_supervision_mask": traj_supervision_mask,
+        "traj_supervision_prefix_len": sample_payload["traj_supervision_prefix_len"],
+        "traj_supervision_count": sample_payload["traj_supervision_count"],
         "valid_steps": valid_steps,
     }
     if "visibility" in sample_payload:
@@ -757,17 +637,27 @@ def save_single_query_frame_v2(
     frame_data,
     grid_size: int,
     filter_args=None,
+    full_depths: np.ndarray | None = None,
+    depth_volatility_map: np.ndarray | None = None,
 ):
     video_output_dir = os.path.join(output_dir, video_name)
     samples_dir = os.path.join(video_output_dir, "samples")
     os.makedirs(samples_dir, exist_ok=True)
 
+    segment_len = int(frame_data["coords"].shape[0])
+    raw_depths_segment = (
+        np.asarray(full_depths[query_frame_idx : query_frame_idx + segment_len], dtype=np.float32)
+        if full_depths is not None
+        else None
+    )
     bundle = build_query_frame_sample_data(
         query_frame_idx=query_frame_idx,
         frame_data=frame_data,
         grid_size=grid_size,
         filter_args=filter_args,
         save_visibility=getattr(filter_args, "save_visibility", False),
+        raw_depths_segment=raw_depths_segment,
+        depth_volatility_map=depth_volatility_map,
     )
     sample_payload = bundle["sample_payload"]
     sample_data = {
@@ -776,6 +666,16 @@ def save_single_query_frame_v2(
         "query_frame_index": sample_payload["query_frame_index"],
         "segment_frame_indices": sample_payload["segment_frame_indices"],
         "traj_valid_mask": sample_payload["traj_valid_mask"],
+        "traj_depth_consistency_ratio": sample_payload["traj_depth_consistency_ratio"],
+        "traj_stable_depth_consistency_ratio": sample_payload["traj_stable_depth_consistency_ratio"],
+        "traj_high_volatility_hit": sample_payload["traj_high_volatility_hit"],
+        "traj_volatility_exposure_ratio": sample_payload["traj_volatility_exposure_ratio"],
+        "traj_compare_frame_count": sample_payload["traj_compare_frame_count"],
+        "traj_stable_compare_frame_count": sample_payload["traj_stable_compare_frame_count"],
+        "traj_mask_reason_bits": sample_payload["traj_mask_reason_bits"],
+        "traj_supervision_mask": sample_payload["traj_supervision_mask"],
+        "traj_supervision_prefix_len": sample_payload["traj_supervision_prefix_len"],
+        "traj_supervision_count": sample_payload["traj_supervision_count"],
     }
     if "visibility" in sample_payload:
         sample_data["visibility"] = sample_payload["visibility"]
@@ -827,11 +727,19 @@ def save_structured_data(
             raise ValueError("v2 output requires full_video_tensor/full_depths/full_intrinsics/full_extrinsics")
 
         full_video_uint8 = _tensor_video_to_uint8_hwc(full_video_tensor)
+        full_depths_np = _tensor_to_numpy(full_depths).astype(np.float32)
+        full_intrinsics_np = _tensor_to_numpy(full_intrinsics).astype(np.float32)
+        full_extrinsics_np = _tensor_to_numpy(full_extrinsics).astype(np.float32)
+        depth_volatility_map = compute_depth_volatility_map(
+            full_depths_np,
+            min_depth=float(getattr(filter_args, "min_depth", 0.01)),
+            max_depth=float(getattr(filter_args, "max_depth", 10.0)),
+        )
         write_scene_h5(
             video_output_dir / "scene.h5",
-            depths=_tensor_to_numpy(full_depths).astype(np.float32),
-            intrinsics=_tensor_to_numpy(full_intrinsics).astype(np.float32),
-            extrinsics_w2c=_tensor_to_numpy(full_extrinsics).astype(np.float32),
+            depths=full_depths_np,
+            intrinsics=full_intrinsics_np,
+            extrinsics_w2c=full_extrinsics_np,
         )
         write_scene_rgb_mp4(video_output_dir / "scene_rgb.mp4", video_frames=full_video_uint8, fps=10)
         write_scene_meta(
@@ -861,9 +769,21 @@ def save_structured_data(
                 frame_data=frame_data,
                 grid_size=grid_size,
                 filter_args=filter_args,
+                full_depths=full_depths_np,
+                depth_volatility_map=depth_volatility_map,
             )
         return
 
+    full_depths_np = _tensor_to_numpy(full_depths).astype(np.float32) if full_depths is not None else None
+    depth_volatility_map = (
+        compute_depth_volatility_map(
+            full_depths_np,
+            min_depth=float(getattr(filter_args, "min_depth", 0.01)),
+            max_depth=float(getattr(filter_args, "max_depth", 10.0)),
+        )
+        if full_depths_np is not None
+        else None
+    )
     for query_frame_idx, frame_data in query_frame_results.items():
         save_single_query_frame_legacy(
             video_name=video_name,
@@ -873,6 +793,8 @@ def save_structured_data(
             future_len=future_len,
             grid_size=grid_size,
             filter_args=filter_args,
+            full_depths=full_depths_np,
+            depth_volatility_map=depth_volatility_map,
         )
 
     main_npz = {

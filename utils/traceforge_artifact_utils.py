@@ -171,6 +171,56 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 else np.ones(traj_uvz.shape[0], dtype=bool)
             )
             visibility = data["visibility"].astype(np.float16) if "visibility" in data else None
+            traj_depth_consistency_ratio = (
+                data["traj_depth_consistency_ratio"].astype(np.float16)
+                if "traj_depth_consistency_ratio" in data
+                else None
+            )
+            traj_stable_depth_consistency_ratio = (
+                data["traj_stable_depth_consistency_ratio"].astype(np.float16)
+                if "traj_stable_depth_consistency_ratio" in data
+                else None
+            )
+            traj_high_volatility_hit = (
+                np.asarray(data["traj_high_volatility_hit"]).astype(bool, copy=False)
+                if "traj_high_volatility_hit" in data
+                else None
+            )
+            traj_volatility_exposure_ratio = (
+                data["traj_volatility_exposure_ratio"].astype(np.float16)
+                if "traj_volatility_exposure_ratio" in data
+                else None
+            )
+            traj_compare_frame_count = (
+                data["traj_compare_frame_count"].astype(np.uint16)
+                if "traj_compare_frame_count" in data
+                else None
+            )
+            traj_stable_compare_frame_count = (
+                data["traj_stable_compare_frame_count"].astype(np.uint16)
+                if "traj_stable_compare_frame_count" in data
+                else None
+            )
+            traj_mask_reason_bits = (
+                data["traj_mask_reason_bits"].astype(np.uint8)
+                if "traj_mask_reason_bits" in data
+                else None
+            )
+            traj_supervision_mask = (
+                np.asarray(data["traj_supervision_mask"]).astype(bool, copy=False)
+                if "traj_supervision_mask" in data
+                else None
+            )
+            traj_supervision_prefix_len = (
+                data["traj_supervision_prefix_len"].astype(np.uint16)
+                if "traj_supervision_prefix_len" in data
+                else None
+            )
+            traj_supervision_count = (
+                data["traj_supervision_count"].astype(np.uint16)
+                if "traj_supervision_count" in data
+                else None
+            )
             return {
                 "layout": V2_LAYOUT,
                 "traj_uvz": traj_uvz,
@@ -180,6 +230,16 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 "segment_frame_indices": segment_frame_indices,
                 "traj_valid_mask": traj_valid_mask,
                 "visibility": visibility,
+                "traj_depth_consistency_ratio": traj_depth_consistency_ratio,
+                "traj_stable_depth_consistency_ratio": traj_stable_depth_consistency_ratio,
+                "traj_high_volatility_hit": traj_high_volatility_hit,
+                "traj_volatility_exposure_ratio": traj_volatility_exposure_ratio,
+                "traj_compare_frame_count": traj_compare_frame_count,
+                "traj_stable_compare_frame_count": traj_stable_compare_frame_count,
+                "traj_mask_reason_bits": traj_mask_reason_bits,
+                "traj_supervision_mask": traj_supervision_mask,
+                "traj_supervision_prefix_len": traj_supervision_prefix_len,
+                "traj_supervision_count": traj_supervision_count,
                 "frame_aligned": True,
             }
 
@@ -216,6 +276,56 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
             "segment_frame_indices": segment_frame_indices,
             "traj_valid_mask": traj_valid_mask,
             "visibility": None,
+            "traj_depth_consistency_ratio": (
+                data["traj_depth_consistency_ratio"].astype(np.float16)
+                if "traj_depth_consistency_ratio" in data
+                else None
+            ),
+            "traj_stable_depth_consistency_ratio": (
+                data["traj_stable_depth_consistency_ratio"].astype(np.float16)
+                if "traj_stable_depth_consistency_ratio" in data
+                else None
+            ),
+            "traj_high_volatility_hit": (
+                np.asarray(data["traj_high_volatility_hit"]).astype(bool, copy=False)
+                if "traj_high_volatility_hit" in data
+                else None
+            ),
+            "traj_volatility_exposure_ratio": (
+                data["traj_volatility_exposure_ratio"].astype(np.float16)
+                if "traj_volatility_exposure_ratio" in data
+                else None
+            ),
+            "traj_compare_frame_count": (
+                data["traj_compare_frame_count"].astype(np.uint16)
+                if "traj_compare_frame_count" in data
+                else None
+            ),
+            "traj_stable_compare_frame_count": (
+                data["traj_stable_compare_frame_count"].astype(np.uint16)
+                if "traj_stable_compare_frame_count" in data
+                else None
+            ),
+            "traj_mask_reason_bits": (
+                data["traj_mask_reason_bits"].astype(np.uint8)
+                if "traj_mask_reason_bits" in data
+                else None
+            ),
+            "traj_supervision_mask": (
+                np.asarray(data["traj_supervision_mask"]).astype(bool, copy=False)
+                if "traj_supervision_mask" in data
+                else None
+            ),
+            "traj_supervision_prefix_len": (
+                data["traj_supervision_prefix_len"].astype(np.uint16)
+                if "traj_supervision_prefix_len" in data
+                else None
+            ),
+            "traj_supervision_count": (
+                data["traj_supervision_count"].astype(np.uint16)
+                if "traj_supervision_count" in data
+                else None
+            ),
             "valid_steps": valid_steps,
             "frame_aligned": frame_aligned,
         }
@@ -285,6 +395,7 @@ def build_pointcloud_from_frame(
     depth_min: float = 0.01,
     depth_max: float = 10.0,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Return world-space points filtered by query-frame camera depth."""
     from utils.threed_utils import unproject_by_depth
 
     depth = np.asarray(depth, dtype=np.float32)
@@ -296,12 +407,14 @@ def build_pointcloud_from_frame(
     xyz = unproject_by_depth(depth[None, None], intrinsics[None], c2w[None])[0].transpose(1, 2, 0)
     pts = xyz[::downsample, ::downsample].reshape(-1, 3)
     colors = rgb[::downsample, ::downsample].reshape(-1, 3).astype(np.float32) / 255.0
+    depth_ds = depth[::downsample, ::downsample].reshape(-1)
 
     valid = (
         np.isfinite(pts).all(axis=1)
         & np.isfinite(colors).all(axis=1)
-        & (pts[:, 2] > depth_min)
-        & (pts[:, 2] < depth_max)
+        & np.isfinite(depth_ds)
+        & (depth_ds > depth_min)
+        & (depth_ds < depth_max)
     )
     return pts[valid].astype(np.float32), colors[valid].astype(np.float32)
 

@@ -95,6 +95,19 @@ def parse_camera_names(camera_names: str) -> list[str]:
     return values
 
 
+def resolve_traj_filter_profile(camera_name: str, requested_profile: str) -> str:
+    if requested_profile != "auto":
+        return requested_profile
+    camera_name = camera_name.lower()
+    if (
+        camera_name.endswith("camera_3")
+        or "wrist" in camera_name
+        or "hand" in camera_name
+    ):
+        return "wrist"
+    return "external"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Batch inference for press_one_button_demo_v1"
@@ -275,6 +288,13 @@ def parse_args() -> argparse.Namespace:
         default="standard",
         choices=["none", "basic", "standard", "strict"],
         help="Trajectory filtering level for sample traj_valid_mask",
+    )
+    parser.add_argument(
+        "--traj_filter_profile",
+        type=str,
+        default="auto",
+        choices=["auto", "external", "wrist"],
+        help="Trajectory filtering profile. auto maps wrist-like camera names to wrist and others to external.",
     )
     parser.add_argument(
         "--min_valid_frames",
@@ -547,6 +567,7 @@ def build_worker_cmd(
         "--grid_size", str(args.grid_size),
         "--output_layout", args.output_layout,
         "--filter_level", args.filter_level,
+        "--traj_filter_profile", args.traj_filter_profile,
         "--min_depth", str(args.min_depth),
         "--max_depth", str(args.max_depth),
         "--trajectory_dirname", args.trajectory_dirname,
@@ -733,6 +754,10 @@ def build_camera_args(
     camera_args = copy.deepcopy(base_args)
     camera_args.mask_dir = None
     camera_args.camera_name = camera_name
+    camera_args.traj_filter_profile = resolve_traj_filter_profile(
+        camera_name,
+        base_args.traj_filter_profile,
+    )
     camera_args.external_geom_npz = str(episode_dir / base_args.external_geom_name)
     return camera_args
 
