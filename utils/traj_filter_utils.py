@@ -15,12 +15,30 @@ TEMPORAL_DEPTH_REL_TOL = 0.10
 TEMPORAL_MIN_CONSISTENCY_RATIO = 0.95
 
 TRAJ_FILTER_PROFILE_EXTERNAL = "external"
+TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR = "external_manipulator"
+TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR_V2 = "external_manipulator_v2"
 TRAJ_FILTER_PROFILE_WRIST = "wrist"
+TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR = "wrist_manipulator"
 
 WRIST_MIN_PREFIX_FRAMES = 3
 WRIST_MIN_SUPPORT_FRAMES = 3
 WRIST_PREFIX_RATIO = 0.15
 WRIST_SUPPORT_RATIO = 0.20
+
+WRIST_MANIPULATOR_MAX_DEPTH_RANK = 0.50
+WRIST_MANIPULATOR_MIN_MOTION_EXTENT = 0.03
+WRIST_MANIPULATOR_CLUSTER_RADIUS_RATIO = 0.06
+WRIST_MANIPULATOR_CLUSTER_RADIUS_MIN_PX = 24
+WRIST_MANIPULATOR_MIN_COMPONENT_RATIO = 0.005
+WRIST_MANIPULATOR_MIN_COMPONENT_SIZE = 2
+
+EXTERNAL_MANIPULATOR_V2_MAX_DEPTH_RANK = 0.70
+EXTERNAL_MANIPULATOR_V2_MIN_MOTION_EXTENT = 0.01
+EXTERNAL_MANIPULATOR_V2_CLUSTER_RADIUS_RATIO = 0.06
+EXTERNAL_MANIPULATOR_V2_CLUSTER_RADIUS_MIN_PX = 24
+EXTERNAL_MANIPULATOR_V2_MIN_COMPONENT_RATIO = 0.002
+EXTERNAL_MANIPULATOR_V2_MIN_COMPONENT_SIZE = 2
+EXTERNAL_MANIPULATOR_V2_MAJOR_COMPONENT_RATIO = 0.15
 
 VOLATILITY_LOW_PERCENTILE = 5.0
 VOLATILITY_HIGH_PERCENTILE = 95.0
@@ -30,6 +48,9 @@ MASK_REASON_BASE_GEOMETRY_FAIL = np.uint8(1 << 0)
 MASK_REASON_QUERY_DEPTH_FAIL = np.uint8(1 << 1)
 MASK_REASON_TEMPORAL_CONSISTENCY_FAIL = np.uint8(1 << 2)
 MASK_REASON_STABLE_TEMPORAL_FAIL = np.uint8(1 << 3)
+MASK_REASON_MANIPULATOR_DEPTH_FAIL = np.uint8(1 << 4)
+MASK_REASON_MANIPULATOR_MOTION_FAIL = np.uint8(1 << 5)
+MASK_REASON_MANIPULATOR_CLUSTER_FAIL = np.uint8(1 << 6)
 
 
 def _normalize_visibility(
@@ -126,6 +147,333 @@ def _resolve_support_frame_requirement(
     if num_frames <= 0:
         return 0
     return min(num_frames, max(int(min_frames), int(np.ceil(float(ratio) * num_frames))))
+
+
+def _compute_query_depth_ranks(query_depth_values: np.ndarray, seed_mask: np.ndarray) -> np.ndarray:
+    query_depth_values = np.asarray(query_depth_values, dtype=np.float32).reshape(-1)
+    seed_mask = np.asarray(seed_mask, dtype=bool).reshape(-1)
+    if query_depth_values.shape != seed_mask.shape:
+        raise ValueError(
+            f"Expected query_depth_values and seed_mask to share shape, got "
+            f"{query_depth_values.shape} and {seed_mask.shape}"
+        )
+
+    ranks = np.full(query_depth_values.shape, np.nan, dtype=np.float32)
+    valid_seed = seed_mask & np.isfinite(query_depth_values)
+    seed_indices = np.flatnonzero(valid_seed)
+    if seed_indices.size == 0:
+        return ranks
+
+    order = seed_indices[np.argsort(query_depth_values[seed_indices], kind="stable")]
+    if order.size == 1:
+        ranks[order[0]] = 0.0
+        return ranks
+
+    denom = float(order.size - 1)
+    ranks[order] = np.arange(order.size, dtype=np.float32) / denom
+    return ranks
+
+
+def _compute_supervised_motion_metrics(
+    world_tracks: np.ndarray,
+    supervision_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    world_tracks = np.asarray(world_tracks, dtype=np.float32)
+    supervision_mask = np.asarray(supervision_mask, dtype=bool)
+    if world_tracks.ndim != 3 or world_tracks.shape[-1] != 3:
+        raise ValueError(f"Expected world_tracks shape (N,T,3), got {world_tracks.shape}")
+    if supervision_mask.shape != world_tracks.shape[:2]:
+        raise ValueError(
+            f"Expected supervision_mask shape {world_tracks.shape[:2]}, got {supervision_mask.shape}"
+        )
+
+    num_tracks, num_frames, _ = world_tracks.shape
+    valid = np.isfinite(world_tracks).all(axis=-1) & supervision_mask
+    motion_extent = np.full(num_tracks, np.nan, dtype=np.float32)
+    motion_step_median = np.full(num_tracks, np.nan, dtype=np.float32)
+
+    step_norm = None
+    pair_valid = None
+    if num_frames > 1:
+        step_norm = np.linalg.norm(np.diff(world_tracks, axis=1), axis=-1)
+        pair_valid = valid[:, :-1] & valid[:, 1:]
+
+    for track_idx in range(num_tracks):
+        valid_indices = np.flatnonzero(valid[track_idx])
+        if valid_indices.size >= 2:
+            pts = world_tracks[track_idx, valid_indices]
+            motion_extent[track_idx] = float(np.max(np.linalg.norm(pts - pts[0], axis=1)))
+
+        if step_norm is None or pair_valid is None:
+            continue
+
+        valid_steps = step_norm[track_idx, pair_valid[track_idx]]
+        if valid_steps.size > 0:
+            motion_step_median[track_idx] = float(np.median(valid_steps))
+
+    return motion_extent, motion_step_median
+
+
+def _select_largest_spatial_component(
+    keypoints: np.ndarray,
+    candidate_mask: np.ndarray,
+    *,
+    image_height: int,
+    image_width: int,
+    radius_ratio: float,
+    radius_min_px: int,
+    min_component_ratio: float,
+    min_component_size: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+    keypoints = np.asarray(keypoints, dtype=np.float32)
+    candidate_mask = np.asarray(candidate_mask, dtype=bool)
+    if keypoints.ndim != 2 or keypoints.shape[1] != 2:
+        raise ValueError(f"Expected keypoints shape (N,2), got {keypoints.shape}")
+    if candidate_mask.shape != (keypoints.shape[0],):
+        raise ValueError(f"Expected candidate_mask shape {(keypoints.shape[0],)}, got {candidate_mask.shape}")
+
+    num_tracks = int(keypoints.shape[0])
+    final_mask = np.zeros(num_tracks, dtype=bool)
+    component_ids = np.full(num_tracks, -1, dtype=np.int16)
+    component_sizes = np.zeros(num_tracks, dtype=np.uint16)
+    candidate_indices = np.flatnonzero(candidate_mask)
+    if candidate_indices.size == 0:
+        return final_mask, component_ids, component_sizes, False
+
+    radius_px = float(max(int(radius_min_px), int(round(float(radius_ratio) * min(image_height, image_width)))))
+    radius_sq = radius_px * radius_px
+    coords = keypoints[candidate_indices]
+    unvisited = np.ones(candidate_indices.size, dtype=bool)
+    local_component_ids = np.full(candidate_indices.size, -1, dtype=np.int32)
+    component_members: list[np.ndarray] = []
+
+    while unvisited.any():
+        start = int(np.flatnonzero(unvisited)[0])
+        unvisited[start] = False
+        stack = [start]
+        members = [start]
+
+        while stack:
+            current = stack.pop()
+            remaining = np.flatnonzero(unvisited)
+            if remaining.size == 0:
+                continue
+            diff = coords[remaining] - coords[current]
+            neighbors = remaining[np.sum(diff * diff, axis=1) <= radius_sq]
+            if neighbors.size == 0:
+                continue
+            unvisited[neighbors] = False
+            stack.extend(neighbors.tolist())
+            members.extend(neighbors.tolist())
+
+        component_id = len(component_members)
+        member_array = np.asarray(members, dtype=np.int32)
+        local_component_ids[member_array] = component_id
+        component_members.append(member_array)
+
+    component_sizes_local = np.asarray([len(members) for members in component_members], dtype=np.int32)
+    component_ids[candidate_indices] = local_component_ids.astype(np.int16)
+    for component_id, members in enumerate(component_members):
+        component_sizes[candidate_indices[members]] = np.uint16(component_sizes_local[component_id])
+
+    required_component_size = max(
+        int(min_component_size),
+        int(np.ceil(float(min_component_ratio) * float(num_tracks))),
+    )
+    largest_component_id = int(np.argmax(component_sizes_local))
+    largest_component_size = int(component_sizes_local[largest_component_id])
+    if largest_component_size >= required_component_size:
+        final_mask[candidate_indices[component_members[largest_component_id]]] = True
+        return final_mask, component_ids, component_sizes, False
+
+    final_mask[candidate_indices] = True
+    return final_mask, component_ids, component_sizes, True
+
+
+def _select_major_spatial_components(
+    keypoints: np.ndarray,
+    candidate_mask: np.ndarray,
+    *,
+    image_height: int,
+    image_width: int,
+    radius_ratio: float,
+    radius_min_px: int,
+    min_component_ratio: float,
+    min_component_size: int,
+    major_component_ratio: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+    keypoints = np.asarray(keypoints, dtype=np.float32)
+    candidate_mask = np.asarray(candidate_mask, dtype=bool)
+    if keypoints.ndim != 2 or keypoints.shape[1] != 2:
+        raise ValueError(f"Expected keypoints shape (N,2), got {keypoints.shape}")
+    if candidate_mask.shape != (keypoints.shape[0],):
+        raise ValueError(f"Expected candidate_mask shape {(keypoints.shape[0],)}, got {candidate_mask.shape}")
+
+    num_tracks = int(keypoints.shape[0])
+    final_mask = np.zeros(num_tracks, dtype=bool)
+    component_ids = np.full(num_tracks, -1, dtype=np.int16)
+    component_sizes = np.zeros(num_tracks, dtype=np.uint16)
+    candidate_indices = np.flatnonzero(candidate_mask)
+    if candidate_indices.size == 0:
+        return final_mask, component_ids, component_sizes, False
+
+    radius_px = float(max(int(radius_min_px), int(round(float(radius_ratio) * min(image_height, image_width)))))
+    radius_sq = radius_px * radius_px
+    coords = keypoints[candidate_indices]
+    unvisited = np.ones(candidate_indices.size, dtype=bool)
+    local_component_ids = np.full(candidate_indices.size, -1, dtype=np.int32)
+    component_members: list[np.ndarray] = []
+
+    while unvisited.any():
+        start = int(np.flatnonzero(unvisited)[0])
+        unvisited[start] = False
+        stack = [start]
+        members = [start]
+
+        while stack:
+            current = stack.pop()
+            remaining = np.flatnonzero(unvisited)
+            if remaining.size == 0:
+                continue
+            diff = coords[remaining] - coords[current]
+            neighbors = remaining[np.sum(diff * diff, axis=1) <= radius_sq]
+            if neighbors.size == 0:
+                continue
+            unvisited[neighbors] = False
+            stack.extend(neighbors.tolist())
+            members.extend(neighbors.tolist())
+
+        component_id = len(component_members)
+        member_array = np.asarray(members, dtype=np.int32)
+        local_component_ids[member_array] = component_id
+        component_members.append(member_array)
+
+    component_sizes_local = np.asarray([len(members) for members in component_members], dtype=np.int32)
+    component_ids[candidate_indices] = local_component_ids.astype(np.int16)
+    for component_id, members in enumerate(component_members):
+        component_sizes[candidate_indices[members]] = np.uint16(component_sizes_local[component_id])
+
+    required_component_size = max(
+        int(min_component_size),
+        int(np.ceil(float(min_component_ratio) * float(num_tracks))),
+    )
+    largest_component_size = int(component_sizes_local.max())
+    if largest_component_size < required_component_size:
+        final_mask[candidate_indices] = True
+        return final_mask, component_ids, component_sizes, True
+
+    major_component_size = max(
+        required_component_size,
+        int(np.ceil(float(major_component_ratio) * float(largest_component_size))),
+    )
+    keep_component_ids = np.flatnonzero(component_sizes_local >= major_component_size)
+    for component_id in keep_component_ids.tolist():
+        final_mask[candidate_indices[component_members[component_id]]] = True
+    return final_mask, component_ids, component_sizes, False
+
+
+def _apply_manipulator_aware_filter(
+    *,
+    traj: np.ndarray,
+    keypoints: np.ndarray,
+    seed_mask: np.ndarray,
+    supervision_mask: np.ndarray,
+    intrinsics_segment: np.ndarray,
+    extrinsics_segment: np.ndarray,
+    image_height: int,
+    image_width: int,
+    min_depth: float,
+    max_depth: float,
+    max_depth_rank: float,
+    min_motion_extent: float,
+    cluster_radius_ratio: float,
+    cluster_radius_min_px: int,
+    min_component_ratio: float,
+    min_component_size: int,
+    component_keep_mode: str = "largest",
+    major_component_ratio: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]:
+    traj = np.asarray(traj, dtype=np.float32)
+    keypoints = np.asarray(keypoints, dtype=np.float32)
+    seed_mask = np.asarray(seed_mask, dtype=bool)
+    supervision_mask = np.asarray(supervision_mask, dtype=bool)
+    intrinsics_segment = np.asarray(intrinsics_segment, dtype=np.float32)
+    extrinsics_segment = np.asarray(extrinsics_segment, dtype=np.float32)
+
+    query_depth_values = traj[:, 0, 2].astype(np.float32, copy=False)
+    traj_query_depth_rank = _compute_query_depth_ranks(query_depth_values, seed_mask)
+    near_depth_mask = (
+        seed_mask
+        & np.isfinite(traj_query_depth_rank)
+        & (traj_query_depth_rank <= float(max_depth_rank))
+    )
+
+    world_tracks = traj_uvz_to_world_coordinates(
+        traj,
+        query_intrinsics=intrinsics_segment[0],
+        query_w2c=extrinsics_segment[0],
+        min_depth=min_depth,
+        max_depth=max_depth,
+    )
+    traj_motion_extent, traj_motion_step_median = _compute_supervised_motion_metrics(
+        world_tracks,
+        supervision_mask,
+    )
+    motion_mask = (
+        seed_mask
+        & np.isfinite(traj_motion_extent)
+        & (traj_motion_extent >= float(min_motion_extent))
+    )
+    traj_manipulator_candidate_mask = seed_mask & near_depth_mask & motion_mask
+    if component_keep_mode == "largest":
+        (
+            final_mask,
+            traj_manipulator_cluster_id,
+            traj_manipulator_component_size,
+            fallback_used,
+        ) = _select_largest_spatial_component(
+            keypoints,
+            traj_manipulator_candidate_mask,
+            image_height=image_height,
+            image_width=image_width,
+            radius_ratio=cluster_radius_ratio,
+            radius_min_px=cluster_radius_min_px,
+            min_component_ratio=min_component_ratio,
+            min_component_size=min_component_size,
+        )
+    elif component_keep_mode == "major":
+        if major_component_ratio is None:
+            raise ValueError("major_component_ratio is required when component_keep_mode='major'")
+        (
+            final_mask,
+            traj_manipulator_cluster_id,
+            traj_manipulator_component_size,
+            fallback_used,
+        ) = _select_major_spatial_components(
+            keypoints,
+            traj_manipulator_candidate_mask,
+            image_height=image_height,
+            image_width=image_width,
+            radius_ratio=cluster_radius_ratio,
+            radius_min_px=cluster_radius_min_px,
+            min_component_ratio=min_component_ratio,
+            min_component_size=min_component_size,
+            major_component_ratio=major_component_ratio,
+        )
+    else:
+        raise ValueError(f"Unsupported component_keep_mode: {component_keep_mode}")
+    return (
+        final_mask,
+        traj_query_depth_rank,
+        traj_motion_extent,
+        traj_motion_step_median,
+        traj_manipulator_candidate_mask,
+        traj_manipulator_cluster_id,
+        traj_manipulator_component_size,
+        near_depth_mask,
+        motion_mask,
+        bool(fallback_used),
+    )
 
 
 def compute_traj_base_geometry(
@@ -347,6 +695,23 @@ def resolve_traj_filter_config(filter_args) -> dict:
         },
     }
     config = defaults[level].copy()
+    config.update(
+        {
+            "wrist_manipulator_max_depth_rank": WRIST_MANIPULATOR_MAX_DEPTH_RANK,
+            "wrist_manipulator_min_motion_extent": WRIST_MANIPULATOR_MIN_MOTION_EXTENT,
+            "wrist_manipulator_cluster_radius_ratio": WRIST_MANIPULATOR_CLUSTER_RADIUS_RATIO,
+            "wrist_manipulator_cluster_radius_min_px": WRIST_MANIPULATOR_CLUSTER_RADIUS_MIN_PX,
+            "wrist_manipulator_min_component_ratio": WRIST_MANIPULATOR_MIN_COMPONENT_RATIO,
+            "wrist_manipulator_min_component_size": WRIST_MANIPULATOR_MIN_COMPONENT_SIZE,
+            "external_manipulator_v2_max_depth_rank": EXTERNAL_MANIPULATOR_V2_MAX_DEPTH_RANK,
+            "external_manipulator_v2_min_motion_extent": EXTERNAL_MANIPULATOR_V2_MIN_MOTION_EXTENT,
+            "external_manipulator_v2_cluster_radius_ratio": EXTERNAL_MANIPULATOR_V2_CLUSTER_RADIUS_RATIO,
+            "external_manipulator_v2_cluster_radius_min_px": EXTERNAL_MANIPULATOR_V2_CLUSTER_RADIUS_MIN_PX,
+            "external_manipulator_v2_min_component_ratio": EXTERNAL_MANIPULATOR_V2_MIN_COMPONENT_RATIO,
+            "external_manipulator_v2_min_component_size": EXTERNAL_MANIPULATOR_V2_MIN_COMPONENT_SIZE,
+            "external_manipulator_v2_major_component_ratio": EXTERNAL_MANIPULATOR_V2_MAJOR_COMPONENT_RATIO,
+        }
+    )
     if filter_args is None:
         return config
 
@@ -692,6 +1057,11 @@ def build_traj_filter_result(
     default_supervision_mask = np.isfinite(traj).all(axis=-1).astype(bool)
     default_supervision_prefix_len = _compute_true_prefix_lengths(default_supervision_mask).astype(np.uint16)
     default_supervision_count = default_supervision_mask.sum(axis=1).astype(np.uint16)
+    default_manipulator_mask = np.zeros(num_tracks, dtype=bool)
+    default_manipulator_rank = np.full(num_tracks, np.nan, dtype=np.float32)
+    default_cluster_id = np.full(num_tracks, -1, dtype=np.int16)
+    default_component_size = np.zeros(num_tracks, dtype=np.uint16)
+    default_fallback_used = np.asarray(False, dtype=bool)
 
     if not config["enabled"]:
         return {
@@ -706,6 +1076,14 @@ def build_traj_filter_result(
             "traj_supervision_mask": default_supervision_mask,
             "traj_supervision_prefix_len": default_supervision_prefix_len,
             "traj_supervision_count": default_supervision_count,
+            "traj_wrist_seed_mask": default_manipulator_mask.copy(),
+            "traj_query_depth_rank": default_manipulator_rank.copy(),
+            "traj_motion_extent": default_manipulator_rank.copy(),
+            "traj_motion_step_median": default_manipulator_rank.copy(),
+            "traj_manipulator_candidate_mask": default_manipulator_mask.copy(),
+            "traj_manipulator_cluster_id": default_cluster_id.copy(),
+            "traj_manipulator_component_size": default_component_size.copy(),
+            "traj_manipulator_cluster_fallback_used": default_fallback_used.copy(),
         }
 
     visibility = _normalize_visibility(visibs, num_tracks=num_tracks, num_frames=num_frames)
@@ -806,15 +1184,98 @@ def build_traj_filter_result(
 
     reason_bits = np.zeros(num_tracks, dtype=np.uint8)
     profile = config["profile"]
-    if profile not in {TRAJ_FILTER_PROFILE_EXTERNAL, TRAJ_FILTER_PROFILE_WRIST}:
+    if profile not in {
+        TRAJ_FILTER_PROFILE_EXTERNAL,
+        TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR,
+        TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR_V2,
+        TRAJ_FILTER_PROFILE_WRIST,
+        TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR,
+    }:
         raise ValueError(f"Unsupported traj_filter_profile: {profile}")
 
-    if profile == TRAJ_FILTER_PROFILE_EXTERNAL:
+    wrist_seed_mask = default_manipulator_mask.copy()
+    traj_query_depth_rank = default_manipulator_rank.copy()
+    traj_motion_extent = default_manipulator_rank.copy()
+    traj_motion_step_median = default_manipulator_rank.copy()
+    traj_manipulator_candidate_mask = default_manipulator_mask.copy()
+    traj_manipulator_cluster_id = default_cluster_id.copy()
+    traj_manipulator_component_size = default_component_size.copy()
+    traj_manipulator_cluster_fallback_used = default_fallback_used.copy()
+    external_seed_mask = base_mask & query_depth_mask & temporal_mask
+
+    if profile in {
+        TRAJ_FILTER_PROFILE_EXTERNAL,
+        TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR,
+        TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR_V2,
+    }:
         reason_bits[~base_mask] |= MASK_REASON_BASE_GEOMETRY_FAIL
         reason_bits[~query_depth_mask] |= MASK_REASON_QUERY_DEPTH_FAIL
         reason_bits[~temporal_mask] |= MASK_REASON_TEMPORAL_CONSISTENCY_FAIL
         reason_bits[stable_temporal_fail & (~temporal_mask)] |= MASK_REASON_STABLE_TEMPORAL_FAIL
-        final_mask = base_mask & query_depth_mask & temporal_mask
+        if profile == TRAJ_FILTER_PROFILE_EXTERNAL:
+            final_mask = external_seed_mask
+        else:
+            wrist_seed_mask = external_seed_mask.copy()
+            raw_depths_segment, intrinsics_segment, extrinsics_segment = _require_segment_geometry(
+                raw_depths_segment=raw_depths_segment,
+                intrinsics_segment=intrinsics_segment,
+                extrinsics_segment=extrinsics_segment,
+                expected_num_frames=num_frames,
+            )
+            manipulator_filter_kwargs = {
+                "traj": traj,
+                "keypoints": keypoints,
+                "seed_mask": wrist_seed_mask,
+                "supervision_mask": supervision_mask,
+                "intrinsics_segment": intrinsics_segment,
+                "extrinsics_segment": extrinsics_segment,
+                "image_height": image_height,
+                "image_width": image_width,
+                "min_depth": config["min_depth"],
+                "max_depth": config["max_depth"],
+            }
+            if profile == TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR:
+                manipulator_filter_kwargs.update(
+                    {
+                        "max_depth_rank": config["wrist_manipulator_max_depth_rank"],
+                        "min_motion_extent": config["wrist_manipulator_min_motion_extent"],
+                        "cluster_radius_ratio": config["wrist_manipulator_cluster_radius_ratio"],
+                        "cluster_radius_min_px": config["wrist_manipulator_cluster_radius_min_px"],
+                        "min_component_ratio": config["wrist_manipulator_min_component_ratio"],
+                        "min_component_size": config["wrist_manipulator_min_component_size"],
+                        "component_keep_mode": "largest",
+                    }
+                )
+            else:
+                manipulator_filter_kwargs.update(
+                    {
+                        "max_depth_rank": config["external_manipulator_v2_max_depth_rank"],
+                        "min_motion_extent": config["external_manipulator_v2_min_motion_extent"],
+                        "cluster_radius_ratio": config["external_manipulator_v2_cluster_radius_ratio"],
+                        "cluster_radius_min_px": config["external_manipulator_v2_cluster_radius_min_px"],
+                        "min_component_ratio": config["external_manipulator_v2_min_component_ratio"],
+                        "min_component_size": config["external_manipulator_v2_min_component_size"],
+                        "component_keep_mode": "major",
+                        "major_component_ratio": config["external_manipulator_v2_major_component_ratio"],
+                    }
+                )
+            (
+                final_mask,
+                traj_query_depth_rank,
+                traj_motion_extent,
+                traj_motion_step_median,
+                traj_manipulator_candidate_mask,
+                traj_manipulator_cluster_id,
+                traj_manipulator_component_size,
+                near_depth_mask,
+                motion_mask,
+                fallback_used,
+            ) = _apply_manipulator_aware_filter(**manipulator_filter_kwargs)
+            traj_manipulator_cluster_fallback_used = np.asarray(fallback_used, dtype=bool)
+
+            reason_bits[wrist_seed_mask & (~near_depth_mask)] |= MASK_REASON_MANIPULATOR_DEPTH_FAIL
+            reason_bits[wrist_seed_mask & (~motion_mask)] |= MASK_REASON_MANIPULATOR_MOTION_FAIL
+            reason_bits[traj_manipulator_candidate_mask & (~final_mask)] |= MASK_REASON_MANIPULATOR_CLUSTER_FAIL
     else:
         required_prefix_frames = _resolve_support_frame_requirement(
             num_frames=num_frames,
@@ -834,7 +1295,51 @@ def build_traj_filter_result(
         reason_bits[~wrist_base_mask] |= MASK_REASON_BASE_GEOMETRY_FAIL
         reason_bits[~query_depth_mask] |= MASK_REASON_QUERY_DEPTH_FAIL
         reason_bits[~supervision_support_mask] |= MASK_REASON_TEMPORAL_CONSISTENCY_FAIL
-        final_mask = wrist_base_mask & query_depth_mask & supervision_support_mask
+        wrist_seed_mask = wrist_base_mask & query_depth_mask & supervision_support_mask
+
+        if profile == TRAJ_FILTER_PROFILE_WRIST:
+            final_mask = wrist_seed_mask
+        else:
+            raw_depths_segment, intrinsics_segment, extrinsics_segment = _require_segment_geometry(
+                raw_depths_segment=raw_depths_segment,
+                intrinsics_segment=intrinsics_segment,
+                extrinsics_segment=extrinsics_segment,
+                expected_num_frames=num_frames,
+            )
+            (
+                final_mask,
+                traj_query_depth_rank,
+                traj_motion_extent,
+                traj_motion_step_median,
+                traj_manipulator_candidate_mask,
+                traj_manipulator_cluster_id,
+                traj_manipulator_component_size,
+                near_depth_mask,
+                motion_mask,
+                fallback_used,
+            ) = _apply_manipulator_aware_filter(
+                traj=traj,
+                keypoints=keypoints,
+                seed_mask=wrist_seed_mask,
+                supervision_mask=supervision_mask,
+                intrinsics_segment=intrinsics_segment,
+                extrinsics_segment=extrinsics_segment,
+                image_height=image_height,
+                image_width=image_width,
+                min_depth=config["min_depth"],
+                max_depth=config["max_depth"],
+                max_depth_rank=config["wrist_manipulator_max_depth_rank"],
+                min_motion_extent=config["wrist_manipulator_min_motion_extent"],
+                cluster_radius_ratio=config["wrist_manipulator_cluster_radius_ratio"],
+                cluster_radius_min_px=config["wrist_manipulator_cluster_radius_min_px"],
+                min_component_ratio=config["wrist_manipulator_min_component_ratio"],
+                min_component_size=config["wrist_manipulator_min_component_size"],
+            )
+            traj_manipulator_cluster_fallback_used = np.asarray(fallback_used, dtype=bool)
+
+            reason_bits[wrist_seed_mask & (~near_depth_mask)] |= MASK_REASON_MANIPULATOR_DEPTH_FAIL
+            reason_bits[wrist_seed_mask & (~motion_mask)] |= MASK_REASON_MANIPULATOR_MOTION_FAIL
+            reason_bits[traj_manipulator_candidate_mask & (~final_mask)] |= MASK_REASON_MANIPULATOR_CLUSTER_FAIL
 
     return {
         "traj_valid_mask": final_mask.astype(bool),
@@ -848,6 +1353,16 @@ def build_traj_filter_result(
         "traj_supervision_mask": supervision_mask.astype(bool),
         "traj_supervision_prefix_len": supervision_prefix_len.astype(np.uint16),
         "traj_supervision_count": supervision_count.astype(np.uint16),
+        "traj_wrist_seed_mask": wrist_seed_mask.astype(bool),
+        "traj_query_depth_rank": traj_query_depth_rank.astype(np.float32),
+        "traj_motion_extent": traj_motion_extent.astype(np.float32),
+        "traj_motion_step_median": traj_motion_step_median.astype(np.float32),
+        "traj_manipulator_candidate_mask": traj_manipulator_candidate_mask.astype(bool),
+        "traj_manipulator_cluster_id": traj_manipulator_cluster_id.astype(np.int16),
+        "traj_manipulator_component_size": traj_manipulator_component_size.astype(np.uint16),
+        "traj_manipulator_cluster_fallback_used": np.asarray(
+            traj_manipulator_cluster_fallback_used, dtype=bool
+        ),
     }
 
 

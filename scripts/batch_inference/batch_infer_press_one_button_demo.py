@@ -293,8 +293,11 @@ def parse_args() -> argparse.Namespace:
         "--traj_filter_profile",
         type=str,
         default="auto",
-        choices=["auto", "external", "wrist"],
-        help="Trajectory filtering profile. auto maps wrist-like camera names to wrist and others to external.",
+        choices=["auto", "external", "external_manipulator", "external_manipulator_v2", "wrist", "wrist_manipulator"],
+        help=(
+            "Trajectory filtering profile. auto maps wrist-like camera names to wrist and others to external; "
+            "external_manipulator, external_manipulator_v2, and wrist_manipulator must be requested explicitly."
+        ),
     )
     parser.add_argument(
         "--min_valid_frames",

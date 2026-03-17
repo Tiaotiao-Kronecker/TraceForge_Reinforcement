@@ -174,8 +174,14 @@ def parse_args():
         "--traj_filter_profile",
         type=str,
         default="external",
-        choices=["external", "wrist"],
-        help="Trajectory filter profile: external keeps the current strict full-track mask; wrist keeps partial trajectories with per-frame supervision masks.",
+        choices=["external", "external_manipulator", "external_manipulator_v2", "wrist", "wrist_manipulator"],
+        help=(
+            "Trajectory filter profile: external keeps the current strict full-track mask; "
+            "external_manipulator keeps external as the seed and then prunes to manipulator-like tracks; "
+            "external_manipulator_v2 is a looser external manipulator profile that keeps major manipulator components; "
+            "wrist keeps partial trajectories with per-frame supervision masks; "
+            "wrist_manipulator adds near-field and motion-aware pruning on top of wrist."
+        ),
     )
     parser.add_argument(
         "--min_valid_frames",
@@ -222,7 +228,10 @@ def retarget_trajectories(
     top_percent: float = 0.02,
 ):
     """
-    Synchronous arc-length retargeting using per-segment robust speeds.
+    Dormant helper for synchronous arc-length retargeting.
+
+    This helper is intentionally kept for reference, but the current TraceForge
+    inference/save path does not invoke it.
 
     Steps:
       1) Global normalize x,y by (trajectory[-1,0,0], trajectory[-1,0,1]), then clip x,y to [0,1].
@@ -332,89 +341,15 @@ def filter_anomalous_trajectories(
     accel_threshold: float = 3.0,
 ) -> np.ndarray:
     """
-    Filter out anomalous trajectories based on velocity direction consistency and acceleration.
+    No-op placeholder for an older trajectory cleanup experiment.
 
-    Detects false trajectories caused by depth instability using two criteria:
-    1. Random direction changes (back-and-forth jumps)
-    2. Sudden velocity changes (high acceleration)
-
-    Args:
-        traj: (N, T, 3) trajectory array
-        direction_threshold: Threshold for mean cosine similarity (default: 0.3)
-        accel_threshold: IQR multiplier for acceleration outlier detection (default: 3.0)
-
-    Returns:
-        filtered_traj: (N, T, 3) with anomalous trajectories set to inf
+    The historical implementation was intentionally removed from the live path to
+    avoid leaving dead filtering logic in the file. Keep the helper so the call
+    site remains explicit that no extra anomaly pruning is applied after
+    projection.
     """
-    # FILTERING DISABLED - return original trajectory
+    del direction_threshold, accel_threshold
     return traj
-
-    N, T, D = traj.shape
-    if T < 3:
-        return traj
-
-    # Compute valid mask (non-inf points)
-    valid = np.isfinite(traj).all(axis=-1)  # (N, T)
-
-    # Compute direction consistency and acceleration for each trajectory
-    mean_cos_sim = np.ones(N)  # Default to 1 (consistent)
-    max_accel = np.zeros(N)
-
-    for i in range(N):
-        valid_idx = np.where(valid[i])[0]
-        if len(valid_idx) < 3:
-            continue
-
-        # Compute velocity vectors
-        vel = np.diff(traj[i, valid_idx], axis=0)  # (T_valid-1, 3)
-        vel_norm = np.linalg.norm(vel, axis=1, keepdims=True)
-
-        # Skip if velocities are too small (static points)
-        valid_vel = vel_norm.flatten() > 1e-4
-        if np.sum(valid_vel) < 2:
-            continue
-
-        vel = vel[valid_vel]
-        vel_norm = vel_norm[valid_vel]
-
-        # 1. Direction consistency
-        vel_normalized = vel / (vel_norm + 1e-8)
-        cos_sim = np.sum(vel_normalized[:-1] * vel_normalized[1:], axis=1)
-        mean_cos_sim[i] = np.mean(cos_sim) if len(cos_sim) > 0 else 1.0
-
-        # 2. Acceleration (second-order difference)
-        if len(vel) >= 2:
-            accel = np.diff(vel, axis=0)  # (T_valid-2, 3)
-            accel_norm = np.linalg.norm(accel, axis=1)
-            max_accel[i] = np.max(accel_norm) if len(accel_norm) > 0 else 0
-
-    # Filter by direction consistency
-    outliers_direction = mean_cos_sim < direction_threshold
-
-    # Filter by acceleration using IQR
-    valid_accel = max_accel[max_accel > 0]
-    outliers_accel = np.zeros(N, dtype=bool)
-    if len(valid_accel) >= 4:
-        q25, q75 = np.percentile(valid_accel, [25, 75])
-        iqr = q75 - q25
-        if iqr > 1e-6:
-            upper_bound = q75 + accel_threshold * iqr
-            outliers_accel = max_accel > upper_bound
-
-    # Combine filters (OR logic)
-    outliers = outliers_direction | outliers_accel
-
-    # Filter trajectories
-    filtered_traj = traj.copy()
-    filtered_traj[outliers] = np.inf
-
-    n_dir = np.sum(outliers_direction)
-    n_accel = np.sum(outliers_accel)
-    n_total = np.sum(outliers)
-    if n_total > 0:
-        logger.info(f"Filtered {n_total}/{N} trajectories (direction: {n_dir}, accel: {n_accel}, overlap: {n_dir + n_accel - n_total})")
-
-    return filtered_traj
 
 
 def _tensor_to_numpy(value):
@@ -514,6 +449,18 @@ def build_query_frame_sample_data(
         "traj_supervision_mask": traj_filter_result["traj_supervision_mask"].astype(bool),
         "traj_supervision_prefix_len": traj_filter_result["traj_supervision_prefix_len"].astype(np.uint16),
         "traj_supervision_count": traj_filter_result["traj_supervision_count"].astype(np.uint16),
+        "traj_wrist_seed_mask": traj_filter_result["traj_wrist_seed_mask"].astype(bool),
+        "traj_query_depth_rank": traj_filter_result["traj_query_depth_rank"].astype(np.float16),
+        "traj_motion_extent": traj_filter_result["traj_motion_extent"].astype(np.float16),
+        "traj_motion_step_median": traj_filter_result["traj_motion_step_median"].astype(np.float16),
+        "traj_manipulator_candidate_mask": traj_filter_result["traj_manipulator_candidate_mask"].astype(bool),
+        "traj_manipulator_cluster_id": traj_filter_result["traj_manipulator_cluster_id"].astype(np.int16),
+        "traj_manipulator_component_size": traj_filter_result["traj_manipulator_component_size"].astype(
+            np.uint16
+        ),
+        "traj_manipulator_cluster_fallback_used": np.asarray(
+            traj_filter_result["traj_manipulator_cluster_fallback_used"], dtype=bool
+        ),
     }
     if save_visibility:
         visibility = visibs_np
@@ -602,6 +549,14 @@ def save_single_query_frame_legacy(
         "traj_supervision_mask": traj_supervision_mask,
         "traj_supervision_prefix_len": sample_payload["traj_supervision_prefix_len"],
         "traj_supervision_count": sample_payload["traj_supervision_count"],
+        "traj_wrist_seed_mask": sample_payload["traj_wrist_seed_mask"],
+        "traj_query_depth_rank": sample_payload["traj_query_depth_rank"],
+        "traj_motion_extent": sample_payload["traj_motion_extent"],
+        "traj_motion_step_median": sample_payload["traj_motion_step_median"],
+        "traj_manipulator_candidate_mask": sample_payload["traj_manipulator_candidate_mask"],
+        "traj_manipulator_cluster_id": sample_payload["traj_manipulator_cluster_id"],
+        "traj_manipulator_component_size": sample_payload["traj_manipulator_component_size"],
+        "traj_manipulator_cluster_fallback_used": sample_payload["traj_manipulator_cluster_fallback_used"],
         "valid_steps": valid_steps,
     }
     if "visibility" in sample_payload:
@@ -676,6 +631,14 @@ def save_single_query_frame_v2(
         "traj_supervision_mask": sample_payload["traj_supervision_mask"],
         "traj_supervision_prefix_len": sample_payload["traj_supervision_prefix_len"],
         "traj_supervision_count": sample_payload["traj_supervision_count"],
+        "traj_wrist_seed_mask": sample_payload["traj_wrist_seed_mask"],
+        "traj_query_depth_rank": sample_payload["traj_query_depth_rank"],
+        "traj_motion_extent": sample_payload["traj_motion_extent"],
+        "traj_motion_step_median": sample_payload["traj_motion_step_median"],
+        "traj_manipulator_candidate_mask": sample_payload["traj_manipulator_candidate_mask"],
+        "traj_manipulator_cluster_id": sample_payload["traj_manipulator_cluster_id"],
+        "traj_manipulator_component_size": sample_payload["traj_manipulator_component_size"],
+        "traj_manipulator_cluster_fallback_used": sample_payload["traj_manipulator_cluster_fallback_used"],
     }
     if "visibility" in sample_payload:
         sample_data["visibility"] = sample_payload["visibility"]
