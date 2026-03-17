@@ -5,6 +5,10 @@ TraceForge 推理数据集采样脚本
 从大量 TraceForge 推理结果中采样指定数量的 case，支持随机采样与均匀采样。
 输出采样结果到文件，并可选择复制或创建软链接到目标目录。
 
+当前脚本按 `legacy` case 目录结构工作，要求每个 case 下存在
+`images0/images` 与 `images0/samples`。它不会解析 press-one-button demo
+当前默认的 `v2` scene cache 布局。
+
 用法:
     python sample_traceforge_dataset.py \
         --data_dir /data2/dataset/output_bridge_v2_full_grid80 \
@@ -32,7 +36,7 @@ from pathlib import Path
 
 
 def is_valid_case(case_dir: Path) -> bool:
-    """检查 case 是否有效（含 images0/images 与 samples）"""
+    """检查 legacy case 是否有效（含 images0/images 与 samples）"""
     images_dir = case_dir / "images0" / "images"
     samples_dir = case_dir / "images0" / "samples"
     if not images_dir.exists() or not samples_dir.exists():
@@ -77,7 +81,7 @@ def main():
         "--data_dir",
         type=str,
         default="/data2/dataset/output_bridge_v2_full_grid80",
-        help="TraceForge 推理输出根目录",
+        help="TraceForge legacy 推理输出根目录",
     )
     parser.add_argument(
         "--n_sample",
@@ -101,7 +105,7 @@ def main():
     parser.add_argument(
         "--valid_only",
         action="store_true",
-        help="仅从有效 case 中采样（通过 images0/images 与 samples 检查）",
+        help="仅从有效 legacy case 中采样（通过 images0/images 与 samples 检查）",
     )
     parser.add_argument(
         "--output_list",

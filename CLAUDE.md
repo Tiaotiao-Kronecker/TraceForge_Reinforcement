@@ -150,7 +150,7 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 
 **Sim360 Dataset**:
 - Branch `curation/sim-360-extrinsics-fixed` contains extrinsics fixes
-- See `docs/camera_extrinsics_investigation_2026-03-12.md` for details
+- See `docs/history/camera_extrinsics_investigation_2026-03-12.md` for details
 
 ## Common Issues
 
@@ -207,7 +207,7 @@ Use `--output_layout legacy` to keep the old layout:
 └── <video_name>.npz
 ```
 
-**⚠️ CRITICAL - NPZ Data Format**: Main NPZ and Sample NPZ use **different coordinate systems** and **different time dimensions**. See `docs/npz_data_format_analysis.md` for essential details on:
+**⚠️ CRITICAL - NPZ Data Format**: Main NPZ and Sample NPZ use different coordinate/time semantics. See `docs/traceforge_output_structure.md` for the maintained format notes:
 - Coordinate system differences (world coordinates vs image coordinates+depth)
 - Time dimension handling (padding, segment lengths)
 - Camera parameter coverage (full video vs segment)
@@ -241,10 +241,10 @@ python scripts/batch_inference/check_failed_inference.py
 
 - `scripts/batch_inference/BATCH_INFERENCE_GUIDE.md`: Comprehensive batch processing guide
 - `scripts/visualization/visualization_features.md`: Visualization capabilities
-- `docs/npz_data_format_analysis.md`: **NPZ data format and coordinate systems (CRITICAL for visualization)**
+- `docs/traceforge_output_structure.md`: **Maintained output format and coordinate conventions**
 - `docs/depth_scale_alignment_math.md`: Depth alignment mathematics
-- `docs/trajectory_pipeline_analysis.md`: Pipeline analysis
-- `docs/camera_extrinsics_investigation_2026-03-12.md`: Camera extrinsics debugging
+- `docs/history/README.md`: Historical investigations and archived notes
+- `docs/history/camera_extrinsics_investigation_2026-03-12.md`: Historical camera extrinsics debugging
 
 ## Running Long Processes
 

@@ -1,41 +1,31 @@
-# 批量推理脚本和文档
+# 批量推理脚本
 
-本目录包含批量推理相关的所有脚本和文档。
+本目录包含当前维护中的推理入口和少量校验脚本。
 
-## 脚本文件
+## 核心入口
 
-### 核心脚本
+- `infer.py`
+  - 通用单视频 / 批量推理入口
+  - 默认输出 `v2` layout
+  - 支持 `external / wrist / manipulator` 轨迹过滤 profile
+- `batch_infer.py`
+  - 旧通用批处理入口，适合 legacy 数据集目录批量跑
+- `batch_infer_press_one_button_demo.py`
+  - `press_one_button_demo_v1` 的专用批处理入口
+  - 支持 `traj_filter_profile auto`
 
-- **batch_infer.py** - 批量推理主脚本
-- **infer.py** - 单个轨迹推理脚本（由batch_infer.py调用）
+## 辅助脚本
 
-### 测试和验证脚本
-
-- **stress_test_batch_inference.py** - 压力测试脚本
-- **run_large_scale_stress_test.sh** - 大规模压力测试便捷脚本
-- **check_batch_inference_results.sh** - 检查批量推理结果脚本
-- **analyze_batch_failures.py** - 分析批量推理失败原因
-- **verify_model_cache.py** - 验证模型缓存完整性
-- **test_model_sharing.py** - 测试模型共享机制
+- `analyze_batch_failures.py`
+- `check_failed_inference.py`
+- `test_inference_output_shapes.py`
+- `verify_model_cache.py`
+- `verify_pointcloud.py`
+- `verify_traj_valid_mask.py`
 
 ## 文档
 
-- **BATCH_INFERENCE_GUIDE.md** - 批量推理完整指南
+- [BATCH_INFERENCE_GUIDE.md](BATCH_INFERENCE_GUIDE.md)
 
-## 快速开始
-
-```bash
-# 运行批量推理
-python batch_infer.py \
-    --base_path /usr/data/dataset/opt/dataset_temp/bridge_depth \
-    --out_dir ./output_bridge_depth_grid80 \
-    --use_all_trajectories \
-    --skip_existing \
-    --frame_drop_rate 5 \
-    --gpu_id 0,1,2,3,4,5 \
-    --max_workers 6 \
-    --grid_size 80
-```
-
-详细说明请参考 [BATCH_INFERENCE_GUIDE.md](BATCH_INFERENCE_GUIDE.md)
-
+如果需要查看旧实验或一次性调查，请不要从这里找，统一去
+`scripts/archived/investigations/`。
