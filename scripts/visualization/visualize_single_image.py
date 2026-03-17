@@ -17,6 +17,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 from utils.traceforge_artifact_utils import (
     SceneReader,
     build_pointcloud_from_frame,
+    build_sample_visualization_view,
     normalize_sample_data,
     traj_uvz_to_world,
 )
@@ -70,6 +71,7 @@ def resolve_scene_inputs(
     depth_path: str | None = None,
 ) -> dict:
     sample = normalize_sample_data(npz_path)
+    render_view = build_sample_visualization_view(sample)
     episode_dir = Path(npz_path).resolve().parent.parent
     query_frame_idx = int(sample["query_frame_index"])
 
@@ -90,17 +92,7 @@ def resolve_scene_inputs(
 
     rgb = resize_rgb_if_needed(rgb, depth.shape)
 
-    traj_uvz = sample["traj_uvz"].astype(np.float32)
-    keypoints = sample["keypoints"].astype(np.float32)
-    traj_valid_mask = sample["traj_valid_mask"].astype(bool, copy=False)
-    segment_frame_indices = np.asarray(sample["segment_frame_indices"], dtype=np.int32)
-
-    if sample.get("frame_aligned", False) and len(segment_frame_indices) < traj_uvz.shape[1]:
-        traj_uvz = traj_uvz[:, : len(segment_frame_indices)]
-
-    raw_num_trajectories = int(traj_uvz.shape[0])
-    traj_uvz = traj_uvz[traj_valid_mask]
-    keypoints = keypoints[traj_valid_mask]
+    traj_uvz = render_view["traj_uvz"]
     traj_world = traj_uvz_to_world(traj_uvz, intrinsics, w2c)
     point_cloud_xyz, point_cloud_rgb = build_pointcloud_from_frame(
         depth=depth,
@@ -114,9 +106,10 @@ def resolve_scene_inputs(
         "episode_dir": episode_dir,
         "query_frame_idx": query_frame_idx,
         "traj_world": traj_world,
-        "keypoints": keypoints,
-        "raw_num_trajectories": raw_num_trajectories,
-        "segment_frame_count": len(segment_frame_indices),
+        "keypoints": render_view["keypoints"],
+        "raw_num_trajectories": render_view["raw_num_tracks"],
+        "kept_num_trajectories": render_view["kept_num_tracks"],
+        "segment_frame_count": len(render_view["segment_frame_indices"]),
         "rgb": rgb,
         "depth": depth,
         "intrinsics": intrinsics,
@@ -144,7 +137,7 @@ def visualize_single_image(
 
     logger.info(
         f"Loaded frame {scene['query_frame_idx']} from {scene['episode_dir']}: "
-        f"{len(traj_world)}/{raw_num_trajectories} valid trajectories"
+        f"{scene['kept_num_trajectories']}/{raw_num_trajectories} valid trajectories"
     )
     logger.info(f"Point cloud: {len(point_cloud_xyz)} points after filtering")
 

@@ -21,6 +21,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from utils.traceforge_artifact_utils import (
     SceneReader,
+    build_sample_visualization_view,
     detect_output_layout,
     list_sample_query_frames,
     normalize_sample_data,
@@ -111,19 +112,10 @@ class BatchProcessChecker:
     def load_and_validate_sample(self, sample_path: Path) -> dict | None:
         try:
             sample = normalize_sample_data(sample_path)
-            traj = sample["traj_uvz"].astype(np.float32)
-            keypoints = sample["keypoints"].astype(np.float32)
-            traj_valid_mask = sample["traj_valid_mask"].astype(bool, copy=False)
-            segment_frame_indices = np.asarray(sample["segment_frame_indices"], dtype=np.int32)
-
-            if sample.get("frame_aligned", False) and len(segment_frame_indices) < traj.shape[1]:
-                traj = traj[:, : len(segment_frame_indices)]
-
-            keypoints = keypoints[traj_valid_mask]
-            traj = traj[traj_valid_mask]
-            valid_steps = np.ones(traj.shape[1], dtype=bool)
-            if sample["layout"] == "legacy" and not sample.get("frame_aligned", False):
-                valid_steps = np.asarray(sample.get("valid_steps", valid_steps)).astype(bool, copy=False)[: traj.shape[1]]
+            render_view = build_sample_visualization_view(sample)
+            traj = render_view["traj_uvz"]
+            keypoints = render_view["keypoints"]
+            rendered_frame_count = render_view["rendered_frame_count"]
 
             if keypoints.ndim != 2 or keypoints.shape[1] != 2:
                 self.log_warning(f"Invalid keypoints shape in {sample_path.name}: {keypoints.shape}")
@@ -135,7 +127,7 @@ class BatchProcessChecker:
             return {
                 "keypoints": keypoints,
                 "traj": traj,
-                "valid_steps": valid_steps,
+                "rendered_frame_count": rendered_frame_count,
                 "query_frame_index": int(sample["query_frame_index"]),
             }
         except Exception as exc:
@@ -165,7 +157,7 @@ class BatchProcessChecker:
             h, w = image.shape[:2]
             keypoints = data["keypoints"]
             traj = data["traj"]
-            valid_steps = np.asarray(data["valid_steps"]).astype(bool, copy=False)
+            rendered_frame_count = np.asarray(data["rendered_frame_count"], dtype=np.uint16)
 
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
             keypoint_color = plt.cm.tab20(0)
@@ -182,9 +174,8 @@ class BatchProcessChecker:
             ax2.set_title(f"{video_name} Frame {frame_idx} - UVZ Trajectories (Depth as Color)")
             for kp, trajectory in zip(keypoints, traj):
                 ax2.scatter(kp[0], kp[1], c=["red"], s=100, alpha=0.9, edgecolors="white", linewidths=2, marker="o")
-                valid_traj = trajectory[valid_steps[: trajectory.shape[0]]]
-                finite_mask = np.isfinite(valid_traj).all(axis=1)
-                valid_traj = valid_traj[finite_mask]
+                finite_mask = np.isfinite(trajectory).all(axis=1)
+                valid_traj = trajectory[finite_mask]
                 if len(valid_traj) < 2:
                     continue
 
@@ -218,7 +209,8 @@ class BatchProcessChecker:
             cbar = plt.colorbar(sm, ax=ax2, shrink=0.8, aspect=20)
             cbar.set_label("Normalized Depth (0=Near, 1=Far)", rotation=270, labelpad=15)
 
-            info_text = f"Keypoints: {len(keypoints)}\nValid steps: {int(np.sum(valid_steps))}"
+            median_rendered_frames = float(np.median(rendered_frame_count)) if rendered_frame_count.size > 0 else 0.0
+            info_text = f"Keypoints: {len(keypoints)}\nMedian rendered frames/track: {median_rendered_frames:.1f}"
             fig.text(
                 0.02,
                 0.98,

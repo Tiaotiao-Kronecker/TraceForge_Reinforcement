@@ -40,6 +40,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 from utils.traceforge_artifact_utils import (
     SceneReader,
     build_pointcloud_from_frame,
+    build_sample_visualization_view,
     list_sample_query_frames,
     normalize_sample_data,
     traj_uvz_to_world,
@@ -672,18 +673,11 @@ def verify_camera(
 
     sample_path = camera_dir / "samples" / f"{camera_name}_{query_frame}.npz"
     sample = load_sample_npz(sample_path)
-    traj = sample["traj_uvz"].astype(np.float32)
-    traj_2d = sample["traj_2d"].astype(np.float32)
-    traj_valid_mask = sample["traj_valid_mask"].astype(bool, copy=False)
-    segment_frame_indices = np.asarray(sample["segment_frame_indices"], dtype=np.int32)
-    if sample.get("frame_aligned", False) and len(segment_frame_indices) < traj.shape[1]:
-        traj = traj[:, : len(segment_frame_indices)]
-        traj_2d = traj_2d[:, : len(segment_frame_indices)]
-
-    raw_num_tracks = traj.shape[0]
-    if not np.all(traj_valid_mask):
-        traj = traj[traj_valid_mask]
-        traj_2d = traj_2d[traj_valid_mask]
+    render_view = build_sample_visualization_view(sample)
+    traj = render_view["traj_uvz"]
+    traj_2d = render_view["traj_2d"]
+    raw_num_tracks = int(render_view["raw_num_tracks"])
+    kept_num_tracks = int(render_view["kept_num_tracks"])
     with SceneReader(camera_dir) as scene_reader:
         intrinsics, extrinsics = scene_reader.get_camera_arrays()
         if query_frame >= len(intrinsics) or query_frame >= len(extrinsics):
@@ -696,7 +690,7 @@ def verify_camera(
             extrinsics[query_frame].astype(np.float32),
         )
     print(
-        f"[{camera_name}] traj_valid_mask kept {len(traj_world)}/{raw_num_tracks} tracks",
+        f"[{camera_name}] traj_valid_mask kept {kept_num_tracks}/{raw_num_tracks} tracks",
         file=sys.stderr,
     )
 

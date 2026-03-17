@@ -165,6 +165,7 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
             keypoints = data["keypoints"].astype(np.float32)
             query_frame_index = int(np.asarray(data["query_frame_index"]).reshape(-1)[0])
             segment_frame_indices = data["segment_frame_indices"].astype(np.int32)
+            num_tracks = int(traj_uvz.shape[0])
             traj_valid_mask = (
                 np.asarray(data["traj_valid_mask"]).astype(bool, copy=False)
                 if "traj_valid_mask" in data
@@ -221,6 +222,46 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 if "traj_supervision_count" in data
                 else None
             )
+            traj_wrist_seed_mask = (
+                np.asarray(data["traj_wrist_seed_mask"]).astype(bool, copy=False)
+                if "traj_wrist_seed_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            )
+            traj_query_depth_rank = (
+                data["traj_query_depth_rank"].astype(np.float16)
+                if "traj_query_depth_rank" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            )
+            traj_motion_extent = (
+                data["traj_motion_extent"].astype(np.float16)
+                if "traj_motion_extent" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            )
+            traj_motion_step_median = (
+                data["traj_motion_step_median"].astype(np.float16)
+                if "traj_motion_step_median" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            )
+            traj_manipulator_candidate_mask = (
+                np.asarray(data["traj_manipulator_candidate_mask"]).astype(bool, copy=False)
+                if "traj_manipulator_candidate_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            )
+            traj_manipulator_cluster_id = (
+                data["traj_manipulator_cluster_id"].astype(np.int16)
+                if "traj_manipulator_cluster_id" in data
+                else np.full(num_tracks, -1, dtype=np.int16)
+            )
+            traj_manipulator_component_size = (
+                data["traj_manipulator_component_size"].astype(np.uint16)
+                if "traj_manipulator_component_size" in data
+                else np.zeros(num_tracks, dtype=np.uint16)
+            )
+            traj_manipulator_cluster_fallback_used = (
+                bool(np.asarray(data["traj_manipulator_cluster_fallback_used"]).reshape(-1)[0])
+                if "traj_manipulator_cluster_fallback_used" in data
+                else False
+            )
             return {
                 "layout": V2_LAYOUT,
                 "traj_uvz": traj_uvz,
@@ -240,6 +281,14 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 "traj_supervision_mask": traj_supervision_mask,
                 "traj_supervision_prefix_len": traj_supervision_prefix_len,
                 "traj_supervision_count": traj_supervision_count,
+                "traj_wrist_seed_mask": traj_wrist_seed_mask,
+                "traj_query_depth_rank": traj_query_depth_rank,
+                "traj_motion_extent": traj_motion_extent,
+                "traj_motion_step_median": traj_motion_step_median,
+                "traj_manipulator_candidate_mask": traj_manipulator_candidate_mask,
+                "traj_manipulator_cluster_id": traj_manipulator_cluster_id,
+                "traj_manipulator_component_size": traj_manipulator_component_size,
+                "traj_manipulator_cluster_fallback_used": traj_manipulator_cluster_fallback_used,
                 "frame_aligned": True,
             }
 
@@ -251,6 +300,7 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
         )
         keypoints = data["keypoints"].astype(np.float32)
         query_frame_index = int(np.asarray(data["frame_index"]).reshape(-1)[0])
+        num_tracks = int(traj_uvz.shape[0])
         if "traj_valid_mask" in data:
             traj_valid_mask = np.asarray(data["traj_valid_mask"]).astype(bool, copy=False)
         else:
@@ -326,11 +376,128 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 if "traj_supervision_count" in data
                 else None
             ),
+            "traj_wrist_seed_mask": (
+                np.asarray(data["traj_wrist_seed_mask"]).astype(bool, copy=False)
+                if "traj_wrist_seed_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            ),
+            "traj_query_depth_rank": (
+                data["traj_query_depth_rank"].astype(np.float16)
+                if "traj_query_depth_rank" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            ),
+            "traj_motion_extent": (
+                data["traj_motion_extent"].astype(np.float16)
+                if "traj_motion_extent" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            ),
+            "traj_motion_step_median": (
+                data["traj_motion_step_median"].astype(np.float16)
+                if "traj_motion_step_median" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            ),
+            "traj_manipulator_candidate_mask": (
+                np.asarray(data["traj_manipulator_candidate_mask"]).astype(bool, copy=False)
+                if "traj_manipulator_candidate_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            ),
+            "traj_manipulator_cluster_id": (
+                data["traj_manipulator_cluster_id"].astype(np.int16)
+                if "traj_manipulator_cluster_id" in data
+                else np.full(num_tracks, -1, dtype=np.int16)
+            ),
+            "traj_manipulator_component_size": (
+                data["traj_manipulator_component_size"].astype(np.uint16)
+                if "traj_manipulator_component_size" in data
+                else np.zeros(num_tracks, dtype=np.uint16)
+            ),
+            "traj_manipulator_cluster_fallback_used": (
+                bool(np.asarray(data["traj_manipulator_cluster_fallback_used"]).reshape(-1)[0])
+                if "traj_manipulator_cluster_fallback_used" in data
+                else False
+            ),
             "valid_steps": valid_steps,
             "frame_aligned": frame_aligned,
         }
     finally:
         data.close()
+
+
+def _apply_render_step_mask(traj: np.ndarray, render_step_mask: np.ndarray) -> np.ndarray:
+    traj = np.array(traj, dtype=np.float32, copy=True)
+    render_step_mask = np.asarray(render_step_mask, dtype=bool)
+    if traj.shape[:2] != render_step_mask.shape:
+        raise ValueError(
+            f"Expected render_step_mask shape {traj.shape[:2]}, got {render_step_mask.shape}"
+        )
+    traj[~render_step_mask] = np.nan
+    return traj
+
+
+def build_sample_visualization_view(sample: dict[str, Any]) -> dict[str, Any]:
+    """Return a wrist-aware visualization view over a normalized sample payload."""
+    traj_uvz = np.asarray(sample["traj_uvz"], dtype=np.float32)
+    traj_2d = np.asarray(sample["traj_2d"], dtype=np.float32)
+    keypoints = np.asarray(sample["keypoints"], dtype=np.float32)
+    segment_frame_indices = np.asarray(sample["segment_frame_indices"], dtype=np.int32)
+    traj_valid_mask = np.asarray(sample["traj_valid_mask"]).astype(bool, copy=False)
+    traj_supervision_mask = sample.get("traj_supervision_mask")
+    if traj_supervision_mask is not None:
+        traj_supervision_mask = np.asarray(traj_supervision_mask).astype(bool, copy=False)
+
+    if traj_uvz.ndim != 3 or traj_uvz.shape[-1] != 3:
+        raise ValueError(f"Expected traj_uvz shape (N,T,3), got {traj_uvz.shape}")
+    if traj_2d.shape != (*traj_uvz.shape[:2], 2):
+        raise ValueError(f"Expected traj_2d shape {(*traj_uvz.shape[:2], 2)}, got {traj_2d.shape}")
+    if keypoints.shape != (traj_uvz.shape[0], 2):
+        raise ValueError(f"Expected keypoints shape {(traj_uvz.shape[0], 2)}, got {keypoints.shape}")
+    if traj_valid_mask.shape != (traj_uvz.shape[0],):
+        raise ValueError(f"Expected traj_valid_mask shape {(traj_uvz.shape[0],)}, got {traj_valid_mask.shape}")
+
+    if sample.get("frame_aligned", False) and len(segment_frame_indices) < traj_uvz.shape[1]:
+        segment_len = int(len(segment_frame_indices))
+        traj_uvz = traj_uvz[:, :segment_len]
+        traj_2d = traj_2d[:, :segment_len]
+        if traj_supervision_mask is not None and traj_supervision_mask.ndim == 2:
+            traj_supervision_mask = traj_supervision_mask[:, :segment_len]
+
+    raw_num_tracks = int(traj_uvz.shape[0])
+    num_frames = int(traj_uvz.shape[1])
+    traj_uvz = traj_uvz[traj_valid_mask]
+    traj_2d = traj_2d[traj_valid_mask]
+    keypoints = keypoints[traj_valid_mask]
+    kept_num_tracks = int(traj_uvz.shape[0])
+
+    finite_step_mask = np.isfinite(traj_uvz).all(axis=-1)
+    render_step_mask: np.ndarray | None = None
+    if traj_supervision_mask is not None:
+        if traj_supervision_mask.shape == (raw_num_tracks, num_frames):
+            render_step_mask = np.asarray(traj_supervision_mask[traj_valid_mask], dtype=bool)
+        elif traj_supervision_mask.shape == (kept_num_tracks, num_frames):
+            render_step_mask = np.asarray(traj_supervision_mask, dtype=bool)
+
+    if render_step_mask is None:
+        valid_steps = sample.get("valid_steps")
+        if valid_steps is not None:
+            valid_steps = np.asarray(valid_steps).astype(bool, copy=False).reshape(-1)[:num_frames]
+            if valid_steps.shape == (num_frames,):
+                render_step_mask = np.broadcast_to(valid_steps[None, :], traj_uvz.shape[:2]).copy()
+
+    if render_step_mask is None:
+        render_step_mask = finite_step_mask.copy()
+    else:
+        render_step_mask &= finite_step_mask
+
+    return {
+        "traj_uvz": _apply_render_step_mask(traj_uvz, render_step_mask),
+        "traj_2d": _apply_render_step_mask(traj_2d, render_step_mask),
+        "keypoints": keypoints,
+        "segment_frame_indices": segment_frame_indices,
+        "render_step_mask": render_step_mask.astype(bool),
+        "rendered_frame_count": render_step_mask.sum(axis=1).astype(np.uint16),
+        "raw_num_tracks": raw_num_tracks,
+        "kept_num_tracks": kept_num_tracks,
+    }
 
 
 def list_sample_query_frames(episode_dir: str | Path, video_name: str | None = None) -> list[int]:
