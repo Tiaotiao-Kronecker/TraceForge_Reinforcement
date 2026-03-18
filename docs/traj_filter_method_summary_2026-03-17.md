@@ -8,14 +8,14 @@
 
 - 动态链路与静态链路都统一走 `utils/traj_filter_utils.py`
 - sample 序列化和可视化读取都已经能消费统一的 `traj_valid_mask` 与调试字段
-- `auto` profile 会把 wrist-like 相机自动映射到 `wrist`，其余相机走 `external`
+- `auto` profile 会把 wrist-like 相机自动映射到 `wrist_manipulator_top95`，其余相机走 `external`
 
 ## 2. 方法总览
 
 轨迹过滤由两层配置共同决定：
 
 - `filter_level`: `none / basic / standard / strict`
-- `traj_filter_profile`: `external / external_manipulator / external_manipulator_v2 / wrist / wrist_manipulator`
+- `traj_filter_profile`: `external / external_manipulator / external_manipulator_v2 / wrist / wrist_manipulator_top95 / wrist_manipulator`
 
 其中：
 
@@ -25,13 +25,15 @@
 - `external_manipulator` 在 `external` 基础上进一步收缩到机械臂主体轨迹
 - `external_manipulator_v2` 是面向 external 相机的更宽松 manipulator 版本
 - `wrist` 面向 wrist 相机，允许“短前缀但有连续支撑”的轨迹保留
+- `wrist_manipulator_top95` 是 wrist_manipulator 的临时去噪版本，只额外去掉 motion 最低的尾部 `5%`
 - `wrist_manipulator` 在 `wrist` 基础上进一步逼近“机械夹爪/机械臂主体”轨迹
 
 `auto` 的映射规则如下：
 
-- 相机名以 `camera_3` 结尾，或包含 `wrist` / `hand`，映射到 `wrist`
+- 相机名以 `camera_3` 结尾，或包含 `wrist` / `hand`，映射到 `wrist_manipulator_top95`
 - 其他相机映射到 `external`
-- `external_manipulator`、`external_manipulator_v2` 与 `wrist_manipulator` 都需要显式指定，不参与 `auto`
+- `external_manipulator`、`external_manipulator_v2` 与 `wrist_manipulator`
+  都需要显式指定，不参与 `auto`
 
 ## 3. 基础过滤框架
 
@@ -84,7 +86,7 @@ query 帧上的每个 keypoint 都会先做一次局部深度质量检查：
 - `traj_supervision_prefix_len`
 - `traj_supervision_count`
 
-## 4. 四个 profile 的差异
+## 4. 六个 profile 的差异
 
 ### 4.1 `external`
 
@@ -176,7 +178,31 @@ wrist_seed_mask = wrist_base_mask & query_depth_mask & supervision_support_mask
 
 对 wrist 相机来说，这能保留“只在前缀阶段稳定出现、随后被机械臂遮挡或离开视野”的真实夹爪轨迹。
 
-### 4.5 `wrist_manipulator`
+### 4.5 `wrist_manipulator_top95`
+
+`wrist_manipulator_top95` 当前就是 wrist-like 相机在 `auto` 下的默认 profile。
+
+它先完整走完 `wrist_manipulator`，然后再做一层轻量 motion 收缩：
+
+1. 先按 `wrist_manipulator` 的 near-depth / motion / largest-cluster 规则得到 baseline
+2. 复用这一步得到的 `traj_motion_extent`
+3. 只在 `wrist_manipulator` 的最终保留轨迹内按 `traj_motion_extent` 降序排序，保留前 `95%`
+
+最终：
+
+```text
+wrist_seed_mask = wrist_base_mask & query_depth_mask & supervision_support_mask
+manipulator_mask = largest_spatial_component(wrist_seed_mask & near_depth_mask & motion_mask)
+final_mask = top95_motion_extent(manipulator_mask)
+```
+
+这条 profile 的定位是：
+
+- 先以 `wrist_manipulator` 作为更强收缩基线，再削掉其中 motion 最低的尾部一层
+- 显式 `wrist` 仍保留为更宽松的兼容版本，但不再是默认 auto 映射
+- 明确承认这不是根因修复，后续仍应回到深度边界和几何 lifting 问题本身
+
+### 4.6 `wrist_manipulator`
 
 `wrist_manipulator` 在 `wrist_seed_mask` 上继续做三步 manipulator-aware 收缩：
 
@@ -217,6 +243,12 @@ final_mask = largest_spatial_component(traj_manipulator_candidate_mask)
 - `traj_manipulator_cluster_id`
 - `traj_manipulator_component_size`
 - `traj_manipulator_cluster_fallback_used`
+
+`wrist_manipulator_top95` 不新增 reason bit，也不新增 sample 字段：
+
+- 过滤解释依赖 `traj_wrist_seed_mask`
+- 排序依据依赖 `traj_motion_extent` / `traj_motion_step_median`
+- 当前 `traj_mask_reason_bits` 的 `uint8` bit 位已用满，不再额外扩展
 
 这些字段现在已经在：
 

@@ -40,6 +40,7 @@ Run scripts from the repository root.
 python scripts/batch_inference/infer.py \
   --video_path <input_video_or_frames_dir> \
   --out_dir <output_dir> \
+  --scene_storage_mode cache \
   --batch_process \
   --skip_existing \
   --frame_drop_rate 5 \
@@ -94,16 +95,24 @@ python checker/batch_process_result_checker.py <output_dir> --max-videos 1 --max
 
 ## Output Layout
 
-Default output is `v2`:
+Default output is `v2` with `scene_storage_mode=source_ref`:
+
+```text
+<episode_dir>/
+├── scene_meta.json
+└── samples/
+    ├── <sample0>.npz
+    └── ...
+```
+
+`scene_meta.json` stores source RGB/depth/geometry references plus `source_frame_indices`.
+
+When local scene caches are required, pass `--scene_storage_mode cache`; that variant also writes:
 
 ```text
 <episode_dir>/
 ├── scene.h5
-├── scene_meta.json
 ├── scene_rgb.mp4
-└── samples/
-    ├── <sample0>.npz
-    └── ...
 ```
 
 Important `v2` sample fields:

@@ -32,6 +32,7 @@ wget -O checkpoints/tapip3d_final.pth https://huggingface.co/zbww/tapip3d/resolv
 python scripts/batch_inference/infer.py \
     --video_path <input_video_directory> \
     --out_dir <output_directory> \
+    --scene_storage_mode cache \
     --batch_process \
     --use_all_trajectories \
     --skip_existing \
@@ -120,6 +121,7 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 - `--depth_pose_method vggt4` + `--external_geom_npz`: Use VGGT depth/intrinsics but replace extrinsics
 - `--external_extr_mode`: Specify if external matrices are `w2c` (world-to-camera, default) or `c2w` (camera-to-world)
 - Supports both NPZ and H5 formats (use `--camera_name` for H5 multi-camera files)
+- Default `scene_storage_mode=source_ref` only works with `--depth_pose_method external`; VGGT-style runs must use `--scene_storage_mode cache`
 
 **Multi-GPU Processing**:
 - Fixed `third_party/pointops2/functions/pointops.py` to use input tensor devices instead of hardcoded cuda:0
@@ -174,17 +176,26 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 
 ## Output Structure
 
-### Default layout: `v2`
+### Default layout: `v2 + source_ref`
 
 ```
 <output_dir>/<video_name>/
-├── scene.h5                   # Shared per-frame depth/intrinsics/extrinsics cache
-├── scene_meta.json            # Layout metadata
-├── scene_rgb.mp4              # Shared RGB cache
+├── scene_meta.json            # Layout metadata + source RGB/depth/geometry references
 ├── samples/                   # Per-frame 3D trajectories
 │   ├── <video_name>_0.npz
 │   ├── <video_name>_5.npz
 │   └── ...
+```
+
+`source_ref` stores `source_frame_indices` plus source RGB/depth/geometry paths in
+`scene_meta.json`, and reconstructs frames/geometry lazily from those sources.
+
+When local scene caches are needed, pass `--scene_storage_mode cache`; that adds:
+
+```
+<output_dir>/<video_name>/
+├── scene.h5                   # Shared per-frame depth/intrinsics/extrinsics cache
+├── scene_rgb.mp4              # Shared RGB cache
 ```
 
 `v2` sample NPZ contents:

@@ -14,6 +14,7 @@
 python scripts/batch_inference/infer.py \
   --video_path <input_dir> \
   --out_dir <output_dir> \
+  --scene_storage_mode cache \
   --batch_process \
   --skip_existing \
   --frame_drop_rate 5 \
@@ -24,6 +25,8 @@ python scripts/batch_inference/infer.py \
 关键点：
 
 - 默认输出 layout 为 `v2`
+- 默认 `scene_storage_mode` 为 `source_ref`，仅适用于 `depth_pose_method=external`
+- 若沿用 `infer.py` 的默认 `vggt4`，需要显式传 `--scene_storage_mode cache`
 - `--output_layout legacy` 仅用于兼容旧工具
 - `future_len` 控制每个 query frame 的跟踪窗口
 - `grid_size` 控制 query keypoint 密度
@@ -63,10 +66,13 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
 
 补充说明：
 
-- `auto` 会把 wrist-like camera 映射到 `wrist`
-- `external_manipulator`、`external_manipulator_v2`、`wrist_manipulator`
+- `auto` 会把 wrist-like camera 映射到 `wrist_manipulator_top95`
+- `external_manipulator`、`external_manipulator_v2`、`wrist_manipulator_top95`、`wrist_manipulator`
   需要显式指定
+- `wrist_manipulator_top95` 是 wrist_manipulator 的临时去噪 profile：先走 wrist_manipulator，再按
+  motion extent 只保留每个 sample 前 `95%` 的轨迹
 - 推荐直接在 episode 下写 `trajectory/<camera_name>/...`
+- `depth_pose_method=external` 时默认使用 `scene_storage_mode=source_ref`，直接复用源 RGB/depth/geometry
 
 ## 检查与回归
 

@@ -7,12 +7,16 @@
 - `infer.py`
   - 通用单视频 / 批量推理入口
   - 默认输出 `v2` layout
-  - 支持 `external / wrist / manipulator` 轨迹过滤 profile
+  - 默认 `scene_storage_mode=source_ref`，仅适用于 `depth_pose_method=external`
+  - 使用默认 `vggt4` 时需要显式传 `--scene_storage_mode cache`
+  - 支持 `external / external_manipulator / external_manipulator_v2 / wrist / wrist_manipulator_top95 / wrist_manipulator`
+    轨迹过滤 profile
 - `batch_infer.py`
   - 旧通用批处理入口，适合 legacy 数据集目录批量跑
 - `batch_infer_press_one_button_demo.py`
   - `press_one_button_demo_v1` 的专用批处理入口
   - 支持 `traj_filter_profile auto`
+  - `auto` 默认把 wrist-like 相机映射到 `wrist_manipulator_top95`
 
 ## 辅助脚本
 

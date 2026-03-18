@@ -5,7 +5,7 @@
 ## 当前脚本
 
 - `visualize_single_image.py`
-  - 读取 sample NPZ 和 episode scene cache
+  - 读取 sample NPZ 和 episode scene artifacts
   - 按 `traj_valid_mask` 显示过滤后的 3D 轨迹
   - `--image_path` / `--depth_path` 只是可选 override
 - `visualize_3d_keypoint_animation.py`

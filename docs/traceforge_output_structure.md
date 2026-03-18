@@ -2,9 +2,39 @@
 
 本文档描述当前维护中的 TraceForge 输出协议。
 
-## 1. 当前默认布局：`v2`
+## 1. 当前默认布局：`v2 + source_ref`
 
 默认输出目录：
+
+```text
+<episode_dir>/
+├── scene_meta.json
+└── samples/
+    ├── <video_name>_0.npz
+    ├── <video_name>_15.npz
+    └── ...
+```
+
+其中：
+
+- `scene_meta.json`
+  - layout 元数据
+  - `scene_storage_mode`
+  - 源 RGB / depth / geometry 路径
+  - `source_frame_indices`
+  - `future_len`
+- `samples/*.npz`
+  - 单个 query frame 的轨迹 sample
+
+默认 `scene_storage_mode=source_ref` 只在 `depth_pose_method=external` 下成立：
+
+- 不写本地 `scene.h5`
+- 不写本地 `scene_rgb.mp4`
+- 读取时通过 `scene_meta.json` 回到源 RGB / depth / geometry
+
+## 2. `v2 + cache` 兼容模式
+
+当显式传 `--scene_storage_mode cache` 时，`v2` 目录变为：
 
 ```text
 <episode_dir>/
@@ -23,14 +53,10 @@
   - `dense/depth`: 全视频深度
   - `camera/intrinsics`: 全视频内参
   - `camera/extrinsics_w2c`: 全视频 `w2c` 外参
-- `scene_meta.json`
-  - layout 元数据、源路径和 `future_len`
 - `scene_rgb.mp4`
   - 全视频 RGB cache
-- `samples/*.npz`
-  - 单个 query frame 的轨迹 sample
 
-## 2. `v2` sample NPZ 字段
+## 3. `v2` sample NPZ 字段
 
 当前核心字段：
 
@@ -56,7 +82,7 @@
 - `T_seg` 是该 query frame 实际跟踪长度，不再强制 retarget 到固定步数
 - 当前 sample 主时间轴与 `segment_frame_indices` 对齐
 
-## 3. `legacy` 布局
+## 4. `legacy` 布局
 
 兼容模式：
 
@@ -79,7 +105,7 @@
 - 会按 `future_len` padding，并配套 `valid_steps`
 - 查询帧 RGB / depth 会作为独立文件保存
 
-## 4. 坐标和时域约定
+## 5. 坐标和时域约定
 
 - `v2` sample 里的 `traj_uvz` 是 query-camera 坐标，不是 world 坐标
 - world 轨迹需要结合 query frame 的 `intrinsics` 和 `w2c` 还原
@@ -91,7 +117,7 @@
 - 旧 retarget helper 仍在代码里保留，但没有接入当前推理/存盘流程
 - 因此当前 sample 时间轴不使用弧长重采样
 
-## 5. 可视化建议
+## 6. 可视化建议
 
 - 单 sample 3D 查看：
   - `scripts/visualization/visualize_single_image.py`

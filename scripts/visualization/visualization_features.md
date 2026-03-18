@@ -21,7 +21,7 @@ python scripts/visualization/visualize_single_image.py \
 ### 当前行为
 
 - 从 sample 里读取轨迹和 `traj_valid_mask`
-- 从 episode scene cache 读取 query frame 的 RGB、depth、intrinsics、extrinsics
+- 从 episode scene artifacts 读取 query frame 的 RGB、depth、intrinsics、extrinsics
 - 把 `traj_uvz` 还原为 world coordinates 后渲染
 - 只显示过滤后保留下来的轨迹
 
