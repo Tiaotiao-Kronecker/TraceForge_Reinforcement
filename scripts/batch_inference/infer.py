@@ -17,7 +17,10 @@ from pathlib import Path
 
 from utils.video_depth_pose_utils import video_depth_pose_dict
 from utils.traceforge_artifact_utils import (
+    DEFAULT_SCENE_STORAGE_MODE,
     LEGACY_LAYOUT,
+    SCENE_STORAGE_CACHE,
+    SCENE_STORAGE_SOURCE_REF,
     V2_LAYOUT,
     is_traceforge_output_complete,
     path_kind,
@@ -103,6 +106,17 @@ def parse_args():
         help="Artifact layout: v2(scene cache + samples) or legacy(main NPZ + query frame images/depth).",
     )
     parser.add_argument(
+        "--scene_storage_mode",
+        type=str,
+        default=DEFAULT_SCENE_STORAGE_MODE,
+        choices=[SCENE_STORAGE_SOURCE_REF, SCENE_STORAGE_CACHE],
+        help=(
+            "Storage backend for v2 artifacts. source_ref stores source RGB/depth/geometry "
+            "references in scene_meta.json and skips scene.h5/scene_rgb.mp4; cache writes local scene caches. "
+            "source_ref currently requires --depth_pose_method external."
+        ),
+    )
+    parser.add_argument(
         "--save_visibility",
         action="store_true",
         default=False,
@@ -174,12 +188,21 @@ def parse_args():
         "--traj_filter_profile",
         type=str,
         default="external",
-        choices=["external", "external_manipulator", "external_manipulator_v2", "wrist", "wrist_manipulator"],
+        choices=[
+            "external",
+            "external_manipulator",
+            "external_manipulator_v2",
+            "wrist",
+            "wrist_manipulator_top95",
+            "wrist_manipulator",
+        ],
         help=(
             "Trajectory filter profile: external keeps the current strict full-track mask; "
             "external_manipulator keeps external as the seed and then prunes to manipulator-like tracks; "
             "external_manipulator_v2 is a looser external manipulator profile that keeps major manipulator components; "
             "wrist keeps partial trajectories with per-frame supervision masks; "
+            "wrist_manipulator_top95 keeps wrist_manipulator as the baseline and removes the lowest-motion 5 percent "
+            "from its final tracks per sample; "
             "wrist_manipulator adds near-field and motion-aware pruning on top of wrist."
         ),
     )
@@ -451,6 +474,12 @@ def build_query_frame_sample_data(
         "traj_supervision_count": traj_filter_result["traj_supervision_count"].astype(np.uint16),
         "traj_wrist_seed_mask": traj_filter_result["traj_wrist_seed_mask"].astype(bool),
         "traj_query_depth_rank": traj_filter_result["traj_query_depth_rank"].astype(np.float16),
+        "traj_query_depth_edge_mask": traj_filter_result["traj_query_depth_edge_mask"].astype(bool),
+        "traj_query_depth_patch_valid_ratio": traj_filter_result["traj_query_depth_patch_valid_ratio"].astype(
+            np.float16
+        ),
+        "traj_query_depth_patch_std": traj_filter_result["traj_query_depth_patch_std"].astype(np.float16),
+        "traj_query_depth_edge_risk_mask": traj_filter_result["traj_query_depth_edge_risk_mask"].astype(bool),
         "traj_motion_extent": traj_filter_result["traj_motion_extent"].astype(np.float16),
         "traj_motion_step_median": traj_filter_result["traj_motion_step_median"].astype(np.float16),
         "traj_manipulator_candidate_mask": traj_filter_result["traj_manipulator_candidate_mask"].astype(bool),
@@ -551,6 +580,10 @@ def save_single_query_frame_legacy(
         "traj_supervision_count": sample_payload["traj_supervision_count"],
         "traj_wrist_seed_mask": sample_payload["traj_wrist_seed_mask"],
         "traj_query_depth_rank": sample_payload["traj_query_depth_rank"],
+        "traj_query_depth_edge_mask": sample_payload["traj_query_depth_edge_mask"],
+        "traj_query_depth_patch_valid_ratio": sample_payload["traj_query_depth_patch_valid_ratio"],
+        "traj_query_depth_patch_std": sample_payload["traj_query_depth_patch_std"],
+        "traj_query_depth_edge_risk_mask": sample_payload["traj_query_depth_edge_risk_mask"],
         "traj_motion_extent": sample_payload["traj_motion_extent"],
         "traj_motion_step_median": sample_payload["traj_motion_step_median"],
         "traj_manipulator_candidate_mask": sample_payload["traj_manipulator_candidate_mask"],
@@ -633,6 +666,10 @@ def save_single_query_frame_v2(
         "traj_supervision_count": sample_payload["traj_supervision_count"],
         "traj_wrist_seed_mask": sample_payload["traj_wrist_seed_mask"],
         "traj_query_depth_rank": sample_payload["traj_query_depth_rank"],
+        "traj_query_depth_edge_mask": sample_payload["traj_query_depth_edge_mask"],
+        "traj_query_depth_patch_valid_ratio": sample_payload["traj_query_depth_patch_valid_ratio"],
+        "traj_query_depth_patch_std": sample_payload["traj_query_depth_patch_std"],
+        "traj_query_depth_edge_risk_mask": sample_payload["traj_query_depth_edge_risk_mask"],
         "traj_motion_extent": sample_payload["traj_motion_extent"],
         "traj_motion_step_median": sample_payload["traj_motion_step_median"],
         "traj_manipulator_candidate_mask": sample_payload["traj_manipulator_candidate_mask"],
@@ -672,17 +709,43 @@ def save_structured_data(
     depth_conf=None,
     video_source_path: str | None = None,
     depth_source_path: str | None = None,
+    source_frame_indices=None,
 ):
     """Save TraceForge inference artifacts."""
     del intrinsics, extrinsics, query_points_per_frame, horizon, use_all_trajectories
 
     layout = getattr(filter_args, "output_layout", V2_LAYOUT) if filter_args is not None else V2_LAYOUT
+    scene_storage_mode = (
+        getattr(filter_args, "scene_storage_mode", DEFAULT_SCENE_STORAGE_MODE)
+        if filter_args is not None
+        else DEFAULT_SCENE_STORAGE_MODE
+    )
     video_output_dir = Path(output_dir) / video_name
     video_output_dir.mkdir(parents=True, exist_ok=True)
 
     if query_frame_results is None:
         logger.warning(f"No query frame results to save for {video_name}")
         return
+
+    if scene_storage_mode not in (SCENE_STORAGE_SOURCE_REF, SCENE_STORAGE_CACHE):
+        raise ValueError(
+            f"Unsupported scene_storage_mode='{scene_storage_mode}'. "
+            f"Expected one of {[SCENE_STORAGE_SOURCE_REF, SCENE_STORAGE_CACHE]}."
+        )
+    if layout != V2_LAYOUT and scene_storage_mode != SCENE_STORAGE_CACHE:
+        raise ValueError(
+            f"scene_storage_mode='{scene_storage_mode}' is only supported with --output_layout {V2_LAYOUT}. "
+            f"Use --scene_storage_mode {SCENE_STORAGE_CACHE} for legacy output."
+        )
+    if (
+        layout == V2_LAYOUT
+        and scene_storage_mode == SCENE_STORAGE_SOURCE_REF
+        and getattr(filter_args, "depth_pose_method", None) != "external"
+    ):
+        raise ValueError(
+            "scene_storage_mode='source_ref' currently requires --depth_pose_method external. "
+            "Use --scene_storage_mode cache for non-external geometry pipelines."
+        )
 
     logger.info(f"Saving {len(query_frame_results)} query frame results using layout={layout}")
     if layout == V2_LAYOUT:
@@ -693,35 +756,57 @@ def save_structured_data(
         full_depths_np = _tensor_to_numpy(full_depths).astype(np.float32)
         full_intrinsics_np = _tensor_to_numpy(full_intrinsics).astype(np.float32)
         full_extrinsics_np = _tensor_to_numpy(full_extrinsics).astype(np.float32)
+        frame_count = int(full_video_uint8.shape[0])
+        if source_frame_indices is None:
+            source_frame_indices_np = np.arange(frame_count, dtype=np.int32)
+        else:
+            source_frame_indices_np = np.asarray(source_frame_indices, dtype=np.int32).reshape(-1)
+        if source_frame_indices_np.shape != (frame_count,):
+            raise ValueError(
+                f"Expected source_frame_indices shape {(frame_count,)}, got {source_frame_indices_np.shape}"
+            )
+
         depth_volatility_map = compute_depth_volatility_map(
             full_depths_np,
             min_depth=float(getattr(filter_args, "min_depth", 0.01)),
             max_depth=float(getattr(filter_args, "max_depth", 10.0)),
         )
-        write_scene_h5(
-            video_output_dir / "scene.h5",
-            depths=full_depths_np,
-            intrinsics=full_intrinsics_np,
-            extrinsics_w2c=full_extrinsics_np,
-        )
-        write_scene_rgb_mp4(video_output_dir / "scene_rgb.mp4", video_frames=full_video_uint8, fps=10)
+        scene_h5_relpath = "scene.h5" if scene_storage_mode == SCENE_STORAGE_CACHE else None
+        rgb_cache_relpath = "scene_rgb.mp4" if scene_storage_mode == SCENE_STORAGE_CACHE else None
+        source_geom_path = getattr(filter_args, "external_geom_npz", None) if filter_args is not None else None
+        if scene_storage_mode == SCENE_STORAGE_CACHE:
+            write_scene_h5(
+                video_output_dir / "scene.h5",
+                depths=full_depths_np,
+                intrinsics=full_intrinsics_np,
+                extrinsics_w2c=full_extrinsics_np,
+            )
+            write_scene_rgb_mp4(video_output_dir / "scene_rgb.mp4", video_frames=full_video_uint8, fps=10)
         write_scene_meta(
             video_output_dir / "scene_meta.json",
             {
                 "layout_version": 2,
                 "video_name": video_name,
-                "frame_count": int(full_video_uint8.shape[0]),
+                "frame_count": frame_count,
                 "height": int(full_video_uint8.shape[1]),
                 "width": int(full_video_uint8.shape[2]),
                 "extrinsics_mode": "w2c",
                 "frame_drop_rate": int(getattr(filter_args, "frame_drop_rate", 1)),
                 "future_len": int(future_len),
                 "original_filenames": list(map(str, original_filenames)),
-                "rgb_cache_path": "scene_rgb.mp4",
+                "scene_storage_mode": scene_storage_mode,
+                "scene_h5_path": scene_h5_relpath,
+                "rgb_cache_path": rgb_cache_relpath,
                 "source_rgb_path": video_source_path,
                 "source_rgb_kind": path_kind(video_source_path),
                 "source_depth_path": depth_source_path,
                 "source_depth_kind": path_kind(depth_source_path),
+                "source_geom_path": source_geom_path,
+                "source_geom_kind": path_kind(source_geom_path),
+                "source_camera_name": getattr(filter_args, "camera_name", None),
+                "source_extrinsics_mode": getattr(filter_args, "external_extr_mode", None),
+                "depth_pose_method": getattr(filter_args, "depth_pose_method", None),
+                "source_frame_indices": source_frame_indices_np.tolist(),
             },
         )
         for query_frame_idx, frame_data in query_frame_results.items():
@@ -808,16 +893,25 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
     )
 
     # Load RGB with computed stride
-    video_tensor, video_mask, original_filenames = load_video_and_mask(
+    video_tensor, video_mask, original_filenames, source_frame_indices = load_video_and_mask(
         video_path, args.mask_dir, stride, args.max_num_frames
     )
+    source_frame_indices = np.asarray(source_frame_indices, dtype=np.int32)
 
     # Load depth (if provided) with the SAME stride and same frame order ( _frame_sort_key ) as RGB
     depth_tensor = None
     if depth_path is not None:
-        depth_tensor, _, _ = load_video_and_mask(
+        depth_tensor, _, _, depth_frame_indices = load_video_and_mask(
             depth_path, None, stride, args.max_num_frames, is_depth=True
         )  # [T, H, W]
+        depth_frame_indices = np.asarray(depth_frame_indices, dtype=np.int32)
+        if (
+            source_frame_indices.shape == depth_frame_indices.shape
+            and not np.array_equal(source_frame_indices, depth_frame_indices)
+        ):
+            logger.warning(
+                "RGB/depth sampled source frame indices differ; proceeding with RGB indices for scene references."
+            )
         if len(depth_tensor) != len(video_tensor):
             logger.warning(
                 f"Depth frame count ({len(depth_tensor)}) != RGB frame count ({len(video_tensor)}); "
@@ -827,6 +921,7 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
             depth_tensor = depth_tensor[:min_len]
             video_tensor = video_tensor[:min_len]
             original_filenames = original_filenames[:min_len]
+            source_frame_indices = source_frame_indices[:min_len]
         valid_depth = (depth_tensor > 0)
         depth_tensor[~valid_depth] = 0  # Invalidate bad depth values
 
@@ -879,6 +974,7 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
             f"按前 {video_length} 帧对齐。"
         )
         original_filenames = original_filenames[:video_length]
+    source_frame_indices = np.asarray(source_frame_indices, dtype=np.int32).reshape(-1)[:video_length]
 
     frame_H, frame_W = video_ten.shape[-2:]
 
@@ -1074,6 +1170,7 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
         "extrinsics": extrinsics,
         "query_points_per_frame": query_points_per_frame,
         "original_filenames": original_filenames,
+        "source_frame_indices": source_frame_indices,
         "depth_conf": depth_conf_npy,
         "query_frame_results": query_frame_results,  # Add individual frame results
         "full_intrinsics": torch.from_numpy(intrs_npy)
@@ -1169,6 +1266,7 @@ def _collect_and_sort_frame_files(video_path, extensions):
 
 def load_video_and_mask(video_path, mask_dir=None, fps=1, max_num_frames=384, is_depth=False):
     original_filenames = []
+    source_frame_indices: list[int] = []
 
     if os.path.isdir(video_path):
         # RGB 支持 jpg/jpeg/png；深度图通常为 png，统一用同一排序逻辑保证与 RGB 逐帧对齐
@@ -1176,12 +1274,16 @@ def load_video_and_mask(video_path, mask_dir=None, fps=1, max_num_frames=384, is
         img_files = _collect_and_sort_frame_files(video_path, exts)
 
         # IMPORTANT: Subsample the file list BEFORE loading to save memory
-        img_files = img_files[::fps]
+        indexed_img_files = list(enumerate(img_files))
+        indexed_img_files = indexed_img_files[::fps]
         if max_num_frames is not None and max_num_frames > 0:
-            img_files = img_files[:max_num_frames]
+            indexed_img_files = indexed_img_files[:max_num_frames]
 
         video_tensor = []
-        for img_file in tqdm.tqdm(img_files, desc="Loading images" if not is_depth else "Loading depth"):
+        for source_idx, img_file in tqdm.tqdm(
+            indexed_img_files,
+            desc="Loading images" if not is_depth else "Loading depth",
+        ):
             if is_depth:
                 # 支持 .npy 和 .png 两种深度格式
                 if img_file.endswith('.npy'):
@@ -1203,6 +1305,7 @@ def load_video_and_mask(video_path, mask_dir=None, fps=1, max_num_frames=384, is
             # Extract original filename without extension
             filename = os.path.splitext(os.path.basename(img_file))[0]
             original_filenames.append(filename)
+            source_frame_indices.append(int(source_idx))
         video_tensor = torch.stack(video_tensor)  # (N, H, W, 3)
     elif video_path.endswith((".mp4", ".mov", ".avi", ".mkv", ".webm")):
         # simple video reading. Please modify it if it causes OOM
@@ -1210,12 +1313,15 @@ def load_video_and_mask(video_path, mask_dir=None, fps=1, max_num_frames=384, is
         # Generate frame names for video files
         for i in range(len(video_tensor)):
             original_filenames.append(f"frame_{i:010d}")
+            source_frame_indices.append(i)
         # For video files, subsample after loading
         video_tensor = video_tensor[::fps]
         original_filenames = original_filenames[::fps]
+        source_frame_indices = source_frame_indices[::fps]
         if max_num_frames is not None and max_num_frames > 0:
             video_tensor = video_tensor[:max_num_frames]
             original_filenames = original_filenames[:max_num_frames]
+            source_frame_indices = source_frame_indices[:max_num_frames]
 
     if not is_depth:
         video_tensor = video_tensor.permute(
@@ -1225,6 +1331,7 @@ def load_video_and_mask(video_path, mask_dir=None, fps=1, max_num_frames=384, is
     if max_num_frames is not None and max_num_frames > 0:
         video_tensor = video_tensor[:max_num_frames]
         original_filenames = original_filenames[:max_num_frames]
+        source_frame_indices = source_frame_indices[:max_num_frames]
     video_length = len(video_tensor)
     logger.debug(f"Loaded video with {video_length} frames from {video_path}")
     frame_h, frame_w = video_tensor.shape[-2:]
@@ -1242,7 +1349,7 @@ def load_video_and_mask(video_path, mask_dir=None, fps=1, max_num_frames=384, is
 
     if not is_depth:
         video_tensor /= 255.
-    return video_tensor, video_mask_npy, original_filenames
+    return video_tensor, video_mask_npy, original_filenames, np.asarray(source_frame_indices, dtype=np.int32)
 
 
 def create_uniform_grid_points(height, width, grid_size=20, device="cuda"):
@@ -1421,6 +1528,7 @@ if __name__ == "__main__":
                 depth_conf=result["depth_conf"],
                 video_source_path=video_path,
                 depth_source_path=depth_path,
+                source_frame_indices=result["source_frame_indices"],
             )
 
         except Exception as e:

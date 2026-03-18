@@ -7,6 +7,9 @@ from typing import Any
 import h5py
 import imageio.v2 as imageio
 import numpy as np
+from PIL import Image
+
+from utils.extrinsics_utils import normalize_extrinsics_to_w2c
 
 
 V2_LAYOUT = "v2"
@@ -14,6 +17,13 @@ LEGACY_LAYOUT = "legacy"
 SCENE_H5_NAME = "scene.h5"
 SCENE_META_NAME = "scene_meta.json"
 SCENE_RGB_NAME = "scene_rgb.mp4"
+SCENE_STORAGE_CACHE = "cache"
+SCENE_STORAGE_SOURCE_REF = "source_ref"
+DEFAULT_SCENE_STORAGE_MODE = SCENE_STORAGE_SOURCE_REF
+
+_VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpg", ".mpeg")
+_RGB_FRAME_EXTS = (".jpg", ".jpeg", ".png")
+_DEPTH_FRAME_EXTS = (".npy", ".png", ".jpg", ".jpeg")
 
 
 def _to_path(path: str | Path) -> Path:
@@ -22,9 +32,118 @@ def _to_path(path: str | Path) -> Path:
 
 def detect_output_layout(episode_dir: str | Path) -> str:
     episode_dir = _to_path(episode_dir)
-    if (episode_dir / SCENE_H5_NAME).is_file() and (episode_dir / "samples").is_dir():
+    samples_dir = episode_dir / "samples"
+    if samples_dir.is_dir() and (
+        (episode_dir / SCENE_META_NAME).is_file()
+        or (episode_dir / SCENE_H5_NAME).is_file()
+    ):
         return V2_LAYOUT
     return LEGACY_LAYOUT
+
+
+def get_scene_storage_mode(meta: dict[str, Any] | None) -> str:
+    if not meta:
+        return SCENE_STORAGE_CACHE
+    return str(meta.get("scene_storage_mode", SCENE_STORAGE_CACHE))
+
+
+def _resolve_meta_path(base_dir: str | Path, raw_path: str | None) -> Path | None:
+    if not raw_path:
+        return None
+    path = _to_path(raw_path)
+    if path.is_absolute():
+        return path
+    return _to_path(base_dir) / path
+
+
+def _frame_sort_key(path: str | Path) -> tuple[int, str]:
+    path = str(path)
+    stem = Path(path).stem
+    if stem.isdigit():
+        return int(stem), path
+    digits = "".join(ch if ch.isdigit() else " " for ch in stem).split()
+    if digits:
+        return int(digits[-1]), path
+    return 0, path
+
+
+def _collect_and_sort_frame_files(root: str | Path, extensions: tuple[str, ...]) -> list[Path]:
+    root = _to_path(root)
+    files: list[Path] = []
+    for ext in extensions:
+        files.extend(sorted(root.glob(f"*{ext}")))
+    if not files:
+        left_dir = root / "left"
+        if left_dir.is_dir():
+            for ext in extensions:
+                files.extend(sorted(left_dir.glob(f"*{ext}")))
+    files.sort(key=_frame_sort_key)
+    return files
+
+
+def _load_rgb_image(path: str | Path) -> np.ndarray:
+    return np.array(Image.open(path).convert("RGB"), dtype=np.uint8)
+
+
+def _load_depth_image(path: str | Path) -> np.ndarray:
+    path = _to_path(path)
+    if path.suffix.lower() == ".npy":
+        return np.load(path).astype(np.float32)
+    image = Image.open(path).convert("I;16")
+    return np.array(image).astype(np.float32) / 1000.0
+
+
+def _load_external_geom_arrays(
+    *,
+    geom_path: str | Path,
+    camera_name: str,
+    extr_mode: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    geom_path = _to_path(geom_path)
+    if not geom_path.exists():
+        raise FileNotFoundError(f"Missing source geometry file: {geom_path}")
+
+    if geom_path.suffix.lower() == ".h5":
+        intr_key_with_suffix = f"observation/camera/intrinsics/{camera_name}_left"
+        extr_key_with_suffix = f"observation/camera/extrinsics/{camera_name}_left"
+        intr_key_no_suffix = f"observation/camera/intrinsics/{camera_name}"
+        extr_key_no_suffix = f"observation/camera/extrinsics/{camera_name}"
+
+        with h5py.File(geom_path, "r") as f:
+            if intr_key_with_suffix in f and extr_key_with_suffix in f:
+                intrinsics = f[intr_key_with_suffix][:].astype(np.float32)
+                extrinsics = f[extr_key_with_suffix][:].astype(np.float32)
+            elif intr_key_no_suffix in f and extr_key_no_suffix in f:
+                intrinsics = f[intr_key_no_suffix][:].astype(np.float32)
+                extrinsics = f[extr_key_no_suffix][:].astype(np.float32)
+            else:
+                available = list(f["observation/camera/intrinsics"].keys()) if "observation/camera/intrinsics" in f else []
+                raise KeyError(
+                    f"H5 geometry must contain either '{intr_key_with_suffix}' or '{intr_key_no_suffix}'. "
+                    f"Available cameras: {available}"
+                )
+    else:
+        data = np.load(geom_path)
+        try:
+            if "intrinsics" not in data or "extrinsics" not in data:
+                raise KeyError(
+                    f"NPZ geometry must contain 'intrinsics' and 'extrinsics': {geom_path}"
+                )
+            intrinsics = data["intrinsics"].astype(np.float32)
+            extrinsics = data["extrinsics"].astype(np.float32)
+        finally:
+            data.close()
+
+    if intrinsics.shape[0] != extrinsics.shape[0]:
+        raise ValueError(
+            f"Geometry intrinsics/extrinsics length mismatch: {intrinsics.shape[0]} vs {extrinsics.shape[0]}"
+        )
+    extrinsics_w2c = normalize_extrinsics_to_w2c(
+        extrinsics,
+        extr_mode=extr_mode,
+        context="SceneReader source geometry",
+    )
+    return intrinsics, extrinsics_w2c
 
 
 def is_traceforge_output_complete(output_dir: str | Path) -> bool:
@@ -35,11 +154,32 @@ def is_traceforge_output_complete(output_dir: str | Path) -> bool:
         return False
 
     if detect_output_layout(output_dir) == V2_LAYOUT:
-        return (
-            (output_dir / SCENE_H5_NAME).is_file()
-            and (output_dir / SCENE_META_NAME).is_file()
-            and (output_dir / SCENE_RGB_NAME).is_file()
-        )
+        meta = load_scene_meta(output_dir)
+        if meta is None:
+            return False
+        storage_mode = get_scene_storage_mode(meta)
+        if storage_mode == SCENE_STORAGE_CACHE:
+            scene_h5_path = _resolve_meta_path(output_dir, meta.get("scene_h5_path", SCENE_H5_NAME))
+            rgb_cache_path = _resolve_meta_path(output_dir, meta.get("rgb_cache_path", SCENE_RGB_NAME))
+            return bool(
+                scene_h5_path is not None
+                and scene_h5_path.is_file()
+                and rgb_cache_path is not None
+                and rgb_cache_path.is_file()
+            )
+        if storage_mode == SCENE_STORAGE_SOURCE_REF:
+            source_rgb_path = _resolve_meta_path(output_dir, meta.get("source_rgb_path"))
+            source_depth_path = _resolve_meta_path(output_dir, meta.get("source_depth_path"))
+            source_geom_path = _resolve_meta_path(output_dir, meta.get("source_geom_path"))
+            return bool(
+                source_rgb_path is not None
+                and source_rgb_path.exists()
+                and source_depth_path is not None
+                and source_depth_path.exists()
+                and source_geom_path is not None
+                and source_geom_path.exists()
+            )
+        return False
 
     images_dir = output_dir / "images"
     depth_dir = output_dir / "depth"
@@ -232,6 +372,26 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 if "traj_query_depth_rank" in data
                 else np.full(num_tracks, np.nan, dtype=np.float16)
             )
+            traj_query_depth_edge_mask = (
+                np.asarray(data["traj_query_depth_edge_mask"]).astype(bool, copy=False)
+                if "traj_query_depth_edge_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            )
+            traj_query_depth_patch_valid_ratio = (
+                data["traj_query_depth_patch_valid_ratio"].astype(np.float16)
+                if "traj_query_depth_patch_valid_ratio" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            )
+            traj_query_depth_patch_std = (
+                data["traj_query_depth_patch_std"].astype(np.float16)
+                if "traj_query_depth_patch_std" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            )
+            traj_query_depth_edge_risk_mask = (
+                np.asarray(data["traj_query_depth_edge_risk_mask"]).astype(bool, copy=False)
+                if "traj_query_depth_edge_risk_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            )
             traj_motion_extent = (
                 data["traj_motion_extent"].astype(np.float16)
                 if "traj_motion_extent" in data
@@ -283,6 +443,10 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 "traj_supervision_count": traj_supervision_count,
                 "traj_wrist_seed_mask": traj_wrist_seed_mask,
                 "traj_query_depth_rank": traj_query_depth_rank,
+                "traj_query_depth_edge_mask": traj_query_depth_edge_mask,
+                "traj_query_depth_patch_valid_ratio": traj_query_depth_patch_valid_ratio,
+                "traj_query_depth_patch_std": traj_query_depth_patch_std,
+                "traj_query_depth_edge_risk_mask": traj_query_depth_edge_risk_mask,
                 "traj_motion_extent": traj_motion_extent,
                 "traj_motion_step_median": traj_motion_step_median,
                 "traj_manipulator_candidate_mask": traj_manipulator_candidate_mask,
@@ -385,6 +549,26 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 data["traj_query_depth_rank"].astype(np.float16)
                 if "traj_query_depth_rank" in data
                 else np.full(num_tracks, np.nan, dtype=np.float16)
+            ),
+            "traj_query_depth_edge_mask": (
+                np.asarray(data["traj_query_depth_edge_mask"]).astype(bool, copy=False)
+                if "traj_query_depth_edge_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            ),
+            "traj_query_depth_patch_valid_ratio": (
+                data["traj_query_depth_patch_valid_ratio"].astype(np.float16)
+                if "traj_query_depth_patch_valid_ratio" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            ),
+            "traj_query_depth_patch_std": (
+                data["traj_query_depth_patch_std"].astype(np.float16)
+                if "traj_query_depth_patch_std" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            ),
+            "traj_query_depth_edge_risk_mask": (
+                np.asarray(data["traj_query_depth_edge_risk_mask"]).astype(bool, copy=False)
+                if "traj_query_depth_edge_risk_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
             ),
             "traj_motion_extent": (
                 data["traj_motion_extent"].astype(np.float16)
@@ -591,9 +775,17 @@ class SceneReader:
         self.episode_dir = _to_path(episode_dir)
         self.layout = detect_output_layout(self.episode_dir)
         self.video_name = self.episode_dir.name
+        self._scene_meta: dict[str, Any] | None = None
         self._scene_h5: h5py.File | None = None
         self._scene_reader = None
+        self._source_rgb_reader = None
+        self._source_depth_reader = None
         self._main_npz = None
+        self._source_rgb_files: list[Path] | None = None
+        self._source_depth_files: list[Path] | None = None
+        self._source_frame_indices: np.ndarray | None = None
+        self._source_intrinsics: np.ndarray | None = None
+        self._source_extrinsics: np.ndarray | None = None
 
     def close(self) -> None:
         if self._scene_h5 is not None:
@@ -602,6 +794,12 @@ class SceneReader:
         if self._scene_reader is not None:
             self._scene_reader.close()
             self._scene_reader = None
+        if self._source_rgb_reader is not None:
+            self._source_rgb_reader.close()
+            self._source_rgb_reader = None
+        if self._source_depth_reader is not None:
+            self._source_depth_reader.close()
+            self._source_depth_reader = None
         if self._main_npz is not None:
             self._main_npz.close()
             self._main_npz = None
@@ -612,14 +810,38 @@ class SceneReader:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
+    def _require_scene_meta(self) -> dict[str, Any]:
+        if self._scene_meta is None:
+            self._scene_meta = load_scene_meta(self.episode_dir)
+        if self._scene_meta is None:
+            raise FileNotFoundError(f"Missing {SCENE_META_NAME} under {self.episode_dir}")
+        return self._scene_meta
+
+    def _get_scene_storage_mode(self) -> str:
+        if self.layout != V2_LAYOUT:
+            return SCENE_STORAGE_CACHE
+        return get_scene_storage_mode(self._require_scene_meta())
+
     def _require_scene_h5(self) -> h5py.File:
         if self._scene_h5 is None:
-            self._scene_h5 = h5py.File(self.episode_dir / SCENE_H5_NAME, "r")
+            meta = self._require_scene_meta()
+            scene_h5_path = _resolve_meta_path(self.episode_dir, meta.get("scene_h5_path", SCENE_H5_NAME))
+            if scene_h5_path is None or not scene_h5_path.is_file():
+                raise FileNotFoundError(
+                    f"Missing scene cache H5 for cache-backed v2 output: {scene_h5_path}"
+                )
+            self._scene_h5 = h5py.File(scene_h5_path, "r")
         return self._scene_h5
 
     def _require_scene_reader(self):
         if self._scene_reader is None:
-            self._scene_reader = imageio.get_reader(str(self.episode_dir / SCENE_RGB_NAME))
+            meta = self._require_scene_meta()
+            rgb_cache_path = _resolve_meta_path(self.episode_dir, meta.get("rgb_cache_path", SCENE_RGB_NAME))
+            if rgb_cache_path is None or not rgb_cache_path.is_file():
+                raise FileNotFoundError(
+                    f"Missing scene RGB cache for cache-backed v2 output: {rgb_cache_path}"
+                )
+            self._scene_reader = imageio.get_reader(str(rgb_cache_path))
         return self._scene_reader
 
     def _require_main_npz(self):
@@ -627,12 +849,137 @@ class SceneReader:
             self._main_npz = np.load(self.episode_dir / f"{self.video_name}.npz")
         return self._main_npz
 
+    def _require_source_frame_indices(self) -> np.ndarray:
+        if self._source_frame_indices is None:
+            meta = self._require_scene_meta()
+            raw_indices = meta.get("source_frame_indices")
+            if raw_indices is None:
+                frame_count = int(meta.get("frame_count", 0))
+                self._source_frame_indices = np.arange(frame_count, dtype=np.int32)
+            else:
+                self._source_frame_indices = np.asarray(raw_indices, dtype=np.int32).reshape(-1)
+            if np.any(self._source_frame_indices < 0):
+                raise ValueError(f"source_frame_indices must be non-negative: {self.episode_dir}")
+        return self._source_frame_indices
+
+    def _map_source_frame_index(self, frame_idx: int) -> int:
+        frame_idx = int(frame_idx)
+        source_frame_indices = self._require_source_frame_indices()
+        if frame_idx < 0 or frame_idx >= len(source_frame_indices):
+            raise IndexError(
+                f"frame_idx={frame_idx} exceeds available frames ({len(source_frame_indices)}) "
+                f"for {self.episode_dir}"
+            )
+        return int(source_frame_indices[frame_idx])
+
+    def _require_source_rgb_path(self) -> Path:
+        meta = self._require_scene_meta()
+        source_rgb_path = _resolve_meta_path(self.episode_dir, meta.get("source_rgb_path"))
+        if source_rgb_path is None or not source_rgb_path.exists():
+            raise FileNotFoundError(
+                f"source_ref output is missing source_rgb_path under {self.episode_dir}"
+            )
+        return source_rgb_path
+
+    def _require_source_depth_path(self) -> Path:
+        meta = self._require_scene_meta()
+        source_depth_path = _resolve_meta_path(self.episode_dir, meta.get("source_depth_path"))
+        if source_depth_path is None or not source_depth_path.exists():
+            raise FileNotFoundError(
+                f"source_ref output is missing source_depth_path under {self.episode_dir}"
+            )
+        return source_depth_path
+
+    def _require_source_geom_path(self) -> Path:
+        meta = self._require_scene_meta()
+        source_geom_path = _resolve_meta_path(self.episode_dir, meta.get("source_geom_path"))
+        if source_geom_path is None or not source_geom_path.exists():
+            raise FileNotFoundError(
+                f"source_ref output is missing source_geom_path under {self.episode_dir}"
+            )
+        return source_geom_path
+
+    def _require_source_rgb_files(self) -> list[Path]:
+        if self._source_rgb_files is None:
+            source_rgb_path = self._require_source_rgb_path()
+            if not source_rgb_path.is_dir():
+                raise FileNotFoundError(
+                    f"source_rgb_path must be a directory for frame-backed source_ref outputs: {source_rgb_path}"
+                )
+            self._source_rgb_files = _collect_and_sort_frame_files(source_rgb_path, _RGB_FRAME_EXTS)
+            if not self._source_rgb_files:
+                raise FileNotFoundError(f"No RGB frames found under {source_rgb_path}")
+        return self._source_rgb_files
+
+    def _require_source_depth_files(self) -> list[Path]:
+        if self._source_depth_files is None:
+            source_depth_path = self._require_source_depth_path()
+            if not source_depth_path.is_dir():
+                raise FileNotFoundError(
+                    f"source_depth_path must be a directory for frame-backed source_ref outputs: {source_depth_path}"
+                )
+            self._source_depth_files = _collect_and_sort_frame_files(source_depth_path, _DEPTH_FRAME_EXTS)
+            if not self._source_depth_files:
+                raise FileNotFoundError(f"No depth frames found under {source_depth_path}")
+        return self._source_depth_files
+
+    def _require_source_rgb_reader(self):
+        if self._source_rgb_reader is None:
+            source_rgb_path = self._require_source_rgb_path()
+            if source_rgb_path.suffix.lower() not in _VIDEO_EXTS:
+                raise FileNotFoundError(
+                    f"Unsupported source RGB file for source_ref output: {source_rgb_path}"
+                )
+            self._source_rgb_reader = imageio.get_reader(str(source_rgb_path))
+        return self._source_rgb_reader
+
+    def _require_source_depth_reader(self):
+        if self._source_depth_reader is None:
+            source_depth_path = self._require_source_depth_path()
+            if source_depth_path.suffix.lower() not in _VIDEO_EXTS:
+                raise FileNotFoundError(
+                    f"Unsupported source depth file for source_ref output: {source_depth_path}"
+                )
+            self._source_depth_reader = imageio.get_reader(str(source_depth_path))
+        return self._source_depth_reader
+
+    def _require_source_geom_arrays(self) -> tuple[np.ndarray, np.ndarray]:
+        if self._source_intrinsics is None or self._source_extrinsics is None:
+            meta = self._require_scene_meta()
+            camera_name = str(meta.get("source_camera_name") or self.video_name)
+            extr_mode = str(meta.get("source_extrinsics_mode") or "w2c")
+            source_geom_path = self._require_source_geom_path()
+            self._source_intrinsics, self._source_extrinsics = _load_external_geom_arrays(
+                geom_path=source_geom_path,
+                camera_name=camera_name,
+                extr_mode=extr_mode,
+            )
+        return self._source_intrinsics, self._source_extrinsics
+
     def get_camera_arrays(self) -> tuple[np.ndarray, np.ndarray]:
         if self.layout == V2_LAYOUT:
-            scene_h5 = self._require_scene_h5()
-            intrinsics = scene_h5["camera/intrinsics"][:].astype(np.float32)
-            extrinsics = scene_h5["camera/extrinsics_w2c"][:].astype(np.float32)
-            return intrinsics, extrinsics
+            if self._get_scene_storage_mode() == SCENE_STORAGE_CACHE:
+                scene_h5 = self._require_scene_h5()
+                intrinsics = scene_h5["camera/intrinsics"][:].astype(np.float32)
+                extrinsics = scene_h5["camera/extrinsics_w2c"][:].astype(np.float32)
+                return intrinsics, extrinsics
+
+            source_indices = self._require_source_frame_indices()
+            intrinsics_all, extrinsics_all = self._require_source_geom_arrays()
+            if len(source_indices) == 0:
+                return (
+                    np.zeros((0, 3, 3), dtype=np.float32),
+                    np.zeros((0, 4, 4), dtype=np.float32),
+                )
+            if int(source_indices.max()) >= len(intrinsics_all) or int(source_indices.max()) >= len(extrinsics_all):
+                raise IndexError(
+                    f"source_frame_indices exceed source geometry length for {self.episode_dir}: "
+                    f"max={int(source_indices.max())}, intrinsics={len(intrinsics_all)}, extrinsics={len(extrinsics_all)}"
+                )
+            return (
+                intrinsics_all[source_indices].astype(np.float32),
+                extrinsics_all[source_indices].astype(np.float32),
+            )
 
         data = self._require_main_npz()
         return data["intrinsics"].astype(np.float32), data["extrinsics"].astype(np.float32)
@@ -649,8 +996,30 @@ class SceneReader:
 
     def get_depth_frame(self, frame_idx: int) -> np.ndarray:
         if self.layout == V2_LAYOUT:
-            scene_h5 = self._require_scene_h5()
-            return scene_h5["dense/depth"][frame_idx].astype(np.float32)
+            if self._get_scene_storage_mode() == SCENE_STORAGE_CACHE:
+                scene_h5 = self._require_scene_h5()
+                return scene_h5["dense/depth"][frame_idx].astype(np.float32)
+
+            source_frame_idx = self._map_source_frame_index(frame_idx)
+            source_depth_path = self._require_source_depth_path()
+            if source_depth_path.is_dir():
+                source_depth_files = self._require_source_depth_files()
+                if source_frame_idx >= len(source_depth_files):
+                    raise IndexError(
+                        f"source depth frame {source_frame_idx} exceeds available files ({len(source_depth_files)}) "
+                        f"under {source_depth_path}"
+                    )
+                return _load_depth_image(source_depth_files[source_frame_idx]).astype(np.float32)
+
+            if source_depth_path.suffix.lower() in _VIDEO_EXTS:
+                reader = self._require_source_depth_reader()
+                frame = np.asarray(reader.get_data(source_frame_idx), dtype=np.float32)
+                if frame.ndim == 3:
+                    frame = frame[..., 0]
+                return frame.astype(np.float32)
+            raise FileNotFoundError(
+                f"Unsupported source depth storage for source_ref output: {source_depth_path}"
+            )
 
         depth_raw_path = self.episode_dir / "depth" / f"{self.video_name}_{frame_idx}_raw.npz"
         if depth_raw_path.is_file():
@@ -667,14 +1036,31 @@ class SceneReader:
 
     def get_rgb_frame(self, frame_idx: int) -> np.ndarray:
         if self.layout == V2_LAYOUT:
-            reader = self._require_scene_reader()
-            return np.asarray(reader.get_data(frame_idx), dtype=np.uint8)
+            if self._get_scene_storage_mode() == SCENE_STORAGE_CACHE:
+                reader = self._require_scene_reader()
+                return np.asarray(reader.get_data(frame_idx), dtype=np.uint8)
+
+            source_frame_idx = self._map_source_frame_index(frame_idx)
+            source_rgb_path = self._require_source_rgb_path()
+            if source_rgb_path.is_dir():
+                source_rgb_files = self._require_source_rgb_files()
+                if source_frame_idx >= len(source_rgb_files):
+                    raise IndexError(
+                        f"source RGB frame {source_frame_idx} exceeds available files ({len(source_rgb_files)}) "
+                        f"under {source_rgb_path}"
+                    )
+                return _load_rgb_image(source_rgb_files[source_frame_idx])
+
+            if source_rgb_path.suffix.lower() in _VIDEO_EXTS:
+                reader = self._require_source_rgb_reader()
+                return np.asarray(reader.get_data(source_frame_idx), dtype=np.uint8)
+            raise FileNotFoundError(
+                f"Unsupported source RGB storage for source_ref output: {source_rgb_path}"
+            )
 
         image_path = self.episode_dir / "images" / f"{self.video_name}_{frame_idx}.png"
         if image_path.is_file():
-            import PIL.Image
-
-            return np.array(PIL.Image.open(image_path).convert("RGB"), dtype=np.uint8)
+            return np.array(Image.open(image_path).convert("RGB"), dtype=np.uint8)
 
         data = self._require_main_npz()
         if "video" not in data:

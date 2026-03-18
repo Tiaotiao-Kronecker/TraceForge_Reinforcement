@@ -130,6 +130,7 @@ def process_single_camera(dataset_path, camera_name, args, gpu_id, task_index, t
         "--frame_drop_rate", str(args.frame_drop_rate),
         "--grid_size", str(args.grid_size),
         "--output_layout", args.output_layout,
+        "--scene_storage_mode", args.scene_storage_mode,
     ]
     if args.save_visibility:
         cmd.append("--save_visibility")
@@ -212,6 +213,16 @@ def main():
         default="v2",
         choices=["v2", "legacy"],
         help="Artifact layout passed through to infer.py.",
+    )
+    parser.add_argument(
+        "--scene_storage_mode",
+        type=str,
+        default="source_ref",
+        choices=["source_ref", "cache"],
+        help=(
+            "Storage backend passed through to infer.py. DROID default uses source_ref globally, "
+            "so VGGT workflows typically need --scene_storage_mode cache."
+        ),
     )
     parser.add_argument(
         "--save_visibility",

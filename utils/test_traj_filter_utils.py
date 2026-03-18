@@ -7,6 +7,7 @@ from utils.traj_filter_utils import (
     MASK_REASON_MANIPULATOR_CLUSTER_FAIL,
     MASK_REASON_MANIPULATOR_DEPTH_FAIL,
     MASK_REASON_MANIPULATOR_MOTION_FAIL,
+    MASK_REASON_QUERY_DEPTH_EDGE_FAIL,
     MASK_REASON_QUERY_DEPTH_FAIL,
     MASK_REASON_STABLE_TEMPORAL_FAIL,
     MASK_REASON_TEMPORAL_CONSISTENCY_FAIL,
@@ -500,6 +501,176 @@ class BuildTrajValidMaskTests(unittest.TestCase):
         np.testing.assert_array_equal(result["traj_supervision_count"], np.array([2], dtype=np.uint16))
         self.assertTrue(result["traj_mask_reason_bits"][0] & MASK_REASON_TEMPORAL_CONSISTENCY_FAIL)
 
+    def test_wrist_profile_rejects_query_depth_edge_risk_seed(self):
+        fixture = _make_base_fixture()
+        fixture["query_depth"][:, :2] = 0.05
+
+        result = build_traj_filter_result(
+            traj=fixture["traj"],
+            visibs=fixture["visibs"],
+            image_width=fixture["image_width"],
+            image_height=fixture["image_height"],
+            filter_args=_make_filter_args(boundary_margin=0, traj_filter_profile="wrist"),
+            keypoints=fixture["keypoints"],
+            query_depth=fixture["query_depth"],
+            raw_depths_segment=fixture["raw_depths_segment"],
+            intrinsics_segment=fixture["intrinsics_segment"],
+            extrinsics_segment=fixture["extrinsics_segment"],
+            depth_volatility_map=fixture["depth_volatility_map"],
+        )
+
+        np.testing.assert_array_equal(result["traj_valid_mask"], np.array([False]))
+        np.testing.assert_array_equal(result["traj_query_depth_edge_mask"], np.array([True]))
+        np.testing.assert_array_equal(result["traj_query_depth_edge_risk_mask"], np.array([True]))
+        self.assertAlmostEqual(float(result["traj_query_depth_patch_valid_ratio"][0]), 1.0, places=6)
+        self.assertGreater(float(result["traj_query_depth_patch_std"][0]), 0.003)
+        self.assertTrue(result["traj_mask_reason_bits"][0] & MASK_REASON_QUERY_DEPTH_EDGE_FAIL)
+        self.assertFalse(bool(result["traj_mask_reason_bits"][0] & MASK_REASON_QUERY_DEPTH_FAIL))
+
+    def test_wrist_profile_keeps_low_variance_query_depth_edge_seed(self):
+        fixture = _make_base_fixture()
+        fixture["traj"][0, :, 2] = 0.05
+        fixture["query_depth"][:, :] = 0.05
+        fixture["raw_depths_segment"][:, :, :] = 0.05
+        fixture["query_depth"][:, :2] = 0.052
+
+        result = build_traj_filter_result(
+            traj=fixture["traj"],
+            visibs=fixture["visibs"],
+            image_width=fixture["image_width"],
+            image_height=fixture["image_height"],
+            filter_args=_make_filter_args(boundary_margin=0, traj_filter_profile="wrist"),
+            keypoints=fixture["keypoints"],
+            query_depth=fixture["query_depth"],
+            raw_depths_segment=fixture["raw_depths_segment"],
+            intrinsics_segment=fixture["intrinsics_segment"],
+            extrinsics_segment=fixture["extrinsics_segment"],
+            depth_volatility_map=fixture["depth_volatility_map"],
+        )
+
+        np.testing.assert_array_equal(result["traj_valid_mask"], np.array([True]))
+        np.testing.assert_array_equal(result["traj_query_depth_edge_mask"], np.array([True]))
+        np.testing.assert_array_equal(result["traj_query_depth_edge_risk_mask"], np.array([False]))
+        self.assertLess(float(result["traj_query_depth_patch_std"][0]), 0.003)
+
+    def test_wrist_profile_keeps_default_motion_debug_fields(self):
+        fixture = _make_base_fixture()
+
+        result = build_traj_filter_result(
+            traj=fixture["traj"],
+            visibs=fixture["visibs"],
+            image_width=fixture["image_width"],
+            image_height=fixture["image_height"],
+            filter_args=_make_filter_args(boundary_margin=0, traj_filter_profile="wrist"),
+            keypoints=fixture["keypoints"],
+            query_depth=fixture["query_depth"],
+            raw_depths_segment=fixture["raw_depths_segment"],
+            intrinsics_segment=fixture["intrinsics_segment"],
+            extrinsics_segment=fixture["extrinsics_segment"],
+            depth_volatility_map=fixture["depth_volatility_map"],
+        )
+
+        self.assertTrue(np.isnan(result["traj_motion_extent"]).all())
+        self.assertTrue(np.isnan(result["traj_motion_step_median"]).all())
+        np.testing.assert_array_equal(result["traj_manipulator_candidate_mask"], np.array([False]))
+
+    def test_wrist_manipulator_top95_uses_wrist_manipulator_as_baseline(self):
+        near_tracks = []
+        far_tracks = []
+        for track_idx in range(20):
+            motion = float(track_idx + 1)
+            start_u = 10.0 + float(track_idx * 6)
+            near_tracks.append(
+                _make_track(
+                    u_values=[start_u, start_u + motion, start_u + 2.0 * motion, start_u + 3.0 * motion],
+                    v=24.0,
+                    depth=0.20 + 0.01 * float(track_idx),
+                )
+            )
+            far_start_u = 12.0 + float(track_idx * 6)
+            far_tracks.append(
+                _make_track(
+                    u_values=[far_start_u, far_start_u + 5.0, far_start_u + 10.0, far_start_u + 15.0],
+                    v=120.0,
+                    depth=1.00 + 0.01 * float(track_idx),
+                )
+            )
+        traj = np.concatenate(near_tracks + far_tracks, axis=0)
+        fixture = _make_multi_track_fixture(traj=traj, height=192, width=192)
+
+        manipulator_result = build_traj_filter_result(
+            traj=fixture["traj"],
+            visibs=fixture["visibs"],
+            image_width=fixture["image_width"],
+            image_height=fixture["image_height"],
+            filter_args=_make_filter_args(boundary_margin=0, traj_filter_profile="wrist_manipulator"),
+            keypoints=fixture["keypoints"],
+            query_depth=fixture["query_depth"],
+            raw_depths_segment=fixture["raw_depths_segment"],
+            intrinsics_segment=fixture["intrinsics_segment"],
+            extrinsics_segment=fixture["extrinsics_segment"],
+            depth_volatility_map=fixture["depth_volatility_map"],
+        )
+
+        top95_result = build_traj_filter_result(
+            traj=fixture["traj"],
+            visibs=fixture["visibs"],
+            image_width=fixture["image_width"],
+            image_height=fixture["image_height"],
+            filter_args=_make_filter_args(boundary_margin=0, traj_filter_profile="wrist_manipulator_top95"),
+            keypoints=fixture["keypoints"],
+            query_depth=fixture["query_depth"],
+            raw_depths_segment=fixture["raw_depths_segment"],
+            intrinsics_segment=fixture["intrinsics_segment"],
+            extrinsics_segment=fixture["extrinsics_segment"],
+            depth_volatility_map=fixture["depth_volatility_map"],
+        )
+
+        np.testing.assert_array_equal(top95_result["traj_wrist_seed_mask"], np.ones(40, dtype=bool))
+        np.testing.assert_array_equal(
+            manipulator_result["traj_valid_mask"],
+            np.array([True] * 20 + [False] * 20, dtype=bool),
+        )
+        np.testing.assert_array_equal(
+            top95_result["traj_valid_mask"],
+            np.array([False] + [True] * 19 + [False] * 20, dtype=bool),
+        )
+        self.assertEqual(int(np.count_nonzero(top95_result["traj_valid_mask"])), 19)
+        self.assertTrue(np.isfinite(top95_result["traj_motion_extent"]).all())
+        self.assertTrue(np.isfinite(top95_result["traj_motion_step_median"]).all())
+        np.testing.assert_array_equal(
+            top95_result["traj_valid_mask"] & (~manipulator_result["traj_valid_mask"]),
+            np.zeros(40, dtype=bool),
+        )
+        self.assertLess(
+            float(top95_result["traj_motion_extent"][0]),
+            float(np.min(top95_result["traj_motion_extent"][1:20])),
+        )
+
+    def test_external_profile_ignores_query_depth_edge_risk_rule(self):
+        fixture = _make_base_fixture()
+        fixture["query_depth"][:, :2] = 0.05
+
+        result = build_traj_filter_result(
+            traj=fixture["traj"],
+            visibs=fixture["visibs"],
+            image_width=fixture["image_width"],
+            image_height=fixture["image_height"],
+            filter_args=_make_filter_args(boundary_margin=0, traj_filter_profile="external"),
+            keypoints=fixture["keypoints"],
+            query_depth=fixture["query_depth"],
+            raw_depths_segment=fixture["raw_depths_segment"],
+            intrinsics_segment=fixture["intrinsics_segment"],
+            extrinsics_segment=fixture["extrinsics_segment"],
+            depth_volatility_map=fixture["depth_volatility_map"],
+        )
+
+        np.testing.assert_array_equal(result["traj_valid_mask"], np.array([True]))
+        np.testing.assert_array_equal(result["traj_query_depth_edge_mask"], np.array([False]))
+        np.testing.assert_array_equal(result["traj_query_depth_edge_risk_mask"], np.array([False]))
+        self.assertTrue(np.isnan(result["traj_query_depth_patch_valid_ratio"]).all())
+        self.assertTrue(np.isnan(result["traj_query_depth_patch_std"]).all())
+
     def test_wrist_manipulator_keeps_near_moving_adjacent_cluster(self):
         traj = np.concatenate(
             [
@@ -840,6 +1011,10 @@ class BuildTrajValidMaskTests(unittest.TestCase):
 
         np.testing.assert_array_equal(result["traj_wrist_seed_mask"], np.array([False]))
         self.assertTrue(np.isnan(result["traj_query_depth_rank"]).all())
+        np.testing.assert_array_equal(result["traj_query_depth_edge_mask"], np.array([False]))
+        self.assertTrue(np.isnan(result["traj_query_depth_patch_valid_ratio"]).all())
+        self.assertTrue(np.isnan(result["traj_query_depth_patch_std"]).all())
+        np.testing.assert_array_equal(result["traj_query_depth_edge_risk_mask"], np.array([False]))
         self.assertTrue(np.isnan(result["traj_motion_extent"]).all())
         self.assertTrue(np.isnan(result["traj_motion_step_median"]).all())
         np.testing.assert_array_equal(result["traj_manipulator_candidate_mask"], np.array([False]))

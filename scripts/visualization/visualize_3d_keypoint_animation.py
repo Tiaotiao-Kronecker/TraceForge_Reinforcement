@@ -4,7 +4,7 @@ TraceForge 推理结果的 3D Keypoint 动画可视化。
 
 v2 布局：
 - 总是从 `samples/<video>_<query>.npz` 读取轨迹；
-- `--dense_pointcloud` 时，按 `segment_frame_indices` 从 `scene.h5 + scene_rgb.mp4`
+- `--dense_pointcloud` 时，按 `segment_frame_indices` 从 scene cache 或 source refs
   逐帧重建动态密集点云；
 - 不再依赖“首帧专用主 NPZ”。
 
@@ -317,7 +317,7 @@ def main() -> None:
             segment_frame_indices = np.arange(traj_full.shape[1], dtype=np.int32)
             use_legacy_main_dense = True
         elif args.dense_pointcloud and layout != LEGACY_LAYOUT:
-            logger.info("v2: 使用 scene cache 重建动态 dense pointcloud")
+            logger.info("v2: 使用 scene artifacts 重建动态 dense pointcloud")
             dense_per_frame, dense_colors_per_frame = load_dense_sequence_from_scene(
                 scene_reader,
                 frame_indices=segment_frame_indices,

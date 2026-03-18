@@ -4,11 +4,15 @@ import warnings
 
 import numpy as np
 
+from utils.moge_utils3d import depth_edge
+
 
 QUERY_DEPTH_PATCH_RADIUS = 2
 QUERY_DEPTH_MIN_VALID_RATIO = 0.4
 QUERY_DEPTH_ABS_TOL = 0.05
 QUERY_DEPTH_REL_TOL = 0.10
+QUERY_DEPTH_EDGE_RTOL = 0.03
+QUERY_DEPTH_EDGE_PATCH_STD_THRESHOLD = 0.003
 
 TEMPORAL_DEPTH_ABS_TOL = 0.05
 TEMPORAL_DEPTH_REL_TOL = 0.10
@@ -18,12 +22,14 @@ TRAJ_FILTER_PROFILE_EXTERNAL = "external"
 TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR = "external_manipulator"
 TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR_V2 = "external_manipulator_v2"
 TRAJ_FILTER_PROFILE_WRIST = "wrist"
+TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR_TOP95 = "wrist_manipulator_top95"
 TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR = "wrist_manipulator"
 
 WRIST_MIN_PREFIX_FRAMES = 3
 WRIST_MIN_SUPPORT_FRAMES = 3
 WRIST_PREFIX_RATIO = 0.15
 WRIST_SUPPORT_RATIO = 0.20
+WRIST_MANIPULATOR_TOP95_KEEP_RATIO = 0.95
 
 WRIST_MANIPULATOR_MAX_DEPTH_RANK = 0.50
 WRIST_MANIPULATOR_MIN_MOTION_EXTENT = 0.03
@@ -51,6 +57,7 @@ MASK_REASON_STABLE_TEMPORAL_FAIL = np.uint8(1 << 3)
 MASK_REASON_MANIPULATOR_DEPTH_FAIL = np.uint8(1 << 4)
 MASK_REASON_MANIPULATOR_MOTION_FAIL = np.uint8(1 << 5)
 MASK_REASON_MANIPULATOR_CLUSTER_FAIL = np.uint8(1 << 6)
+MASK_REASON_QUERY_DEPTH_EDGE_FAIL = np.uint8(1 << 7)
 
 
 def _normalize_visibility(
@@ -212,6 +219,30 @@ def _compute_supervised_motion_metrics(
             motion_step_median[track_idx] = float(np.median(valid_steps))
 
     return motion_extent, motion_step_median
+
+
+def _apply_top_motion_extent_filter(
+    *,
+    seed_mask: np.ndarray,
+    motion_extent: np.ndarray,
+    keep_ratio: float,
+) -> np.ndarray:
+    seed_mask = np.asarray(seed_mask, dtype=bool)
+    motion_extent = np.asarray(motion_extent, dtype=np.float32)
+
+    final_mask = np.zeros(seed_mask.shape, dtype=bool)
+    candidate_indices = np.flatnonzero(seed_mask & np.isfinite(motion_extent))
+    if candidate_indices.size == 0:
+        return final_mask
+
+    keep_ratio = float(np.clip(keep_ratio, 0.0, 1.0))
+    order = candidate_indices[np.argsort(-motion_extent[candidate_indices], kind="stable")]
+    keep_count = min(
+        order.size,
+        max(1, int(np.floor(keep_ratio * float(order.size)))),
+    )
+    final_mask[order[:keep_count]] = True
+    return final_mask
 
 
 def _select_largest_spatial_component(
@@ -697,6 +728,7 @@ def resolve_traj_filter_config(filter_args) -> dict:
     config = defaults[level].copy()
     config.update(
         {
+            "wrist_manipulator_top95_keep_ratio": WRIST_MANIPULATOR_TOP95_KEEP_RATIO,
             "wrist_manipulator_max_depth_rank": WRIST_MANIPULATOR_MAX_DEPTH_RANK,
             "wrist_manipulator_min_motion_extent": WRIST_MANIPULATOR_MIN_MOTION_EXTENT,
             "wrist_manipulator_cluster_radius_ratio": WRIST_MANIPULATOR_CLUSTER_RADIUS_RATIO,
@@ -741,6 +773,7 @@ def compute_query_depth_quality_mask(
     min_patch_valid_ratio: float = QUERY_DEPTH_MIN_VALID_RATIO,
     median_abs_threshold: float = QUERY_DEPTH_ABS_TOL,
     median_rel_threshold: float = QUERY_DEPTH_REL_TOL,
+    patch_stats: dict[str, np.ndarray] | None = None,
 ) -> np.ndarray:
     """Reject query points whose raw query-frame depth is invalid or locally isolated."""
     keypoints = np.asarray(keypoints, dtype=np.float32)
@@ -750,41 +783,148 @@ def compute_query_depth_quality_mask(
     if keypoints.ndim != 2 or keypoints.shape[1] != 2:
         raise ValueError(f"Expected keypoints shape (N, 2), got {keypoints.shape}")
 
+    if patch_stats is None:
+        patch_stats = _compute_query_depth_patch_stats(
+            keypoints,
+            query_depth,
+            min_depth=min_depth,
+            max_depth=max_depth,
+            patch_radius=patch_radius,
+        )
+
+    query_valid = np.asarray(patch_stats["query_valid"]).astype(bool, copy=False)
+    patch_valid_ratio = np.asarray(patch_stats["patch_valid_ratio"]).astype(np.float32, copy=False)
+    patch_median = np.asarray(patch_stats["patch_median"]).astype(np.float32, copy=False)
+    query_values = np.asarray(patch_stats["query_values"]).astype(np.float32, copy=False)
+
+    valid_mask = query_valid & (patch_valid_ratio >= float(min_patch_valid_ratio)) & np.isfinite(patch_median)
+    deviation_limit = np.maximum(float(median_abs_threshold), float(median_rel_threshold) * patch_median)
+    valid_mask &= np.isfinite(deviation_limit)
+    valid_mask &= np.abs(query_values - patch_median) <= deviation_limit
+    return valid_mask.astype(bool)
+
+
+def _compute_query_depth_patch_stats(
+    keypoints: np.ndarray,
+    query_depth: np.ndarray,
+    *,
+    min_depth: float,
+    max_depth: float,
+    patch_radius: int = QUERY_DEPTH_PATCH_RADIUS,
+) -> dict[str, np.ndarray]:
+    keypoints = np.asarray(keypoints, dtype=np.float32)
+    query_depth = np.asarray(query_depth, dtype=np.float32)
+    if query_depth.ndim != 2:
+        raise ValueError(f"Expected query_depth shape (H, W), got {query_depth.shape}")
+    if keypoints.ndim != 2 or keypoints.shape[1] != 2:
+        raise ValueError(f"Expected keypoints shape (N, 2), got {keypoints.shape}")
+
+    num_tracks = int(keypoints.shape[0])
     height, width = query_depth.shape
     if width == 0 or height == 0:
-        return np.zeros(keypoints.shape[0], dtype=bool)
+        empty_int = np.zeros(num_tracks, dtype=np.int32)
+        empty_float = np.full(num_tracks, np.nan, dtype=np.float32)
+        empty_bool = np.zeros(num_tracks, dtype=bool)
+        return {
+            "xs": empty_int,
+            "ys": empty_int.copy(),
+            "query_values": empty_float.copy(),
+            "query_valid": empty_bool,
+            "patch_valid_ratio": np.zeros(num_tracks, dtype=np.float32),
+            "patch_median": empty_float.copy(),
+            "patch_std": empty_float.copy(),
+        }
 
     xs = np.clip(np.round(keypoints[:, 0]).astype(np.int32), 0, width - 1)
     ys = np.clip(np.round(keypoints[:, 1]).astype(np.int32), 0, height - 1)
-    valid_mask = np.zeros(keypoints.shape[0], dtype=bool)
+    query_values = query_depth[ys, xs].astype(np.float32, copy=False)
+    query_valid = np.isfinite(query_values) & (query_values > min_depth) & (query_values < max_depth)
+    patch_valid_ratio = np.zeros(num_tracks, dtype=np.float32)
+    patch_median = np.full(num_tracks, np.nan, dtype=np.float32)
+    patch_std = np.full(num_tracks, np.nan, dtype=np.float32)
 
     for track_idx, (x_coord, y_coord) in enumerate(zip(xs, ys)):
-        query_value = float(query_depth[y_coord, x_coord])
-        if not np.isfinite(query_value) or query_value <= min_depth or query_value >= max_depth:
-            continue
-
         y0 = max(0, y_coord - patch_radius)
         y1 = min(height, y_coord + patch_radius + 1)
         x0 = max(0, x_coord - patch_radius)
         x1 = min(width, x_coord + patch_radius + 1)
         patch = query_depth[y0:y1, x0:x1]
         patch_valid = np.isfinite(patch) & (patch > min_depth) & (patch < max_depth)
-
-        if patch_valid.size == 0 or float(patch_valid.mean()) < min_patch_valid_ratio:
-            continue
-
+        if patch_valid.size > 0:
+            patch_valid_ratio[track_idx] = float(patch_valid.mean())
         patch_values = patch[patch_valid]
         if patch_values.size == 0:
             continue
+        patch_median[track_idx] = float(np.median(patch_values))
+        patch_std[track_idx] = float(np.std(patch_values))
 
-        patch_median = float(np.median(patch_values))
-        deviation_limit = max(median_abs_threshold, median_rel_threshold * patch_median)
-        if abs(query_value - patch_median) > deviation_limit:
-            continue
+    return {
+        "xs": xs,
+        "ys": ys,
+        "query_values": query_values,
+        "query_valid": query_valid.astype(bool, copy=False),
+        "patch_valid_ratio": patch_valid_ratio.astype(np.float32),
+        "patch_median": patch_median.astype(np.float32),
+        "patch_std": patch_std.astype(np.float32),
+    }
 
-        valid_mask[track_idx] = True
 
-    return valid_mask
+def compute_query_depth_edge_risk_mask(
+    keypoints: np.ndarray,
+    query_depth: np.ndarray,
+    *,
+    min_depth: float,
+    max_depth: float,
+    edge_rtol: float = QUERY_DEPTH_EDGE_RTOL,
+    patch_radius: int = QUERY_DEPTH_PATCH_RADIUS,
+    min_patch_valid_ratio: float = QUERY_DEPTH_MIN_VALID_RATIO,
+    patch_std_threshold: float = QUERY_DEPTH_EDGE_PATCH_STD_THRESHOLD,
+    patch_stats: dict[str, np.ndarray] | None = None,
+) -> dict[str, np.ndarray]:
+    keypoints = np.asarray(keypoints, dtype=np.float32)
+    query_depth = np.asarray(query_depth, dtype=np.float32)
+    if query_depth.ndim != 2:
+        raise ValueError(f"Expected query_depth shape (H, W), got {query_depth.shape}")
+    if keypoints.ndim != 2 or keypoints.shape[1] != 2:
+        raise ValueError(f"Expected keypoints shape (N, 2), got {keypoints.shape}")
+
+    if patch_stats is None:
+        patch_stats = _compute_query_depth_patch_stats(
+            keypoints,
+            query_depth,
+            min_depth=min_depth,
+            max_depth=max_depth,
+            patch_radius=patch_radius,
+        )
+
+    xs = np.asarray(patch_stats["xs"]).astype(np.int32, copy=False)
+    ys = np.asarray(patch_stats["ys"]).astype(np.int32, copy=False)
+    query_valid = np.asarray(patch_stats["query_valid"]).astype(bool, copy=False)
+    patch_valid_ratio = np.asarray(patch_stats["patch_valid_ratio"]).astype(np.float32, copy=False)
+    patch_std = np.asarray(patch_stats["patch_std"]).astype(np.float32, copy=False)
+
+    valid_depth = np.isfinite(query_depth) & (query_depth > min_depth) & (query_depth < max_depth)
+    if query_depth.shape[0] == 0 or query_depth.shape[1] == 0:
+        query_edge_mask = np.zeros(keypoints.shape[0], dtype=bool)
+    else:
+        depth_in = query_depth.copy()
+        depth_in[~valid_depth] = 1e9
+        edge_mask = depth_edge(depth_in, rtol=edge_rtol, mask=valid_depth)
+        query_edge_mask = edge_mask[ys, xs]
+
+    risk_mask = (
+        query_valid
+        & query_edge_mask
+        & (patch_valid_ratio >= float(min_patch_valid_ratio))
+        & np.isfinite(patch_std)
+        & (patch_std >= float(patch_std_threshold))
+    )
+    return {
+        "mask": risk_mask.astype(bool),
+        "query_edge_mask": query_edge_mask.astype(bool),
+        "patch_valid_ratio": patch_valid_ratio.astype(np.float32),
+        "patch_std": patch_std.astype(np.float32),
+    }
 
 
 def compute_depth_volatility_map(
@@ -1049,6 +1189,16 @@ def build_traj_filter_result(
     traj = np.asarray(traj, dtype=np.float32)
     num_tracks, num_frames, _ = traj.shape
     config = resolve_traj_filter_config(filter_args)
+    profile = config["profile"]
+    if profile not in {
+        TRAJ_FILTER_PROFILE_EXTERNAL,
+        TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR,
+        TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR_V2,
+        TRAJ_FILTER_PROFILE_WRIST,
+        TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR_TOP95,
+        TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR,
+    }:
+        raise ValueError(f"Unsupported traj_filter_profile: {profile}")
 
     default_ratio = np.full(num_tracks, np.nan, dtype=np.float32)
     default_counts = np.zeros(num_tracks, dtype=np.uint16)
@@ -1062,6 +1212,9 @@ def build_traj_filter_result(
     default_cluster_id = np.full(num_tracks, -1, dtype=np.int16)
     default_component_size = np.zeros(num_tracks, dtype=np.uint16)
     default_fallback_used = np.asarray(False, dtype=bool)
+    default_query_depth_edge_mask = np.zeros(num_tracks, dtype=bool)
+    default_query_depth_patch_valid_ratio = np.full(num_tracks, np.nan, dtype=np.float32)
+    default_query_depth_patch_std = np.full(num_tracks, np.nan, dtype=np.float32)
 
     if not config["enabled"]:
         return {
@@ -1084,6 +1237,10 @@ def build_traj_filter_result(
             "traj_manipulator_cluster_id": default_cluster_id.copy(),
             "traj_manipulator_component_size": default_component_size.copy(),
             "traj_manipulator_cluster_fallback_used": default_fallback_used.copy(),
+            "traj_query_depth_edge_mask": default_query_depth_edge_mask.copy(),
+            "traj_query_depth_patch_valid_ratio": default_query_depth_patch_valid_ratio.copy(),
+            "traj_query_depth_patch_std": default_query_depth_patch_std.copy(),
+            "traj_query_depth_edge_risk_mask": default_query_depth_edge_mask.copy(),
         }
 
     visibility = _normalize_visibility(visibs, num_tracks=num_tracks, num_frames=num_frames)
@@ -1109,7 +1266,13 @@ def build_traj_filter_result(
         & np.asarray(base_geometry["depth_smooth_mask"]).astype(bool, copy=False)
     )
 
+    query_depth_quality_mask = np.ones(num_tracks, dtype=bool)
     query_depth_mask = np.ones(num_tracks, dtype=bool)
+    query_depth_patch_stats: dict[str, np.ndarray] | None = None
+    traj_query_depth_edge_mask = default_query_depth_edge_mask.copy()
+    traj_query_depth_patch_valid_ratio = default_query_depth_patch_valid_ratio.copy()
+    traj_query_depth_patch_std = default_query_depth_patch_std.copy()
+    traj_query_depth_edge_risk_mask = default_query_depth_edge_mask.copy()
     if config["use_query_depth_quality"]:
         if keypoints is None or query_depth is None:
             raise ValueError("keypoints and query_depth are required when query-depth quality filtering is enabled")
@@ -1117,12 +1280,45 @@ def build_traj_filter_result(
             raise ValueError(
                 f"Expected keypoints and trajectories to share track count, got {keypoints.shape[0]} and {traj.shape[0]}"
             )
-        query_depth_mask = compute_query_depth_quality_mask(
+        query_depth_patch_stats = _compute_query_depth_patch_stats(
             keypoints,
             query_depth,
             min_depth=config["min_depth"],
             max_depth=config["max_depth"],
         )
+        query_depth_quality_mask = compute_query_depth_quality_mask(
+            keypoints,
+            query_depth,
+            min_depth=config["min_depth"],
+            max_depth=config["max_depth"],
+            patch_stats=query_depth_patch_stats,
+        )
+        query_depth_mask = query_depth_quality_mask.copy()
+        if profile in {
+            TRAJ_FILTER_PROFILE_WRIST,
+            TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR_TOP95,
+            TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR,
+        }:
+            query_depth_edge_result = compute_query_depth_edge_risk_mask(
+                keypoints,
+                query_depth,
+                min_depth=config["min_depth"],
+                max_depth=config["max_depth"],
+                patch_stats=query_depth_patch_stats,
+            )
+            traj_query_depth_edge_mask = np.asarray(query_depth_edge_result["query_edge_mask"]).astype(
+                bool, copy=False
+            )
+            traj_query_depth_patch_valid_ratio = np.asarray(
+                query_depth_edge_result["patch_valid_ratio"]
+            ).astype(np.float32, copy=False)
+            traj_query_depth_patch_std = np.asarray(query_depth_edge_result["patch_std"]).astype(
+                np.float32, copy=False
+            )
+            traj_query_depth_edge_risk_mask = np.asarray(query_depth_edge_result["mask"]).astype(
+                bool, copy=False
+            )
+            query_depth_mask &= ~traj_query_depth_edge_risk_mask
 
     temporal_mask = np.ones(num_tracks, dtype=bool)
     depth_consistency_ratio = default_ratio.copy()
@@ -1183,15 +1379,6 @@ def build_traj_filter_result(
     supervision_count = supervision_mask.sum(axis=1).astype(np.uint16)
 
     reason_bits = np.zeros(num_tracks, dtype=np.uint8)
-    profile = config["profile"]
-    if profile not in {
-        TRAJ_FILTER_PROFILE_EXTERNAL,
-        TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR,
-        TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR_V2,
-        TRAJ_FILTER_PROFILE_WRIST,
-        TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR,
-    }:
-        raise ValueError(f"Unsupported traj_filter_profile: {profile}")
 
     wrist_seed_mask = default_manipulator_mask.copy()
     traj_query_depth_rank = default_manipulator_rank.copy()
@@ -1293,7 +1480,8 @@ def build_traj_filter_result(
             supervision_count >= required_support_frames
         )
         reason_bits[~wrist_base_mask] |= MASK_REASON_BASE_GEOMETRY_FAIL
-        reason_bits[~query_depth_mask] |= MASK_REASON_QUERY_DEPTH_FAIL
+        reason_bits[~query_depth_quality_mask] |= MASK_REASON_QUERY_DEPTH_FAIL
+        reason_bits[traj_query_depth_edge_risk_mask] |= MASK_REASON_QUERY_DEPTH_EDGE_FAIL
         reason_bits[~supervision_support_mask] |= MASK_REASON_TEMPORAL_CONSISTENCY_FAIL
         wrist_seed_mask = wrist_base_mask & query_depth_mask & supervision_support_mask
 
@@ -1307,7 +1495,7 @@ def build_traj_filter_result(
                 expected_num_frames=num_frames,
             )
             (
-                final_mask,
+                manipulator_final_mask,
                 traj_query_depth_rank,
                 traj_motion_extent,
                 traj_motion_step_median,
@@ -1339,7 +1527,15 @@ def build_traj_filter_result(
 
             reason_bits[wrist_seed_mask & (~near_depth_mask)] |= MASK_REASON_MANIPULATOR_DEPTH_FAIL
             reason_bits[wrist_seed_mask & (~motion_mask)] |= MASK_REASON_MANIPULATOR_MOTION_FAIL
-            reason_bits[traj_manipulator_candidate_mask & (~final_mask)] |= MASK_REASON_MANIPULATOR_CLUSTER_FAIL
+            reason_bits[traj_manipulator_candidate_mask & (~manipulator_final_mask)] |= MASK_REASON_MANIPULATOR_CLUSTER_FAIL
+            if profile == TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR_TOP95:
+                final_mask = _apply_top_motion_extent_filter(
+                    seed_mask=manipulator_final_mask,
+                    motion_extent=traj_motion_extent,
+                    keep_ratio=config["wrist_manipulator_top95_keep_ratio"],
+                )
+            else:
+                final_mask = manipulator_final_mask
 
     return {
         "traj_valid_mask": final_mask.astype(bool),
@@ -1363,6 +1559,10 @@ def build_traj_filter_result(
         "traj_manipulator_cluster_fallback_used": np.asarray(
             traj_manipulator_cluster_fallback_used, dtype=bool
         ),
+        "traj_query_depth_edge_mask": traj_query_depth_edge_mask.astype(bool),
+        "traj_query_depth_patch_valid_ratio": traj_query_depth_patch_valid_ratio.astype(np.float32),
+        "traj_query_depth_patch_std": traj_query_depth_patch_std.astype(np.float32),
+        "traj_query_depth_edge_risk_mask": traj_query_depth_edge_risk_mask.astype(bool),
     }
 
 

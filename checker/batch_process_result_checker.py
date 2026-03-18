@@ -23,6 +23,7 @@ from utils.traceforge_artifact_utils import (
     SceneReader,
     build_sample_visualization_view,
     detect_output_layout,
+    is_traceforge_output_complete,
     list_sample_query_frames,
     normalize_sample_data,
 )
@@ -92,10 +93,8 @@ class BatchProcessChecker:
 
         layout = detect_output_layout(video_dir)
         if layout == "v2":
-            required = ["scene.h5", "scene_meta.json", "scene_rgb.mp4"]
-            missing = [name for name in required if not (video_dir / name).is_file()]
-            if missing:
-                self.log_warning(f"Missing v2 artifacts in {video_name}: {missing}")
+            if not is_traceforge_output_complete(video_dir):
+                self.log_warning(f"Incomplete v2 artifacts in {video_name}")
                 return False
         else:
             images_dir = video_dir / "images"

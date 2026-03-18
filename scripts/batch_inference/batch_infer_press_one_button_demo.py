@@ -104,7 +104,7 @@ def resolve_traj_filter_profile(camera_name: str, requested_profile: str) -> str
         or "wrist" in camera_name
         or "hand" in camera_name
     ):
-        return "wrist"
+        return "wrist_manipulator_top95"
     return "external"
 
 
@@ -248,6 +248,16 @@ def parse_args() -> argparse.Namespace:
         help="Artifact layout to write for each camera output.",
     )
     parser.add_argument(
+        "--scene_storage_mode",
+        type=str,
+        default="source_ref",
+        choices=["source_ref", "cache"],
+        help=(
+            "Storage backend for v2 artifacts. source_ref is the default and stores source RGB/depth/geometry "
+            "references in scene_meta.json; cache writes local scene.h5 and scene_rgb.mp4."
+        ),
+    )
+    parser.add_argument(
         "--save_visibility",
         action="store_true",
         default=False,
@@ -293,10 +303,20 @@ def parse_args() -> argparse.Namespace:
         "--traj_filter_profile",
         type=str,
         default="auto",
-        choices=["auto", "external", "external_manipulator", "external_manipulator_v2", "wrist", "wrist_manipulator"],
+        choices=[
+            "auto",
+            "external",
+            "external_manipulator",
+            "external_manipulator_v2",
+            "wrist",
+            "wrist_manipulator_top95",
+            "wrist_manipulator",
+        ],
         help=(
-            "Trajectory filtering profile. auto maps wrist-like camera names to wrist and others to external; "
-            "external_manipulator, external_manipulator_v2, and wrist_manipulator must be requested explicitly."
+            "Trajectory filtering profile. auto maps wrist-like camera names to wrist_manipulator_top95 "
+            "and others to external; "
+            "external_manipulator, external_manipulator_v2, wrist_manipulator_top95, and wrist_manipulator "
+            "must be requested explicitly."
         ),
     )
     parser.add_argument(
@@ -569,6 +589,7 @@ def build_worker_cmd(
         "--max_frames_per_video", str(args.max_frames_per_video),
         "--grid_size", str(args.grid_size),
         "--output_layout", args.output_layout,
+        "--scene_storage_mode", args.scene_storage_mode,
         "--filter_level", args.filter_level,
         "--traj_filter_profile", args.traj_filter_profile,
         "--min_depth", str(args.min_depth),
@@ -801,6 +822,7 @@ def save_result(
             depth_conf=result["depth_conf"],
             video_source_path=str(episode_dir / "rgb" / camera_name),
             depth_source_path=str(episode_dir / "depth" / camera_name),
+            source_frame_indices=result["source_frame_indices"],
         )
     finally:
         if save_lock is not None:

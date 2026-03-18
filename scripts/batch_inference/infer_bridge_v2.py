@@ -106,6 +106,16 @@ def parse_args():
         help="Artifact layout to write for each camera output.",
     )
     parser.add_argument(
+        "--scene_storage_mode",
+        type=str,
+        default=getattr(infer, "DEFAULT_SCENE_STORAGE_MODE", "source_ref"),
+        choices=["source_ref", "cache"],
+        help=(
+            "Storage backend for v2 artifacts. source_ref is the global default, but non-external pipelines "
+            "must switch to cache explicitly."
+        ),
+    )
+    parser.add_argument(
         "--save_visibility",
         action="store_true",
         default=False,
@@ -328,6 +338,7 @@ def run_traj(
             depth_conf=result["depth_conf"],
             video_source_path=video_path,
             depth_source_path=depth_path,
+            source_frame_indices=result["source_frame_indices"],
         )
 
 

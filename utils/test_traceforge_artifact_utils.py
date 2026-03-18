@@ -1,12 +1,21 @@
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 from utils.traceforge_artifact_utils import (
+    SCENE_STORAGE_SOURCE_REF,
+    SceneReader,
     build_pointcloud_from_frame,
     build_sample_visualization_view,
+    detect_output_layout,
+    is_traceforge_output_complete,
+    normalize_sample_data,
+    write_scene_meta,
 )
 
 
@@ -189,6 +198,136 @@ class BuildSampleVisualizationViewTests(unittest.TestCase):
         )
         self.assertTrue(np.isnan(view["traj_uvz"][0, 1]).all())
         np.testing.assert_array_equal(view["rendered_frame_count"], np.array([2], dtype=np.uint16))
+
+
+class NormalizeSampleDataTests(unittest.TestCase):
+    def test_reads_query_depth_edge_debug_fields_from_v2_sample(self):
+        traj_uvz = np.array([[[1.0, 1.0, 1.0]]], dtype=np.float32)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sample_path = Path(tmpdir) / "sample.npz"
+            np.savez(
+                sample_path,
+                traj_uvz=traj_uvz,
+                keypoints=np.array([[1.0, 1.0]], dtype=np.float32),
+                query_frame_index=np.array([0], dtype=np.int32),
+                segment_frame_indices=np.array([0], dtype=np.int32),
+                traj_query_depth_edge_mask=np.array([True], dtype=bool),
+                traj_query_depth_patch_valid_ratio=np.array([1.0], dtype=np.float16),
+                traj_query_depth_patch_std=np.array([0.01], dtype=np.float16),
+                traj_query_depth_edge_risk_mask=np.array([True], dtype=bool),
+            )
+
+            sample = normalize_sample_data(sample_path)
+
+        np.testing.assert_array_equal(sample["traj_query_depth_edge_mask"], np.array([True]))
+        np.testing.assert_array_equal(sample["traj_query_depth_edge_risk_mask"], np.array([True]))
+        np.testing.assert_array_equal(
+            sample["traj_query_depth_patch_valid_ratio"],
+            np.array([1.0], dtype=np.float16),
+        )
+        np.testing.assert_array_equal(
+            sample["traj_query_depth_patch_std"],
+            np.array([0.01], dtype=np.float16),
+        )
+
+
+def _write_rgb_png(path: Path, value: int, *, hw: tuple[int, int] = (2, 3)) -> None:
+    image = np.full((*hw, 3), value, dtype=np.uint8)
+    Image.fromarray(image).save(path)
+
+
+class SourceRefArtifactTests(unittest.TestCase):
+    def _build_source_ref_episode(self, tmpdir: str) -> tuple[Path, np.ndarray, np.ndarray]:
+        root = Path(tmpdir)
+        episode_dir = root / "camera"
+        samples_dir = episode_dir / "samples"
+        rgb_dir = root / "rgb"
+        depth_dir = root / "depth"
+        geom_path = root / "geom.npz"
+
+        samples_dir.mkdir(parents=True, exist_ok=True)
+        rgb_dir.mkdir(parents=True, exist_ok=True)
+        depth_dir.mkdir(parents=True, exist_ok=True)
+
+        for idx, value in enumerate((10, 20, 30)):
+            _write_rgb_png(rgb_dir / f"{idx:05d}.png", value)
+            np.save(depth_dir / f"{idx:05d}.npy", np.full((2, 3), float(idx + 1), dtype=np.float32))
+
+        intrinsics = np.stack(
+            [
+                np.array([[1.0 + idx, 0.0, 2.0], [0.0, 1.5 + idx, 1.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+                for idx in range(3)
+            ],
+            axis=0,
+        )
+        extrinsics = np.repeat(np.eye(4, dtype=np.float32)[None], 3, axis=0)
+        extrinsics[:, 0, 3] = np.array([0.0, 1.0, 2.0], dtype=np.float32)
+        np.savez(geom_path, intrinsics=intrinsics, extrinsics=extrinsics)
+
+        np.savez(
+            samples_dir / "camera_0.npz",
+            traj_uvz=np.array([[[1.0, 1.0, 1.0]]], dtype=np.float32),
+            keypoints=np.array([[1.0, 1.0]], dtype=np.float32),
+            query_frame_index=np.array([0], dtype=np.int32),
+            segment_frame_indices=np.array([0], dtype=np.int32),
+        )
+        write_scene_meta(
+            episode_dir / "scene_meta.json",
+            {
+                "layout_version": 2,
+                "video_name": "camera",
+                "frame_count": 2,
+                "height": 2,
+                "width": 3,
+                "extrinsics_mode": "w2c",
+                "frame_drop_rate": 1,
+                "future_len": 16,
+                "original_filenames": ["00002", "00000"],
+                "scene_storage_mode": SCENE_STORAGE_SOURCE_REF,
+                "scene_h5_path": None,
+                "rgb_cache_path": None,
+                "source_rgb_path": str(rgb_dir),
+                "source_depth_path": str(depth_dir),
+                "source_geom_path": str(geom_path),
+                "source_camera_name": "camera",
+                "source_extrinsics_mode": "w2c",
+                "depth_pose_method": "external",
+                "source_frame_indices": [2, 0],
+            },
+        )
+        return episode_dir, intrinsics, extrinsics
+
+    def test_detect_output_layout_accepts_source_ref_v2(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            episode_dir, _, _ = self._build_source_ref_episode(tmpdir)
+            self.assertEqual(detect_output_layout(episode_dir), "v2")
+            self.assertTrue(is_traceforge_output_complete(episode_dir))
+
+    def test_source_ref_complete_requires_existing_source_paths(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            episode_dir, _, _ = self._build_source_ref_episode(tmpdir)
+            geom_path = Path(tmpdir) / "geom.npz"
+            geom_path.unlink()
+            self.assertFalse(is_traceforge_output_complete(episode_dir))
+
+    def test_scene_reader_reads_source_ref_rgb_depth_and_geometry(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            episode_dir, intrinsics, extrinsics = self._build_source_ref_episode(tmpdir)
+            with SceneReader(episode_dir) as reader:
+                intrinsics_sel, extrinsics_sel = reader.get_camera_arrays()
+                rgb0 = reader.get_rgb_frame(0)
+                rgb1 = reader.get_rgb_frame(1)
+                depth0 = reader.get_depth_frame(0)
+                depth1 = reader.get_depth_frame(1)
+
+            np.testing.assert_allclose(intrinsics_sel[0], intrinsics[2])
+            np.testing.assert_allclose(intrinsics_sel[1], intrinsics[0])
+            np.testing.assert_allclose(extrinsics_sel[0], extrinsics[2])
+            np.testing.assert_allclose(extrinsics_sel[1], extrinsics[0])
+            self.assertEqual(int(rgb0[0, 0, 0]), 30)
+            self.assertEqual(int(rgb1[0, 0, 0]), 10)
+            np.testing.assert_allclose(depth0, np.full((2, 3), 3.0, dtype=np.float32))
+            np.testing.assert_allclose(depth1, np.full((2, 3), 1.0, dtype=np.float32))
 
 
 if __name__ == "__main__":
