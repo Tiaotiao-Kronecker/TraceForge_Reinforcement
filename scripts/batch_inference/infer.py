@@ -37,7 +37,12 @@ from utils.threed_utils import (
     project_tracks_3d_to_2d,
     project_tracks_3d_to_3d,
 )
-from utils.traj_filter_utils import build_traj_filter_result, compute_depth_volatility_map
+from utils.traj_filter_utils import (
+    build_traj_filter_result,
+    compute_accessed_high_volatility_mask,
+    prepare_temporal_depth_consistency_context,
+    resolve_traj_filter_config,
+)
 from utils.keyframe_schedule_utils import map_query_source_indices_to_local
 
 def parse_args():
@@ -416,15 +421,15 @@ def _build_grid_keypoints(frame_h: int, frame_w: int, grid_size: int) -> np.ndar
     return np.stack([xx.flatten(), yy.flatten()], axis=1).astype(np.float32)
 
 
-def build_query_frame_sample_data(
+def prepare_query_frame_sample_bundle(
     *,
     query_frame_idx: int,
     frame_data,
     grid_size: int,
     filter_args=None,
-    save_visibility: bool = False,
+    filter_config: dict | None = None,
     raw_depths_segment: np.ndarray | None = None,
-    depth_volatility_map: np.ndarray | None = None,
+    prepare_temporal_context: bool = False,
 ):
     coords_np = _tensor_to_numpy(frame_data["coords"])
     visibs_np = _tensor_to_numpy(frame_data["visibs"])
@@ -438,6 +443,11 @@ def build_query_frame_sample_data(
     frame_h, frame_w = video_segment.shape[1:3]
     keypoints = _build_grid_keypoints(frame_h, frame_w, grid_size)
     query_frame_depth = depths_segment[0]
+    raw_depths_segment_np = (
+        np.asarray(raw_depths_segment, dtype=np.float32)
+        if raw_depths_segment is not None
+        else depths_segment.astype(np.float32, copy=False)
+    )
     fixed_camera_view = {
         "c2w": np.linalg.inv(extrinsics_np[0]),
         "K": intrinsics_np[0],
@@ -460,6 +470,57 @@ def build_query_frame_sample_data(
         traj_uvz = coords_np.transpose(1, 0, 2).astype(np.float32)
 
     traj_uvz = filter_anomalous_trajectories(traj_uvz)
+    if filter_config is None:
+        filter_config = resolve_traj_filter_config(filter_args)
+
+    temporal_compare_context = None
+    if prepare_temporal_context:
+        temporal_compare_context = prepare_temporal_depth_consistency_context(
+            traj_uvz,
+            visibs=visibs_np,
+            raw_depths_segment=raw_depths_segment_np,
+            intrinsics_segment=intrinsics_np,
+            extrinsics_segment=extrinsics_np,
+            min_depth=float(filter_config["min_depth"]),
+            max_depth=float(filter_config["max_depth"]),
+            depth_abs_tol=float(filter_config["temporal_depth_abs_tol"]),
+            depth_rel_tol=float(filter_config["temporal_depth_rel_tol"]),
+            include_reprojected_uvz=False,
+        )
+
+    return {
+        "query_frame_idx": int(query_frame_idx),
+        "traj_uvz": traj_uvz.astype(np.float32),
+        "traj_2d": tracks2d_fixed.astype(np.float32),
+        "keypoints": keypoints.astype(np.float32),
+        "visibs": visibs_np,
+        "query_frame_img": video_segment[0],
+        "query_frame_depth": query_frame_depth.astype(np.float32),
+        "raw_depths_segment": raw_depths_segment_np.astype(np.float32, copy=False),
+        "intrinsics_segment": intrinsics_np.astype(np.float32, copy=False),
+        "extrinsics_segment": extrinsics_np.astype(np.float32, copy=False),
+        "temporal_compare_context": temporal_compare_context,
+    }
+
+
+def build_query_frame_sample_data(
+    *,
+    prepared_bundle,
+    filter_args=None,
+    save_visibility: bool = False,
+    high_volatility_mask: np.ndarray | None = None,
+):
+    traj_uvz = np.asarray(prepared_bundle["traj_uvz"], dtype=np.float32)
+    traj_2d = np.asarray(prepared_bundle["traj_2d"], dtype=np.float32)
+    keypoints = np.asarray(prepared_bundle["keypoints"], dtype=np.float32)
+    visibs_np = np.asarray(prepared_bundle["visibs"])
+    query_frame_idx = int(prepared_bundle["query_frame_idx"])
+    query_frame_depth = np.asarray(prepared_bundle["query_frame_depth"], dtype=np.float32)
+    raw_depths_segment = np.asarray(prepared_bundle["raw_depths_segment"], dtype=np.float32)
+    intrinsics_np = np.asarray(prepared_bundle["intrinsics_segment"], dtype=np.float32)
+    extrinsics_np = np.asarray(prepared_bundle["extrinsics_segment"], dtype=np.float32)
+    frame_h, frame_w = query_frame_depth.shape
+
     traj_filter_result = build_traj_filter_result(
         traj=traj_uvz,
         visibs=visibs_np,
@@ -471,11 +532,12 @@ def build_query_frame_sample_data(
         raw_depths_segment=raw_depths_segment,
         intrinsics_segment=intrinsics_np,
         extrinsics_segment=extrinsics_np,
-        depth_volatility_map=depth_volatility_map,
+        high_volatility_mask=high_volatility_mask,
+        temporal_compare_context=prepared_bundle.get("temporal_compare_context"),
     )
     sample_payload = {
         "traj_uvz": traj_uvz.astype(np.float32),
-        "traj_2d": tracks2d_fixed.astype(np.float32),
+        "traj_2d": traj_2d.astype(np.float32),
         "keypoints": keypoints,
         "query_frame_index": np.array([query_frame_idx], dtype=np.int32),
         "segment_frame_indices": query_frame_idx + np.arange(traj_uvz.shape[1], dtype=np.int32),
@@ -519,9 +581,58 @@ def build_query_frame_sample_data(
 
     return {
         "sample_payload": sample_payload,
-        "query_frame_img": video_segment[0],
+        "query_frame_img": np.asarray(prepared_bundle["query_frame_img"]),
         "query_frame_depth": query_frame_depth,
     }
+
+
+def _prepare_query_frame_sample_bundles(
+    *,
+    query_frame_results,
+    grid_size: int,
+    filter_args,
+    filter_config: dict,
+    full_depths: np.ndarray | None,
+) -> dict[int, dict[str, object]]:
+    prepare_temporal_context = bool(filter_config["enabled"] and filter_config["use_temporal_depth_consistency"])
+    prepared_bundles: dict[int, dict[str, object]] = {}
+    for query_frame_idx, frame_data in query_frame_results.items():
+        segment_len = int(frame_data["coords"].shape[0])
+        raw_depths_segment = (
+            np.asarray(full_depths[query_frame_idx : query_frame_idx + segment_len], dtype=np.float32)
+            if full_depths is not None
+            else None
+        )
+        prepared_bundles[query_frame_idx] = prepare_query_frame_sample_bundle(
+            query_frame_idx=query_frame_idx,
+            frame_data=frame_data,
+            grid_size=grid_size,
+            filter_args=filter_args,
+            filter_config=filter_config,
+            raw_depths_segment=raw_depths_segment,
+            prepare_temporal_context=prepare_temporal_context,
+        )
+    return prepared_bundles
+
+
+def _build_accessed_pixel_mask(
+    prepared_bundles: dict[int, dict[str, object]],
+    *,
+    image_height: int,
+    image_width: int,
+) -> np.ndarray:
+    accessed_pixel_mask = np.zeros((image_height, image_width), dtype=bool)
+    for prepared_bundle in prepared_bundles.values():
+        temporal_compare_context = prepared_bundle.get("temporal_compare_context")
+        if temporal_compare_context is None:
+            continue
+        compare_mask = np.asarray(temporal_compare_context["compare_mask"]).astype(bool, copy=False)
+        if not np.any(compare_mask):
+            continue
+        xs_clip = np.asarray(temporal_compare_context["xs_clip"]).astype(np.int32, copy=False)
+        ys_clip = np.asarray(temporal_compare_context["ys_clip"]).astype(np.int32, copy=False)
+        accessed_pixel_mask[ys_clip[compare_mask], xs_clip[compare_mask]] = True
+    return accessed_pixel_mask
 
 
 def save_single_query_frame_legacy(
@@ -529,12 +640,10 @@ def save_single_query_frame_legacy(
     video_name,
     output_dir,
     query_frame_idx,
-    frame_data,
+    prepared_bundle,
     future_len: int,
-    grid_size: int,
     filter_args=None,
-    full_depths: np.ndarray | None = None,
-    depth_volatility_map: np.ndarray | None = None,
+    high_volatility_mask: np.ndarray | None = None,
 ):
     video_output_dir = os.path.join(output_dir, video_name)
     images_dir = os.path.join(video_output_dir, "images")
@@ -543,20 +652,11 @@ def save_single_query_frame_legacy(
     for dir_path in [images_dir, depth_dir, samples_dir]:
         os.makedirs(dir_path, exist_ok=True)
 
-    segment_len = int(frame_data["coords"].shape[0])
-    raw_depths_segment = (
-        np.asarray(full_depths[query_frame_idx : query_frame_idx + segment_len], dtype=np.float32)
-        if full_depths is not None
-        else None
-    )
     bundle = build_query_frame_sample_data(
-        query_frame_idx=query_frame_idx,
-        frame_data=frame_data,
-        grid_size=grid_size,
+        prepared_bundle=prepared_bundle,
         filter_args=filter_args,
         save_visibility=getattr(filter_args, "save_visibility", False),
-        raw_depths_segment=raw_depths_segment,
-        depth_volatility_map=depth_volatility_map,
+        high_volatility_mask=high_volatility_mask,
     )
     sample_payload = bundle["sample_payload"]
     traj = sample_payload["traj_uvz"]
@@ -642,30 +742,19 @@ def save_single_query_frame_v2(
     video_name,
     output_dir,
     query_frame_idx,
-    frame_data,
-    grid_size: int,
+    prepared_bundle,
     filter_args=None,
-    full_depths: np.ndarray | None = None,
-    depth_volatility_map: np.ndarray | None = None,
+    high_volatility_mask: np.ndarray | None = None,
 ):
     video_output_dir = os.path.join(output_dir, video_name)
     samples_dir = os.path.join(video_output_dir, "samples")
     os.makedirs(samples_dir, exist_ok=True)
 
-    segment_len = int(frame_data["coords"].shape[0])
-    raw_depths_segment = (
-        np.asarray(full_depths[query_frame_idx : query_frame_idx + segment_len], dtype=np.float32)
-        if full_depths is not None
-        else None
-    )
     bundle = build_query_frame_sample_data(
-        query_frame_idx=query_frame_idx,
-        frame_data=frame_data,
-        grid_size=grid_size,
+        prepared_bundle=prepared_bundle,
         filter_args=filter_args,
         save_visibility=getattr(filter_args, "save_visibility", False),
-        raw_depths_segment=raw_depths_segment,
-        depth_volatility_map=depth_volatility_map,
+        high_volatility_mask=high_volatility_mask,
     )
     sample_payload = bundle["sample_payload"]
     sample_data = {
@@ -767,6 +856,11 @@ def save_structured_data(
         )
 
     logger.info(f"Saving {len(query_frame_results)} query frame results using layout={layout}")
+    filter_config = resolve_traj_filter_config(filter_args)
+    use_temporal_depth_consistency = bool(filter_config["enabled"] and filter_config["use_temporal_depth_consistency"])
+    use_depth_volatility_guidance = bool(
+        use_temporal_depth_consistency and filter_config["use_depth_volatility_guidance"]
+    )
     if layout == V2_LAYOUT:
         if full_video_tensor is None or full_depths is None or full_intrinsics is None or full_extrinsics is None:
             raise ValueError("v2 output requires full_video_tensor/full_depths/full_intrinsics/full_extrinsics")
@@ -790,11 +884,29 @@ def save_structured_data(
                 f"Expected source_frame_indices shape {(frame_count,)}, got {source_frame_indices_np.shape}"
             )
 
-        depth_volatility_map = compute_depth_volatility_map(
-            full_depths_np,
-            min_depth=float(getattr(filter_args, "min_depth", 0.01)),
-            max_depth=float(getattr(filter_args, "max_depth", 10.0)),
+        prepared_bundles = _prepare_query_frame_sample_bundles(
+            query_frame_results=query_frame_results,
+            grid_size=grid_size,
+            filter_args=filter_args,
+            filter_config=filter_config,
+            full_depths=full_depths_np,
         )
+        high_volatility_mask = None
+        if use_depth_volatility_guidance:
+            accessed_pixel_mask = _build_accessed_pixel_mask(
+                prepared_bundles,
+                image_height=int(full_depths_np.shape[1]),
+                image_width=int(full_depths_np.shape[2]),
+            )
+            high_volatility_mask, _ = compute_accessed_high_volatility_mask(
+                full_depths_np,
+                accessed_pixel_mask=accessed_pixel_mask,
+                min_depth=float(filter_config["min_depth"]),
+                max_depth=float(filter_config["max_depth"]),
+                low_percentile=float(filter_config["volatility_low_percentile"]),
+                high_percentile=float(filter_config["volatility_high_percentile"]),
+                mask_percentile=float(filter_config["volatility_mask_percentile"]),
+            )
         scene_h5_relpath = "scene.h5" if scene_storage_mode == SCENE_STORAGE_CACHE else None
         rgb_cache_relpath = "scene_rgb.mp4" if scene_storage_mode == SCENE_STORAGE_CACHE else None
         source_geom_path = getattr(filter_args, "external_geom_npz", None) if filter_args is not None else None
@@ -844,40 +956,52 @@ def save_structured_data(
                 "query_frame_schedule_episode_fps": query_frame_metadata.get("query_frame_schedule_episode_fps"),
             },
         )
-        for query_frame_idx, frame_data in query_frame_results.items():
+        for query_frame_idx, prepared_bundle in prepared_bundles.items():
             save_single_query_frame_v2(
                 video_name=video_name,
                 output_dir=output_dir,
                 query_frame_idx=query_frame_idx,
-                frame_data=frame_data,
-                grid_size=grid_size,
+                prepared_bundle=prepared_bundle,
                 filter_args=filter_args,
-                full_depths=full_depths_np,
-                depth_volatility_map=depth_volatility_map,
+                high_volatility_mask=high_volatility_mask,
             )
         return
 
     full_depths_np = _tensor_to_numpy(full_depths).astype(np.float32) if full_depths is not None else None
-    depth_volatility_map = (
-        compute_depth_volatility_map(
-            full_depths_np,
-            min_depth=float(getattr(filter_args, "min_depth", 0.01)),
-            max_depth=float(getattr(filter_args, "max_depth", 10.0)),
-        )
-        if full_depths_np is not None
-        else None
+    prepared_bundles = _prepare_query_frame_sample_bundles(
+        query_frame_results=query_frame_results,
+        grid_size=grid_size,
+        filter_args=filter_args,
+        filter_config=filter_config,
+        full_depths=full_depths_np,
     )
-    for query_frame_idx, frame_data in query_frame_results.items():
+    high_volatility_mask = None
+    if use_depth_volatility_guidance:
+        if full_depths_np is None:
+            raise ValueError("full_depths is required when depth volatility guidance is enabled")
+        accessed_pixel_mask = _build_accessed_pixel_mask(
+            prepared_bundles,
+            image_height=int(full_depths_np.shape[1]),
+            image_width=int(full_depths_np.shape[2]),
+        )
+        high_volatility_mask, _ = compute_accessed_high_volatility_mask(
+            full_depths_np,
+            accessed_pixel_mask=accessed_pixel_mask,
+            min_depth=float(filter_config["min_depth"]),
+            max_depth=float(filter_config["max_depth"]),
+            low_percentile=float(filter_config["volatility_low_percentile"]),
+            high_percentile=float(filter_config["volatility_high_percentile"]),
+            mask_percentile=float(filter_config["volatility_mask_percentile"]),
+        )
+    for query_frame_idx, prepared_bundle in prepared_bundles.items():
         save_single_query_frame_legacy(
             video_name=video_name,
             output_dir=output_dir,
             query_frame_idx=query_frame_idx,
-            frame_data=frame_data,
+            prepared_bundle=prepared_bundle,
             future_len=future_len,
-            grid_size=grid_size,
             filter_args=filter_args,
-            full_depths=full_depths_np,
-            depth_volatility_map=depth_volatility_map,
+            high_volatility_mask=high_volatility_mask,
         )
 
     main_npz = {

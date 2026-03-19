@@ -13,7 +13,10 @@ from utils.traj_filter_utils import (
     MASK_REASON_TEMPORAL_CONSISTENCY_FAIL,
     build_traj_filter_result,
     build_traj_valid_mask,
+    compute_accessed_high_volatility_mask,
+    compute_depth_volatility_map,
     compute_query_depth_quality_mask,
+    prepare_temporal_depth_consistency_context,
 )
 
 
@@ -1021,6 +1024,144 @@ class BuildTrajValidMaskTests(unittest.TestCase):
         np.testing.assert_array_equal(result["traj_manipulator_cluster_id"], np.array([-1], dtype=np.int16))
         np.testing.assert_array_equal(result["traj_manipulator_component_size"], np.array([0], dtype=np.uint16))
         self.assertFalse(bool(np.asarray(result["traj_manipulator_cluster_fallback_used"]).reshape(-1)[0]))
+
+
+class DepthVolatilityHelperTests(unittest.TestCase):
+    def test_joint_percentile_matches_two_pass_baseline(self):
+        full_depths = np.array(
+            [
+                [[1.0, 2.0], [3.0, np.nan]],
+                [[2.0, 3.0], [4.0, 0.0]],
+                [[3.0, 4.0], [5.0, 12.0]],
+                [[4.0, 5.0], [6.0, 1.0]],
+            ],
+            dtype=np.float32,
+        )
+        min_depth = 0.5
+        max_depth = 10.0
+
+        actual = compute_depth_volatility_map(
+            full_depths,
+            min_depth=min_depth,
+            max_depth=max_depth,
+            low_percentile=5.0,
+            high_percentile=95.0,
+        )
+
+        valid = np.isfinite(full_depths) & (full_depths > min_depth) & (full_depths < max_depth)
+        depths_nan = np.where(valid, full_depths, np.nan)
+        with np.errstate(invalid="ignore"):
+            expected_lo = np.nanpercentile(depths_nan, 5.0, axis=0)
+            expected_hi = np.nanpercentile(depths_nan, 95.0, axis=0)
+        expected = np.nan_to_num(expected_hi - expected_lo, nan=0.0, posinf=0.0, neginf=0.0)
+        expected[valid.sum(axis=0) < 2] = 0.0
+
+        np.testing.assert_allclose(actual, expected.astype(np.float32), atol=1e-6, rtol=0.0)
+
+    def test_accessed_high_volatility_mask_only_uses_accessed_pixels(self):
+        full_depths = np.array(
+            [
+                [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]],
+                [[1.0, 1.0, 9.0], [1.0, 2.0, 1.0]],
+                [[1.0, 1.0, 1.0], [1.0, 3.0, 1.0]],
+                [[1.0, 1.0, 9.0], [1.0, 4.0, 1.0]],
+            ],
+            dtype=np.float32,
+        )
+        accessed_pixel_mask = np.array(
+            [
+                [True, False, False],
+                [False, True, False],
+            ],
+            dtype=bool,
+        )
+
+        high_volatility_mask, threshold = compute_accessed_high_volatility_mask(
+            full_depths,
+            accessed_pixel_mask=accessed_pixel_mask,
+            min_depth=0.01,
+            max_depth=10.0,
+            low_percentile=5.0,
+            high_percentile=95.0,
+            mask_percentile=50.0,
+        )
+
+        expected_mask = np.array(
+            [
+                [False, False, False],
+                [False, True, False],
+            ],
+            dtype=bool,
+        )
+        np.testing.assert_array_equal(high_volatility_mask, expected_mask)
+        self.assertAlmostEqual(float(threshold), 1.35, places=6)
+
+    def test_precomputed_temporal_context_matches_direct_temporal_evaluation(self):
+        fixture = _make_base_fixture(u_values=[1.0, 2.0, 3.0, 5.0])
+        high_volatility_mask = np.zeros(
+            (fixture["image_height"], fixture["image_width"]),
+            dtype=bool,
+        )
+        high_volatility_mask[2, 5] = True
+        fixture["raw_depths_segment"][3, 2, 5] = 2.0
+
+        precomputed_context = prepare_temporal_depth_consistency_context(
+            fixture["traj"],
+            visibs=fixture["visibs"],
+            raw_depths_segment=fixture["raw_depths_segment"],
+            intrinsics_segment=fixture["intrinsics_segment"],
+            extrinsics_segment=fixture["extrinsics_segment"],
+            min_depth=0.01,
+            max_depth=10.0,
+        )
+        precomputed_result = build_traj_filter_result(
+            traj=fixture["traj"],
+            visibs=fixture["visibs"],
+            image_width=fixture["image_width"],
+            image_height=fixture["image_height"],
+            filter_args=_make_filter_args(),
+            keypoints=fixture["keypoints"],
+            query_depth=fixture["query_depth"],
+            raw_depths_segment=fixture["raw_depths_segment"],
+            intrinsics_segment=fixture["intrinsics_segment"],
+            extrinsics_segment=fixture["extrinsics_segment"],
+            high_volatility_mask=high_volatility_mask,
+            temporal_compare_context=precomputed_context,
+        )
+        direct_result = build_traj_filter_result(
+            traj=fixture["traj"],
+            visibs=fixture["visibs"],
+            image_width=fixture["image_width"],
+            image_height=fixture["image_height"],
+            filter_args=_make_filter_args(),
+            keypoints=fixture["keypoints"],
+            query_depth=fixture["query_depth"],
+            raw_depths_segment=fixture["raw_depths_segment"],
+            intrinsics_segment=fixture["intrinsics_segment"],
+            extrinsics_segment=fixture["extrinsics_segment"],
+            high_volatility_mask=high_volatility_mask,
+        )
+
+        np.testing.assert_array_equal(
+            precomputed_result["traj_valid_mask"],
+            direct_result["traj_valid_mask"],
+        )
+        np.testing.assert_array_equal(
+            precomputed_result["traj_high_volatility_hit"],
+            direct_result["traj_high_volatility_hit"],
+        )
+        np.testing.assert_allclose(
+            precomputed_result["traj_volatility_exposure_ratio"],
+            direct_result["traj_volatility_exposure_ratio"],
+            atol=1e-6,
+            rtol=0.0,
+        )
+        np.testing.assert_allclose(
+            precomputed_result["traj_stable_depth_consistency_ratio"],
+            direct_result["traj_stable_depth_consistency_ratio"],
+            atol=1e-6,
+            rtol=0.0,
+        )
 
 
 if __name__ == "__main__":

@@ -18,6 +18,9 @@
 - [branch_note_sim360_extrinsics_fix_2026-03-12.md](branch_note_sim360_extrinsics_fix_2026-03-12.md)
 - [ray_artifact_investigation_2026-03-16.md](ray_artifact_investigation_2026-03-16.md)
 - [repo_root_artifact_audit_2026-03-17.md](repo_root_artifact_audit_2026-03-17.md)
+- [depth_volatility_optimization_plan_2026-03-19.md](depth_volatility_optimization_plan_2026-03-19.md)
+- [depth_volatility_p1_p4_implementation_plan_2026-03-19.md](depth_volatility_p1_p4_implementation_plan_2026-03-19.md)
+- [depth_volatility_benchmark_validation_2026-03-19.md](depth_volatility_benchmark_validation_2026-03-19.md)
 
 ## 当前保留的本地对比产物
 
@@ -33,6 +36,7 @@
 - `data_tmp/history_outputs/outputs_press_one_button_demo_v1_extrinsics_compare_2026-03-12`
 - `data_tmp/history_outputs/outputs_droid_fixed_h5_w2c_case_2026-03-12`
 - `data_tmp/history_outputs/outputs_droid_subset_fullparams_2026-03-12`
+- `data_tmp/depth_volatility_benchmarks/20260319_external_wrist_keep`
 
 ## 根目录遗留项说明
 

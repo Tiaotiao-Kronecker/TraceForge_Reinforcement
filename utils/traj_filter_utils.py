@@ -947,13 +947,33 @@ def compute_depth_volatility_map(
     depths_nan = np.where(valid, full_depths, np.nan)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
-        depth_lo = np.nanpercentile(depths_nan, low_percentile, axis=0)
-        depth_hi = np.nanpercentile(depths_nan, high_percentile, axis=0)
+        depth_lo, depth_hi = np.nanpercentile(
+            depths_nan,
+            [low_percentile, high_percentile],
+            axis=0,
+        )
 
     volatility = np.nan_to_num(depth_hi - depth_lo, nan=0.0, posinf=0.0, neginf=0.0)
     valid_counts = valid.sum(axis=0)
     volatility[valid_counts < 2] = 0.0
     return volatility.astype(np.float32)
+
+
+def _threshold_high_volatility_values(
+    values: np.ndarray,
+    *,
+    percentile: float,
+) -> tuple[np.ndarray, float]:
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    finite = np.isfinite(values)
+    finite_values = values[finite]
+    if finite_values.size == 0:
+        return np.zeros(values.shape, dtype=bool), float("nan")
+
+    threshold = float(np.percentile(finite_values, percentile))
+    if not np.isfinite(threshold) or threshold <= 0.0:
+        return finite & (values > 0.0), threshold
+    return finite & (values >= threshold), threshold
 
 
 def compute_high_volatility_mask(
@@ -966,15 +986,61 @@ def compute_high_volatility_mask(
     if volatility_map.ndim != 2:
         raise ValueError(f"Expected volatility_map shape (H,W), got {volatility_map.shape}")
 
-    finite = np.isfinite(volatility_map)
-    values = volatility_map[finite]
-    if values.size == 0:
-        return np.zeros_like(volatility_map, dtype=bool), float("nan")
+    hit_mask, threshold = _threshold_high_volatility_values(
+        volatility_map.reshape(-1),
+        percentile=percentile,
+    )
+    return hit_mask.reshape(volatility_map.shape), threshold
 
-    threshold = float(np.percentile(values, percentile))
-    if not np.isfinite(threshold) or threshold <= 0.0:
-        return finite & (volatility_map > 0.0), threshold
-    return finite & (volatility_map >= threshold), threshold
+
+def compute_accessed_high_volatility_mask(
+    full_depths: np.ndarray,
+    *,
+    accessed_pixel_mask: np.ndarray,
+    min_depth: float,
+    max_depth: float,
+    low_percentile: float = VOLATILITY_LOW_PERCENTILE,
+    high_percentile: float = VOLATILITY_HIGH_PERCENTILE,
+    mask_percentile: float = VOLATILITY_MASK_PERCENTILE,
+) -> tuple[np.ndarray, float]:
+    """Compute a dense high-volatility mask using only accessed pixel locations."""
+    full_depths = np.asarray(full_depths, dtype=np.float32)
+    accessed_pixel_mask = np.asarray(accessed_pixel_mask, dtype=bool)
+    if full_depths.ndim != 3:
+        raise ValueError(f"Expected full_depths shape (T,H,W), got {full_depths.shape}")
+    if accessed_pixel_mask.shape != full_depths.shape[1:]:
+        raise ValueError(
+            f"Expected accessed_pixel_mask shape {full_depths.shape[1:]}, got {accessed_pixel_mask.shape}"
+        )
+
+    high_volatility_mask = np.zeros(full_depths.shape[1:], dtype=bool)
+    ys, xs = np.nonzero(accessed_pixel_mask)
+    if ys.size == 0:
+        return high_volatility_mask, float("nan")
+
+    accessed_depths = full_depths[:, ys, xs]
+    valid = np.isfinite(accessed_depths) & (accessed_depths > min_depth) & (accessed_depths < max_depth)
+    if not np.any(valid):
+        return high_volatility_mask, float("nan")
+
+    depths_nan = np.where(valid, accessed_depths, np.nan)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        depth_lo, depth_hi = np.nanpercentile(
+            depths_nan,
+            [low_percentile, high_percentile],
+            axis=0,
+        )
+
+    volatility_values = np.nan_to_num(depth_hi - depth_lo, nan=0.0, posinf=0.0, neginf=0.0)
+    valid_counts = valid.sum(axis=0)
+    volatility_values[valid_counts < 2] = 0.0
+    hit_mask, threshold = _threshold_high_volatility_values(
+        volatility_values,
+        percentile=mask_percentile,
+    )
+    high_volatility_mask[ys[hit_mask], xs[hit_mask]] = True
+    return high_volatility_mask, threshold
 
 
 def traj_uvz_to_world_coordinates(
@@ -1064,7 +1130,7 @@ def project_world_tracks_to_camera_uvz(
     return projected
 
 
-def evaluate_temporal_depth_consistency(
+def prepare_temporal_depth_consistency_context(
     traj_uvz: np.ndarray,
     *,
     visibs: np.ndarray | None,
@@ -1073,13 +1139,11 @@ def evaluate_temporal_depth_consistency(
     extrinsics_segment: np.ndarray,
     min_depth: float,
     max_depth: float,
-    min_valid_frames: int,
-    min_consistency_ratio: float = TEMPORAL_MIN_CONSISTENCY_RATIO,
     depth_abs_tol: float = TEMPORAL_DEPTH_ABS_TOL,
     depth_rel_tol: float = TEMPORAL_DEPTH_REL_TOL,
-    high_volatility_mask: np.ndarray | None = None,
+    include_reprojected_uvz: bool = False,
 ) -> dict[str, np.ndarray | int]:
-    """Check whether trajectories remain depth-consistent after per-frame reprojection."""
+    """Prepare reusable per-frame temporal depth consistency comparisons."""
     traj_uvz = np.asarray(traj_uvz, dtype=np.float32)
     num_tracks, num_frames, _ = traj_uvz.shape
     visibility = _normalize_visibility(visibs, num_tracks=num_tracks, num_frames=num_frames)
@@ -1124,6 +1188,37 @@ def evaluate_temporal_depth_consistency(
     depth_limit = np.maximum(depth_abs_tol, depth_rel_tol * observed_depth)
     consistent_frame_mask = compare_mask & (depth_error <= depth_limit)
 
+    context: dict[str, np.ndarray | int] = {
+        "compare_mask": compare_mask.astype(bool),
+        "consistent_frame_mask": consistent_frame_mask.astype(bool),
+        "xs_clip": xs_clip.astype(np.int32),
+        "ys_clip": ys_clip.astype(np.int32),
+        "height": int(height),
+        "width": int(width),
+    }
+    if include_reprojected_uvz:
+        context["reprojected_uvz"] = reprojected_uvz.astype(np.float32)
+    return context
+
+
+def _evaluate_temporal_depth_consistency_from_context(
+    temporal_compare_context: dict[str, np.ndarray | int],
+    *,
+    high_volatility_mask: np.ndarray | None,
+    min_valid_frames: int,
+    min_consistency_ratio: float = TEMPORAL_MIN_CONSISTENCY_RATIO,
+) -> dict[str, np.ndarray | int]:
+    compare_mask = np.asarray(temporal_compare_context["compare_mask"]).astype(bool, copy=False)
+    consistent_frame_mask = np.asarray(temporal_compare_context["consistent_frame_mask"]).astype(bool, copy=False)
+    xs_clip = np.asarray(temporal_compare_context["xs_clip"]).astype(np.int32, copy=False)
+    ys_clip = np.asarray(temporal_compare_context["ys_clip"]).astype(np.int32, copy=False)
+    if compare_mask.shape != consistent_frame_mask.shape or compare_mask.shape != xs_clip.shape or compare_mask.shape != ys_clip.shape:
+        raise ValueError("Temporal compare context arrays must share shape (N,T)")
+
+    num_tracks, num_frames = compare_mask.shape
+    height = int(temporal_compare_context["height"])
+    width = int(temporal_compare_context["width"])
+
     if high_volatility_mask is None:
         volatility_frame_mask = np.zeros((num_tracks, num_frames), dtype=bool)
     else:
@@ -1153,14 +1248,13 @@ def evaluate_temporal_depth_consistency(
     stable_pass = stable_frames_sufficient & (stable_consistency_ratio >= min_consistency_ratio)
     mask = np.where(stable_frames_sufficient, stable_pass, all_pass)
 
-    return {
+    result: dict[str, np.ndarray | int] = {
         "mask": mask.astype(bool),
         "consistency_ratio": consistency_ratio.astype(np.float32),
         "stable_consistency_ratio": stable_consistency_ratio.astype(np.float32),
         "compare_counts": compare_counts,
         "stable_compare_counts": stable_compare_counts,
         "required_compare_frames": int(required_compare_frames),
-        "reprojected_uvz": reprojected_uvz.astype(np.float32),
         "compare_mask": compare_mask.astype(bool),
         "consistent_frame_mask": consistent_frame_mask.astype(bool),
         "high_volatility_hit": volatility_frame_mask.any(axis=1),
@@ -1169,6 +1263,50 @@ def evaluate_temporal_depth_consistency(
         "all_pass": all_pass.astype(bool),
         "stable_pass": stable_pass.astype(bool),
     }
+    if "reprojected_uvz" in temporal_compare_context:
+        result["reprojected_uvz"] = np.asarray(temporal_compare_context["reprojected_uvz"]).astype(
+            np.float32,
+            copy=False,
+        )
+    return result
+
+
+def evaluate_temporal_depth_consistency(
+    traj_uvz: np.ndarray,
+    *,
+    visibs: np.ndarray | None,
+    raw_depths_segment: np.ndarray,
+    intrinsics_segment: np.ndarray,
+    extrinsics_segment: np.ndarray,
+    min_depth: float,
+    max_depth: float,
+    min_valid_frames: int,
+    min_consistency_ratio: float = TEMPORAL_MIN_CONSISTENCY_RATIO,
+    depth_abs_tol: float = TEMPORAL_DEPTH_ABS_TOL,
+    depth_rel_tol: float = TEMPORAL_DEPTH_REL_TOL,
+    high_volatility_mask: np.ndarray | None = None,
+    temporal_compare_context: dict[str, np.ndarray | int] | None = None,
+) -> dict[str, np.ndarray | int]:
+    """Check whether trajectories remain depth-consistent after per-frame reprojection."""
+    if temporal_compare_context is None:
+        temporal_compare_context = prepare_temporal_depth_consistency_context(
+            traj_uvz,
+            visibs=visibs,
+            raw_depths_segment=raw_depths_segment,
+            intrinsics_segment=intrinsics_segment,
+            extrinsics_segment=extrinsics_segment,
+            min_depth=min_depth,
+            max_depth=max_depth,
+            depth_abs_tol=depth_abs_tol,
+            depth_rel_tol=depth_rel_tol,
+            include_reprojected_uvz=True,
+        )
+    return _evaluate_temporal_depth_consistency_from_context(
+        temporal_compare_context,
+        high_volatility_mask=high_volatility_mask,
+        min_valid_frames=min_valid_frames,
+        min_consistency_ratio=min_consistency_ratio,
+    )
 
 
 def build_traj_filter_result(
@@ -1183,7 +1321,9 @@ def build_traj_filter_result(
     raw_depths_segment: np.ndarray | None = None,
     intrinsics_segment: np.ndarray | None = None,
     extrinsics_segment: np.ndarray | None = None,
+    high_volatility_mask: np.ndarray | None = None,
     depth_volatility_map: np.ndarray | None = None,
+    temporal_compare_context: dict[str, np.ndarray | int] | None = None,
 ) -> dict[str, np.ndarray]:
     """Build per-trajectory mask plus debug metadata."""
     traj = np.asarray(traj, dtype=np.float32)
@@ -1331,14 +1471,16 @@ def build_traj_filter_result(
     supervision_mask = default_supervision_mask.copy()
 
     if config["use_temporal_depth_consistency"]:
-        high_volatility_mask = None
+        temporal_high_volatility_mask = None
         if config["use_depth_volatility_guidance"]:
-            if depth_volatility_map is None:
-                raise ValueError("depth_volatility_map is required when volatility guidance is enabled")
-            high_volatility_mask, _ = compute_high_volatility_mask(
-                depth_volatility_map,
-                percentile=config["volatility_mask_percentile"],
-            )
+            if high_volatility_mask is None and depth_volatility_map is not None:
+                high_volatility_mask, _ = compute_high_volatility_mask(
+                    depth_volatility_map,
+                    percentile=config["volatility_mask_percentile"],
+                )
+            if high_volatility_mask is None:
+                raise ValueError("high_volatility_mask is required when volatility guidance is enabled")
+            temporal_high_volatility_mask = high_volatility_mask
 
         temporal_result = evaluate_temporal_depth_consistency(
             traj,
@@ -1352,7 +1494,8 @@ def build_traj_filter_result(
             min_consistency_ratio=config["temporal_min_consistency_ratio"],
             depth_abs_tol=config["temporal_depth_abs_tol"],
             depth_rel_tol=config["temporal_depth_rel_tol"],
-            high_volatility_mask=high_volatility_mask,
+            high_volatility_mask=temporal_high_volatility_mask,
+            temporal_compare_context=temporal_compare_context,
         )
         temporal_mask = np.asarray(temporal_result["mask"]).astype(bool, copy=False)
         depth_consistency_ratio = np.asarray(temporal_result["consistency_ratio"]).astype(np.float32, copy=False)
@@ -1578,7 +1721,9 @@ def build_traj_valid_mask(
     raw_depths_segment: np.ndarray | None = None,
     intrinsics_segment: np.ndarray | None = None,
     extrinsics_segment: np.ndarray | None = None,
+    high_volatility_mask: np.ndarray | None = None,
     depth_volatility_map: np.ndarray | None = None,
+    temporal_compare_context: dict[str, np.ndarray | int] | None = None,
 ) -> np.ndarray:
     """Backward-compatible wrapper returning only the final validity mask."""
     return build_traj_filter_result(
@@ -1592,5 +1737,7 @@ def build_traj_valid_mask(
         raw_depths_segment=raw_depths_segment,
         intrinsics_segment=intrinsics_segment,
         extrinsics_segment=extrinsics_segment,
+        high_volatility_mask=high_volatility_mask,
         depth_volatility_map=depth_volatility_map,
+        temporal_compare_context=temporal_compare_context,
     )["traj_valid_mask"]

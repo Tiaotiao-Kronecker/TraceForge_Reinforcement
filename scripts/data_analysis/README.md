@@ -7,6 +7,9 @@
 - `sample_traceforge_dataset.py`
   - 从 TraceForge case 目录中采样子集
   - 当前按 legacy case 布局工作
+- `benchmark_depth_volatility_optimization.py`
+  - 对比 depth volatility 优化前后在 baseline ref 与当前工作树上的运行耗时
+  - 支持共享 query-frame schedule、external + wrist-like 相机成对测试、以及 save 阶段单独计时
 - `analyze_action_format.py`
 - `check_action_format.py`
 - `check_action_info.py`

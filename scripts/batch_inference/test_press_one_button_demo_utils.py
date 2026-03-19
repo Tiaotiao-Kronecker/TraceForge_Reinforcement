@@ -70,6 +70,7 @@ class PressOneButtonCliSurfaceTests(unittest.TestCase):
         self.assertNotIn("--horizon", _CLI_FLAGS)
         self.assertNotIn("--frame_drop_rate", _CLI_FLAGS)
         self.assertNotIn("--max_frames_per_video", _CLI_FLAGS)
+        self.assertNotIn("--depth_volatility_mode", _CLI_FLAGS)
 
 
 if __name__ == "__main__":
