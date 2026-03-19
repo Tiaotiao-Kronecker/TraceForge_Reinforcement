@@ -1,5 +1,4 @@
 import ast
-import os
 import unittest
 from pathlib import Path
 
@@ -13,6 +12,28 @@ _RESOLVE_MODULE = ast.Module(body=[_RESOLVE_FUNC_AST], type_ignores=[])
 _RESOLVE_NAMESPACE: dict[str, object] = {}
 exec(compile(_RESOLVE_MODULE, str(_SOURCE_PATH), "exec"), _RESOLVE_NAMESPACE)
 resolve_traj_filter_profile = _RESOLVE_NAMESPACE["resolve_traj_filter_profile"]
+
+_PARSE_ARGS_FUNC_AST = next(
+    node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "parse_args"
+)
+
+
+def _collect_cli_flags(func_ast: ast.FunctionDef) -> set[str]:
+    flags: set[str] = set()
+    for node in ast.walk(func_ast):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != "add_argument":
+            continue
+        for arg in node.args:
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str) and arg.value.startswith("--"):
+                flags.add(arg.value)
+    return flags
+
+
+_CLI_FLAGS = _collect_cli_flags(_PARSE_ARGS_FUNC_AST)
 
 
 class ResolveTrajFilterProfileTests(unittest.TestCase):
@@ -41,6 +62,14 @@ class ResolveTrajFilterProfileTests(unittest.TestCase):
             resolve_traj_filter_profile("varied_camera_3", "wrist"),
             "wrist",
         )
+
+
+class PressOneButtonCliSurfaceTests(unittest.TestCase):
+    def test_removes_dead_batch_only_legacy_flags(self):
+        self.assertNotIn("--keyframes_per_sec", _CLI_FLAGS)
+        self.assertNotIn("--horizon", _CLI_FLAGS)
+        self.assertNotIn("--frame_drop_rate", _CLI_FLAGS)
+        self.assertNotIn("--max_frames_per_video", _CLI_FLAGS)
 
 
 if __name__ == "__main__":

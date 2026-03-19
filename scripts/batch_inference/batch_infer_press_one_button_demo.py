@@ -17,14 +17,13 @@ Press-one-button demo 数据集批量推理脚本。
                 varied_camera_3/*.npy
 
 脚本设计参考：
-1. `batch_infer.py` 的批量发现与批量执行思路；
-2. `infer_bridge_v2.py` 的“单条样本多相机推理并保存标准 TraceForge 输出”逻辑。
+1. external-only TraceForge 推理与保存逻辑；
+2. episode/camera 粒度的多 GPU 调度。
 
 推荐多卡使用方式：
-- 默认使用 `--gpu_id 0,1,...` 启动动态调度；
+- 使用 `--gpu_id 0,1,...` 启动动态调度；
 - 每张卡对应一个常驻 worker，只加载一次 3D tracker；
-- worker 从共享任务队列中按 `episode/camera` 粒度领取下一个任务，直到队列清空；
-- 如需兼容旧的平均分片方式，可切回 `--gpu_schedule_mode static`。
+- worker 从共享任务队列中按 `episode/camera` 粒度领取下一个任务，直到队列清空。
 
 默认输出方式：
 - 就地写回到每个 episode 下的 `trajectory/<camera_name>/...`；
@@ -35,6 +34,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
+import json
 import os
 import queue
 import subprocess
@@ -45,6 +46,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import h5py
 import numpy as np
 import torch
 from loguru import logger
@@ -60,6 +62,10 @@ if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
 import infer
+from utils.keyframe_schedule_utils import (
+    build_candidate_source_frame_indices,
+    sample_query_source_indices_per_second,
+)
 from utils.traceforge_artifact_utils import is_traceforge_output_complete
 
 
@@ -71,6 +77,8 @@ DEFAULT_CAMERAS = [
 
 _CUDA_LINALG_WARMUP_LOCK = threading.Lock()
 _CUDA_LINALG_WARMED_DEVICES: set[str] = set()
+_QUERY_FRAME_SCHEDULE_VERSION = 1
+_QUERY_FRAME_SHARED_DIRNAME = "_shared"
 
 
 @dataclass(frozen=True)
@@ -80,6 +88,7 @@ class CameraTask:
     episode_dir: Path
     out_episode_dir: Path
     camera_name: str
+    query_frame_schedule_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -134,22 +143,15 @@ def parse_args() -> argparse.Namespace:
         "--gpu_id",
         type=str,
         default=None,
-        help="Comma-separated GPU IDs, e.g. 0,1,2,3. If set, run multi-GPU in one command.",
-    )
-    parser.add_argument(
-        "--gpu_schedule_mode",
-        type=str,
-        default="dynamic",
-        choices=["dynamic", "static"],
-        help="In --gpu_id mode, choose dynamic camera-task scheduling or legacy static sharding.",
+        help="Comma-separated physical GPU IDs, e.g. 1,3,5,6. IDs may be sparse; pass the currently usable cards.",
     )
     parser.add_argument(
         "--min_free_gpu_mem_gb",
         type=float,
         default=0.0,
         help=(
-            "In --gpu_id mode, skip GPUs whose free memory is below this threshold "
-            "before loading the model. Useful on shared machines."
+            "In --gpu_id mode, wait to load the model on a GPU until its free memory "
+            "reaches this threshold. Useful on shared machines."
         ),
     )
     parser.add_argument(
@@ -177,19 +179,7 @@ def parse_args() -> argparse.Namespace:
         "--max_episodes",
         type=int,
         default=None,
-        help="Limit total episodes before sharding; useful for testing",
-    )
-    parser.add_argument(
-        "--num_shards",
-        type=int,
-        default=1,
-        help="Total shard count for multi-process launch",
-    )
-    parser.add_argument(
-        "--shard_index",
-        type=int,
-        default=0,
-        help="Current shard index in [0, num_shards)",
+        help="Limit total episodes; useful for testing",
     )
     parser.add_argument(
         "--skip_existing",
@@ -216,7 +206,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="external",
         choices=infer.video_depth_pose_dict.keys(),
-        help="Recommended: external, using trajectory_valid.h5 per episode",
+        help="Maintained mode: external, using trajectory_valid.h5 per episode",
     )
     parser.add_argument(
         "--external_geom_name",
@@ -234,11 +224,11 @@ def parse_args() -> argparse.Namespace:
         "--device",
         type=str,
         default="cuda",
-        help="Use cuda:0 when launching each shard with CUDA_VISIBLE_DEVICES",
+        help="Single-GPU execution device. In --gpu_id mode each worker binds its own CUDA device automatically.",
     )
     parser.add_argument("--num_iters", type=int, default=6)
     parser.add_argument("--fps", type=int, default=1)
-    parser.add_argument("--max_num_frames", type=int, default=384)
+    parser.add_argument("--max_num_frames", type=int, default=512)
     parser.add_argument("--save_video", action="store_true", default=False)
     parser.add_argument(
         "--output_layout",
@@ -263,28 +253,35 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Store per-query visibility arrays in sample NPZ files.",
     )
-    parser.add_argument("--horizon", type=int, default=16)
     parser.add_argument(
-        "--use_all_trajectories",
-        action="store_true",
-        default=True,
+        "--keyframes_per_sec_min",
+        type=int,
+        default=2,
+        help="Minimum number of query frames sampled per second for each episode.",
     )
     parser.add_argument(
-        "--frame_drop_rate",
+        "--keyframes_per_sec_max",
         type=int,
-        default=15,
-        help="Query every N frames; 15 reproduces the 0/15/30/45 demo pattern",
+        default=3,
+        help="Maximum number of query frames sampled per second for each episode.",
+    )
+    parser.add_argument(
+        "--keyframe_seed",
+        type=int,
+        default=0,
+        help="Base random seed for deterministic per-episode keyframe schedules.",
+    )
+    parser.add_argument(
+        "--fallback_episode_fps",
+        type=float,
+        default=0.0,
+        help="Fallback FPS used only when trajectory_valid.h5 is missing root attr 'fps'. <=0 disables fallback.",
     )
     parser.add_argument(
         "--future_len",
         type=int,
         default=32,
         help="Tracking window per query frame",
-    )
-    parser.add_argument(
-        "--max_frames_per_video",
-        type=int,
-        default=50,
     )
     parser.add_argument(
         "--grid_size",
@@ -358,10 +355,12 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     args.camera_names = parse_camera_names(args.camera_names)
 
-    if args.num_shards <= 0:
-        raise ValueError("--num_shards must be >= 1")
-    if args.shard_index < 0 or args.shard_index >= args.num_shards:
-        raise ValueError("--shard_index must satisfy 0 <= shard_index < num_shards")
+    if args.fps <= 0:
+        raise ValueError("--fps must be >= 1 for shared per-second keyframe sampling.")
+    if args.keyframes_per_sec_min <= 0 or args.keyframes_per_sec_max <= 0:
+        raise ValueError("--keyframes_per_sec_min/max must both be >= 1")
+    if args.keyframes_per_sec_min > args.keyframes_per_sec_max:
+        raise ValueError("--keyframes_per_sec_min must be <= --keyframes_per_sec_max")
 
     return args
 
@@ -544,138 +543,10 @@ def resolve_episode_output_dir(
     return episode_dir / args.trajectory_dirname
 
 
-def resolve_launcher_log_dir(
-    *,
-    base_path: Path,
-    args: argparse.Namespace,
-    out_root: Path | None,
-) -> Path:
-    if out_root is not None:
-        return out_root / "_logs"
-    return base_path / f"_{args.trajectory_dirname}_batch_logs"
-
-
 def describe_output_target(args: argparse.Namespace, out_root: Path | None) -> str:
     if out_root is not None:
         return str(out_root)
     return f"<episode>/{args.trajectory_dirname}"
-
-
-def build_worker_cmd(
-    *,
-    script_path: str,
-    args: argparse.Namespace,
-    worker_count: int,
-    worker_index: int,
-) -> list[str]:
-    cmd = [
-        sys.executable,
-        script_path,
-        "--base_path", args.base_path,
-        "--camera_names", ",".join(args.camera_names),
-        "--num_shards", str(worker_count),
-        "--shard_index", str(worker_index),
-        "--checkpoint", args.checkpoint,
-        "--depth_pose_method", args.depth_pose_method,
-        "--external_geom_name", args.external_geom_name,
-        "--external_extr_mode", args.external_extr_mode,
-        "--device", "cuda:0",
-        "--num_iters", str(args.num_iters),
-        "--fps", str(args.fps),
-        "--max_num_frames", str(args.max_num_frames),
-        "--horizon", str(args.horizon),
-        "--frame_drop_rate", str(args.frame_drop_rate),
-        "--future_len", str(args.future_len),
-        "--max_frames_per_video", str(args.max_frames_per_video),
-        "--grid_size", str(args.grid_size),
-        "--output_layout", args.output_layout,
-        "--scene_storage_mode", args.scene_storage_mode,
-        "--filter_level", args.filter_level,
-        "--traj_filter_profile", args.traj_filter_profile,
-        "--min_depth", str(args.min_depth),
-        "--max_depth", str(args.max_depth),
-        "--trajectory_dirname", args.trajectory_dirname,
-    ]
-
-    if args.out_dir is not None and args.out_dir.strip():
-        cmd.extend(["--out_dir", args.out_dir])
-    if args.episode_name is not None:
-        cmd.extend(["--episode_name", args.episode_name])
-    if args.max_episodes is not None:
-        cmd.extend(["--max_episodes", str(args.max_episodes)])
-    if args.skip_existing:
-        cmd.append("--skip_existing")
-    if args.copy_lang:
-        cmd.append("--copy_lang")
-    if args.save_video:
-        cmd.append("--save_video")
-    if args.save_visibility:
-        cmd.append("--save_visibility")
-    if args.dry_run:
-        cmd.append("--dry_run")
-    if args.min_valid_frames is not None:
-        cmd.extend(["--min_valid_frames", str(args.min_valid_frames)])
-    if args.visibility_threshold is not None:
-        cmd.extend(["--visibility_threshold", str(args.visibility_threshold)])
-    if args.boundary_margin is not None:
-        cmd.extend(["--boundary_margin", str(args.boundary_margin)])
-    if args.depth_change_threshold is not None:
-        cmd.extend(["--depth_change_threshold", str(args.depth_change_threshold)])
-
-    return cmd
-
-
-def launch_worker_process(
-    *,
-    gpu_id: int,
-    worker_index: int,
-    worker_count: int,
-    args: argparse.Namespace,
-    log_dir: Path,
-) -> tuple[bool, float, str | None]:
-    script_path = os.path.abspath(__file__)
-    cmd = build_worker_cmd(
-        script_path=script_path,
-        args=args,
-        worker_count=worker_count,
-        worker_index=worker_index,
-    )
-
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    env["PYTHONUNBUFFERED"] = "1"
-    env["PYTHONPYCACHEPREFIX"] = env.get("PYTHONPYCACHEPREFIX", "/tmp/traceforge_pycache")
-    env["PYTHONPATH"] = (
-        _PROJECT_ROOT + os.pathsep + env["PYTHONPATH"]
-        if env.get("PYTHONPATH")
-        else _PROJECT_ROOT
-    )
-
-    log_path = log_dir / f"worker_gpu{gpu_id}.log"
-    start_time = time.time()
-    logger.info(
-        f"[GPU {gpu_id}] launch worker {worker_index}/{worker_count}: "
-        f"log={log_path}"
-    )
-
-    with open(log_path, "w", encoding="utf-8") as log_file:
-        proc = subprocess.run(
-            cmd,
-            stdout=log_file,
-            stderr=log_file,
-            env=env,
-            check=False,
-            text=True,
-        )
-
-    elapsed = time.time() - start_time
-    if proc.returncode == 0:
-        logger.info(f"[GPU {gpu_id}] worker finished in {elapsed/60:.1f} min")
-        return True, elapsed, None
-
-    err = f"worker exit code {proc.returncode}"
-    logger.error(f"[GPU {gpu_id}] {err}; see {log_path}")
-    return False, elapsed, err
 
 
 def _has_files(dir_path: Path, suffixes: tuple[str, ...]) -> bool:
@@ -709,10 +580,6 @@ def find_valid_episodes(base_path: Path, camera_names: list[str], geom_name: str
     return episodes
 
 
-def shard_episodes(episodes: list[Path], num_shards: int, shard_index: int) -> list[Path]:
-    return episodes[shard_index::num_shards]
-
-
 def camera_output_complete(out_episode_dir: Path, camera_name: str) -> bool:
     camera_dir = out_episode_dir / camera_name
     return is_traceforge_output_complete(camera_dir)
@@ -727,13 +594,184 @@ def copy_episode_lang(episode_dir: Path, out_episode_dir: Path) -> None:
     target.write_text(lang_path.read_text(encoding="utf-8"), encoding="utf-8")
 
 
+def _count_files(dir_path: Path, suffixes: tuple[str, ...]) -> int:
+    if not dir_path.is_dir():
+        return 0
+    return sum(
+        1
+        for path in dir_path.iterdir()
+        if path.is_file() and path.suffix.lower() in suffixes
+    )
+
+
+def _read_episode_fps(geom_path: Path, fallback_episode_fps: float) -> float:
+    if geom_path.suffix.lower() != ".h5":
+        raise ValueError(
+            f"Shared per-second keyframe sampling requires H5 geometry with root attr 'fps', got: {geom_path}"
+        )
+
+    with h5py.File(geom_path, "r") as h5_file:
+        fps_attr = h5_file.attrs.get("fps")
+    if fps_attr is None:
+        if fallback_episode_fps > 0:
+            return float(fallback_episode_fps)
+        raise ValueError(f"{geom_path} missing root attr 'fps'")
+    return float(fps_attr)
+
+
+def _read_geom_frame_count(geom_path: Path, camera_name: str) -> int:
+    if geom_path.suffix.lower() == ".h5":
+        with h5py.File(geom_path, "r") as h5_file:
+            intr_key_with_suffix = f"observation/camera/intrinsics/{camera_name}_left"
+            extr_key_with_suffix = f"observation/camera/extrinsics/{camera_name}_left"
+            intr_key_no_suffix = f"observation/camera/intrinsics/{camera_name}"
+            extr_key_no_suffix = f"observation/camera/extrinsics/{camera_name}"
+            if intr_key_with_suffix in h5_file and extr_key_with_suffix in h5_file:
+                intr_count = int(h5_file[intr_key_with_suffix].shape[0])
+                extr_count = int(h5_file[extr_key_with_suffix].shape[0])
+                return min(intr_count, extr_count)
+            if intr_key_no_suffix in h5_file and extr_key_no_suffix in h5_file:
+                intr_count = int(h5_file[intr_key_no_suffix].shape[0])
+                extr_count = int(h5_file[extr_key_no_suffix].shape[0])
+                return min(intr_count, extr_count)
+        raise KeyError(
+            f"{geom_path} missing intrinsics/extrinsics datasets for camera '{camera_name}'"
+        )
+
+    with np.load(geom_path) as data:
+        if "intrinsics" not in data or "extrinsics" not in data:
+            raise KeyError(
+                f"NPZ geometry must contain 'intrinsics' and 'extrinsics': {geom_path}"
+            )
+        return min(int(data["intrinsics"].shape[0]), int(data["extrinsics"].shape[0]))
+
+
+def _schedule_spec_hash(spec: dict[str, object]) -> str:
+    encoded = json.dumps(spec, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:12]
+
+
+def _derive_episode_schedule_seed(
+    *,
+    base_seed: int,
+    episode_name: str,
+    spec_hash: str,
+) -> int:
+    material = f"{base_seed}:{episode_name}:{spec_hash}".encode("utf-8")
+    digest = hashlib.sha256(material).digest()
+    return int.from_bytes(digest[:8], byteorder="little", signed=False)
+
+
+def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(
+        f".{path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+    )
+    try:
+        tmp_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def ensure_episode_query_frame_schedule(
+    *,
+    episode_dir: Path,
+    out_episode_dir: Path,
+    args: argparse.Namespace,
+) -> Path:
+    geom_path = episode_dir / args.external_geom_name
+    episode_fps = _read_episode_fps(geom_path, args.fallback_episode_fps)
+
+    camera_raw_frame_counts: dict[str, int] = {}
+    for camera_name in args.camera_names:
+        rgb_dir = episode_dir / "rgb" / camera_name
+        depth_dir = episode_dir / "depth" / camera_name
+        if not _has_files(rgb_dir, (".png", ".jpg", ".jpeg")):
+            continue
+        if not _has_files(depth_dir, (".npy", ".png")):
+            continue
+        rgb_count = _count_files(rgb_dir, (".png", ".jpg", ".jpeg"))
+        depth_count = _count_files(depth_dir, (".npy", ".png"))
+        geom_count = _read_geom_frame_count(geom_path, camera_name)
+        camera_raw_frame_counts[camera_name] = min(rgb_count, depth_count, geom_count)
+
+    if not camera_raw_frame_counts:
+        raise ValueError(f"No schedulable cameras found under {episode_dir}")
+
+    common_raw_frame_count = min(camera_raw_frame_counts.values())
+    candidate_source_frame_indices = build_candidate_source_frame_indices(
+        common_raw_frame_count,
+        stride=int(args.fps),
+        max_num_frames=args.max_num_frames,
+    )
+    if candidate_source_frame_indices.size == 0:
+        raise ValueError(
+            f"{episode_dir.name}: no candidate frames remain after stride/max_num_frames filtering"
+        )
+
+    schedule_spec = {
+        "version": _QUERY_FRAME_SCHEDULE_VERSION,
+        "external_geom_name": args.external_geom_name,
+        "camera_names": list(args.camera_names),
+        "episode_fps": float(episode_fps),
+        "keyframes_per_sec_min": int(args.keyframes_per_sec_min),
+        "keyframes_per_sec_max": int(args.keyframes_per_sec_max),
+        "base_seed": int(args.keyframe_seed),
+        "load_stride": int(args.fps),
+        "max_num_frames": int(args.max_num_frames),
+        "common_raw_frame_count": int(common_raw_frame_count),
+    }
+    spec_hash = _schedule_spec_hash(schedule_spec)
+    schedule_dir = out_episode_dir / _QUERY_FRAME_SHARED_DIRNAME
+    schedule_path = schedule_dir / f"query_frame_schedule_v{_QUERY_FRAME_SCHEDULE_VERSION}_{spec_hash}.json"
+    if schedule_path.is_file():
+        return schedule_path
+
+    derived_seed = _derive_episode_schedule_seed(
+        base_seed=int(args.keyframe_seed),
+        episode_name=episode_dir.name,
+        spec_hash=spec_hash,
+    )
+    query_frame_source_indices = sample_query_source_indices_per_second(
+        candidate_source_frame_indices,
+        episode_fps=episode_fps,
+        keyframes_per_sec_min=int(args.keyframes_per_sec_min),
+        keyframes_per_sec_max=int(args.keyframes_per_sec_max),
+        seed=derived_seed,
+    )
+    if query_frame_source_indices.size == 0:
+        raise ValueError(f"{episode_dir.name}: sampled zero query frames")
+
+    _atomic_write_json(
+        schedule_path,
+        {
+            **schedule_spec,
+            "derived_seed": int(derived_seed),
+            "camera_raw_frame_counts": camera_raw_frame_counts,
+            "candidate_source_frame_indices": candidate_source_frame_indices.tolist(),
+            "query_frame_source_indices": query_frame_source_indices.tolist(),
+        },
+    )
+    logger.info(
+        f"{episode_dir.name}: prepared shared query-frame schedule "
+        f"({len(query_frame_source_indices)} frames, fps={episode_fps:.3f}, "
+        f"kps={args.keyframes_per_sec_min}~{args.keyframes_per_sec_max})"
+    )
+    return schedule_path
+
+
 def build_camera_tasks(
     episodes: list[Path],
     *,
     args: argparse.Namespace,
     out_dir: Path | None,
 ) -> list[CameraTask]:
-    pending: list[tuple[Path, Path, str]] = []
+    pending: list[tuple[Path, Path, str, Path | None]] = []
 
     for episode_dir in episodes:
         out_episode_dir = resolve_episode_output_dir(
@@ -741,6 +779,7 @@ def build_camera_tasks(
             args=args,
             out_root=out_dir,
         )
+        schedule_path: Path | None = None
         for camera_name in args.camera_names:
             rgb_dir = episode_dir / "rgb" / camera_name
             depth_dir = episode_dir / "depth" / camera_name
@@ -753,11 +792,17 @@ def build_camera_tasks(
             if args.skip_existing and camera_output_complete(out_episode_dir, camera_name):
                 logger.info(f"{episode_dir.name}/{camera_name}: skip_existing")
                 continue
-            pending.append((episode_dir, out_episode_dir, camera_name))
+            if schedule_path is None:
+                schedule_path = ensure_episode_query_frame_schedule(
+                    episode_dir=episode_dir,
+                    out_episode_dir=out_episode_dir,
+                    args=args,
+                )
+            pending.append((episode_dir, out_episode_dir, camera_name, schedule_path))
 
     total_tasks = len(pending)
     tasks: list[CameraTask] = []
-    for task_index, (episode_dir, out_episode_dir, camera_name) in enumerate(pending, start=1):
+    for task_index, (episode_dir, out_episode_dir, camera_name, schedule_path) in enumerate(pending, start=1):
         tasks.append(
             CameraTask(
                 task_index=task_index,
@@ -765,6 +810,7 @@ def build_camera_tasks(
                 episode_dir=episode_dir,
                 out_episode_dir=out_episode_dir,
                 camera_name=camera_name,
+                query_frame_schedule_path=schedule_path,
             )
         )
     return tasks
@@ -774,6 +820,8 @@ def build_camera_args(
     base_args: argparse.Namespace,
     episode_dir: Path,
     camera_name: str,
+    *,
+    query_frame_schedule_path: Path | None,
 ) -> argparse.Namespace:
     camera_args = copy.deepcopy(base_args)
     camera_args.mask_dir = None
@@ -783,6 +831,9 @@ def build_camera_args(
         base_args.traj_filter_profile,
     )
     camera_args.external_geom_npz = str(episode_dir / base_args.external_geom_name)
+    camera_args.query_frame_schedule_path = (
+        str(query_frame_schedule_path) if query_frame_schedule_path is not None else None
+    )
     return camera_args
 
 
@@ -793,40 +844,32 @@ def save_result(
     camera_name: str,
     result: dict,
     args: argparse.Namespace,
-    save_lock: threading.Lock | None = None,
 ) -> None:
-    if save_lock is not None:
-        save_lock.acquire()
-    try:
-        infer.save_structured_data(
-            video_name=camera_name,
-            output_dir=str(out_episode_dir),
-            video_tensor=result["video_tensor"],
-            depths=result["depths"],
-            coords=result["coords"],
-            visibs=result["visibs"],
-            intrinsics=result["intrinsics"],
-            extrinsics=result["extrinsics"],
-            query_points_per_frame=result["query_points_per_frame"],
-            horizon=args.horizon,
-            original_filenames=result["original_filenames"],
-            use_all_trajectories=args.use_all_trajectories,
-            query_frame_results=result.get("query_frame_results"),
-            future_len=args.future_len,
-            grid_size=args.grid_size,
-            filter_args=args,
-            full_video_tensor=result["full_video_tensor"],
-            full_depths=result["full_depths"],
-            full_intrinsics=result["full_intrinsics"],
-            full_extrinsics=result["full_extrinsics"],
-            depth_conf=result["depth_conf"],
-            video_source_path=str(episode_dir / "rgb" / camera_name),
-            depth_source_path=str(episode_dir / "depth" / camera_name),
-            source_frame_indices=result["source_frame_indices"],
-        )
-    finally:
-        if save_lock is not None:
-            save_lock.release()
+    infer.save_structured_data(
+        video_name=camera_name,
+        output_dir=str(out_episode_dir),
+        video_tensor=result["video_tensor"],
+        depths=result["depths"],
+        coords=result["coords"],
+        visibs=result["visibs"],
+        intrinsics=result["intrinsics"],
+        extrinsics=result["extrinsics"],
+        query_points_per_frame=result["query_points_per_frame"],
+        original_filenames=result["original_filenames"],
+        query_frame_results=result.get("query_frame_results"),
+        future_len=args.future_len,
+        grid_size=args.grid_size,
+        filter_args=args,
+        full_video_tensor=result["full_video_tensor"],
+        full_depths=result["full_depths"],
+        full_intrinsics=result["full_intrinsics"],
+        full_extrinsics=result["full_extrinsics"],
+        depth_conf=result["depth_conf"],
+        video_source_path=str(episode_dir / "rgb" / camera_name),
+        depth_source_path=str(episode_dir / "depth" / camera_name),
+        source_frame_indices=result["source_frame_indices"],
+        query_frame_metadata=result.get("query_frame_metadata"),
+    )
 
 
 def run_camera_task(
@@ -834,12 +877,16 @@ def run_camera_task(
     task: CameraTask,
     args: argparse.Namespace,
     model_3dtracker,
-    save_lock: threading.Lock | None = None,
 ) -> tuple[bool, bool]:
     if args.copy_lang and not (task.out_episode_dir / "lang.txt").is_file():
         copy_episode_lang(task.episode_dir, task.out_episode_dir)
 
-    camera_args = build_camera_args(args, task.episode_dir, task.camera_name)
+    camera_args = build_camera_args(
+        args,
+        task.episode_dir,
+        task.camera_name,
+        query_frame_schedule_path=task.query_frame_schedule_path,
+    )
     logger.info(
         f"{task.episode_dir.name}/{task.camera_name}: run "
         f"(device={camera_args.device}, depth_pose_method={camera_args.depth_pose_method})"
@@ -860,7 +907,6 @@ def run_camera_task(
             camera_name=task.camera_name,
             result=result,
             args=camera_args,
-            save_lock=save_lock,
         )
         return True, False
     except Exception as exc:
@@ -884,7 +930,6 @@ def run_episode(
     out_episode_dir: Path,
     args: argparse.Namespace,
     model_3dtracker,
-    save_lock: threading.Lock | None = None,
 ) -> tuple[int, int]:
     success_count = 0
     fail_count = 0
@@ -904,6 +949,14 @@ def run_episode(
             continue
         pending_cameras.append(camera_name)
 
+    schedule_path: Path | None = None
+    if pending_cameras:
+        schedule_path = ensure_episode_query_frame_schedule(
+            episode_dir=episode_dir,
+            out_episode_dir=out_episode_dir,
+            args=args,
+        )
+
     tasks = [
         CameraTask(
             task_index=idx,
@@ -911,6 +964,7 @@ def run_episode(
             episode_dir=episode_dir,
             out_episode_dir=out_episode_dir,
             camera_name=camera_name,
+            query_frame_schedule_path=schedule_path,
         )
         for idx, camera_name in enumerate(pending_cameras, start=1)
     ]
@@ -922,7 +976,6 @@ def run_episode(
             task=task,
             args=args,
             model_3dtracker=model_3dtracker,
-            save_lock=save_lock,
         )
         if ok:
             success_count += 1
@@ -937,7 +990,6 @@ def process_camera_tasks_on_gpu(
     gpu_id: int,
     task_queue: queue.Queue[CameraTask],
     args: argparse.Namespace,
-    save_lock: threading.Lock,
     stop_event: threading.Event,
 ) -> tuple[int, int, float]:
     worker_args = copy.deepcopy(args)
@@ -985,7 +1037,6 @@ def process_camera_tasks_on_gpu(
                     task=task,
                     args=worker_args,
                     model_3dtracker=model_3dtracker,
-                    save_lock=save_lock,
                 )
                 if ok:
                     total_camera_success += 1
@@ -1011,57 +1062,6 @@ def process_camera_tasks_on_gpu(
     return total_camera_success, total_camera_fail, elapsed
 
 
-def process_episodes_on_gpu(
-    *,
-    gpu_id: int,
-    episodes: list[Path],
-    args: argparse.Namespace,
-    out_dir: Path | None,
-    save_lock: threading.Lock,
-) -> tuple[int, int, float]:
-    worker_args = copy.deepcopy(args)
-    worker_args.device = f"cuda:{gpu_id}"
-
-    logger.info(
-        f"[GPU {gpu_id}] start worker with {len(episodes)} episodes on {worker_args.device}"
-    )
-    worker_start = time.time()
-    model_3dtracker = infer.load_model(worker_args.checkpoint).to(worker_args.device)
-
-    total_camera_success = 0
-    total_camera_fail = 0
-    try:
-        for idx, episode_dir in enumerate(episodes, start=1):
-            logger.info(
-                f"[GPU {gpu_id}] [{idx}/{len(episodes)}] episode={episode_dir.name}"
-            )
-            out_episode_dir = resolve_episode_output_dir(
-                episode_dir,
-                args=worker_args,
-                out_root=out_dir,
-            )
-            success_count, fail_count = run_episode(
-                episode_dir=episode_dir,
-                out_episode_dir=out_episode_dir,
-                args=worker_args,
-                model_3dtracker=model_3dtracker,
-                save_lock=save_lock,
-            )
-            total_camera_success += success_count
-            total_camera_fail += fail_count
-    finally:
-        del model_3dtracker
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    elapsed = time.time() - worker_start
-    logger.info(
-        f"[GPU {gpu_id}] done in {elapsed/60:.1f} min "
-        f"(camera_success={total_camera_success}, camera_fail={total_camera_fail})"
-    )
-    return total_camera_success, total_camera_fail, elapsed
-
-
 def main() -> None:
     args = parse_args()
     base_path = Path(args.base_path).resolve()
@@ -1077,15 +1077,7 @@ def main() -> None:
             gpu_ids,
             min_free_gpu_mem_gb=args.min_free_gpu_mem_gb,
         )
-        if args.gpu_schedule_mode == "static":
-            gpu_ids = available_gpu_ids
-            if args.min_free_gpu_mem_gb > 0 and not gpu_ids:
-                logger.error(
-                    "No GPUs passed the free-memory filter "
-                    f"(min_free_gpu_mem_gb={args.min_free_gpu_mem_gb})."
-                )
-                return
-        elif args.min_free_gpu_mem_gb > 0 and not available_gpu_ids:
+        if args.min_free_gpu_mem_gb > 0 and not available_gpu_ids:
             logger.warning(
                 "No GPUs currently pass the free-memory filter; "
                 "dynamic workers will wait for recovery."
@@ -1104,11 +1096,7 @@ def main() -> None:
     elif args.max_episodes is not None and args.max_episodes > 0:
         episodes = episodes[: args.max_episodes]
 
-    total_before_shard = len(episodes)
-    if gpu_ids:
-        episodes_for_run = episodes
-    else:
-        episodes_for_run = shard_episodes(episodes, args.num_shards, args.shard_index)
+    episodes_for_run = episodes
 
     logger.info("=" * 80)
     logger.info("Press-one-button demo batch inference")
@@ -1116,16 +1104,13 @@ def main() -> None:
     logger.info(f"out_dir={describe_output_target(args, out_dir)}")
     logger.info(f"cameras={args.camera_names}")
     logger.info(
-        f"episodes(before shard)={total_before_shard}, "
-        f"episodes(this shard)={len(episodes_for_run)}, "
-        f"shard={args.shard_index}/{args.num_shards}"
+        f"episodes={len(episodes_for_run)}"
     )
     logger.info(
         f"device={args.device}, CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}"
     )
     if gpu_ids:
         logger.info(f"gpu_ids={gpu_ids}")
-        logger.info(f"gpu_schedule_mode={args.gpu_schedule_mode}")
         for gpu_id in gpu_ids:
             mem_info = gpu_memory.get(gpu_id)
             if mem_info is None:
@@ -1138,16 +1123,17 @@ def main() -> None:
             mem_info = gpu_memory[gpu_id]
             assert mem_info is not None
             logger.warning(
-                f"[GPU {gpu_id}] skipped by free-memory filter: "
+                f"[GPU {gpu_id}] currently below the free-memory threshold and will wait for recovery: "
                 f"{mem_info.free_gb:.1f} GiB < {args.min_free_gpu_mem_gb:.1f} GiB"
             )
     logger.info(
-        f"frame_drop_rate={args.frame_drop_rate}, future_len={args.future_len}, grid_size={args.grid_size}"
+        f"keyframes_per_sec={args.keyframes_per_sec_min}~{args.keyframes_per_sec_max}, "
+        f"future_len={args.future_len}, grid_size={args.grid_size}, load_stride={args.fps}"
     )
     logger.info("=" * 80)
 
     dynamic_tasks: list[CameraTask] | None = None
-    if gpu_ids and args.gpu_schedule_mode == "dynamic":
+    if gpu_ids:
         dynamic_tasks = build_camera_tasks(
             episodes_for_run,
             args=args,
@@ -1171,103 +1157,58 @@ def main() -> None:
     total_camera_fail = 0
 
     if gpu_ids:
-        if args.num_shards != 1 or args.shard_index != 0:
-            logger.warning(
-                "gpu_id mode ignores the incoming shard settings and manages sharding internally."
-            )
         worker_count = len(gpu_ids)
-        if args.gpu_schedule_mode == "static":
-            log_dir = resolve_launcher_log_dir(
-                base_path=base_path,
-                args=args,
-                out_root=out_dir,
-            )
-            log_dir.mkdir(parents=True, exist_ok=True)
-
-            episodes_per_worker = [len(episodes_for_run[i::worker_count]) for i in range(worker_count)]
-            for worker_index, gpu in enumerate(gpu_ids):
-                logger.info(
-                    f"[GPU {gpu}] assigned {episodes_per_worker[worker_index]} episodes "
-                    f"(worker shard {worker_index}/{worker_count})"
+        assert dynamic_tasks is not None
+        if not dynamic_tasks:
+            logger.info("No pending camera tasks after filtering.")
+            logger.info("=" * 80)
+            return
+        if args.copy_lang:
+            for episode_dir in episodes_for_run:
+                copy_episode_lang(
+                    episode_dir,
+                    resolve_episode_output_dir(
+                        episode_dir,
+                        args=args,
+                        out_root=out_dir,
+                    ),
                 )
 
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                future_map = {
-                    executor.submit(
-                        launch_worker_process,
-                        gpu_id=gpu,
-                        worker_index=worker_index,
-                        worker_count=worker_count,
-                        args=args,
-                        log_dir=log_dir,
-                    ): gpu
-                    for worker_index, gpu in enumerate(gpu_ids)
-                }
-                for future in as_completed(future_map):
-                    gpu = future_map[future]
-                    try:
-                        ok, _elapsed, _err = future.result()
-                        if ok:
-                            total_camera_success += 1
-                        else:
-                            total_camera_fail += 1
-                    except Exception as exc:
-                        total_camera_fail += 1
-                        logger.exception(f"[GPU {gpu}] launcher thread failed: {exc}")
-        else:
-            assert dynamic_tasks is not None
-            if not dynamic_tasks:
-                logger.info("No pending camera tasks after filtering.")
-                logger.info("=" * 80)
-                return
-            if args.copy_lang:
-                for episode_dir in episodes_for_run:
-                    copy_episode_lang(
-                        episode_dir,
-                        resolve_episode_output_dir(
-                            episode_dir,
-                            args=args,
-                            out_root=out_dir,
-                        ),
-                    )
+        task_queue: queue.Queue[CameraTask] = queue.Queue()
+        for task in dynamic_tasks:
+            task_queue.put(task)
+        stop_event = threading.Event()
 
-            save_lock = threading.Lock()
-            task_queue: queue.Queue[CameraTask] = queue.Queue()
-            for task in dynamic_tasks:
-                task_queue.put(task)
-            stop_event = threading.Event()
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_map = {
+                executor.submit(
+                    process_camera_tasks_on_gpu,
+                    gpu_id=gpu,
+                    task_queue=task_queue,
+                    args=args,
+                    stop_event=stop_event,
+                ): gpu
+                for gpu in gpu_ids
+            }
+            while task_queue.unfinished_tasks > 0:
+                if any(future.done() for future in future_map):
+                    logger.error("A dynamic GPU worker exited before all tasks completed.")
+                    break
+                time.sleep(min(max(args.gpu_recovery_poll_sec, 1.0), 30.0))
 
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                future_map = {
-                    executor.submit(
-                        process_camera_tasks_on_gpu,
-                        gpu_id=gpu,
-                        task_queue=task_queue,
-                        args=args,
-                        save_lock=save_lock,
-                        stop_event=stop_event,
-                    ): gpu
-                    for gpu in gpu_ids
-                }
-                while task_queue.unfinished_tasks > 0:
-                    if any(future.done() for future in future_map):
-                        logger.error("A dynamic GPU worker exited before all tasks completed.")
-                        break
-                    time.sleep(min(max(args.gpu_recovery_poll_sec, 1.0), 30.0))
-
-                stop_event.set()
-                for future in as_completed(future_map):
-                    gpu = future_map[future]
-                    try:
-                        success_count, fail_count, _elapsed = future.result()
-                        total_camera_success += success_count
-                        total_camera_fail += fail_count
-                    except Exception as exc:
-                        logger.exception(f"[GPU {gpu}] dynamic worker failed: {exc}")
-            remaining_tasks = task_queue.unfinished_tasks
-            if remaining_tasks > 0:
-                total_camera_fail += remaining_tasks
-                logger.error(f"Dynamic scheduler left {remaining_tasks} camera tasks unprocessed.")
+            stop_event.set()
+            for future in as_completed(future_map):
+                gpu = future_map[future]
+                try:
+                    success_count, fail_count, _elapsed = future.result()
+                    total_camera_success += success_count
+                    total_camera_fail += fail_count
+                except Exception as exc:
+                    logger.exception(f"[GPU {gpu}] dynamic worker failed: {exc}")
+        remaining_tasks = task_queue.unfinished_tasks
+        if remaining_tasks > 0:
+            total_camera_fail += remaining_tasks
+            logger.error(f"Dynamic scheduler left {remaining_tasks} camera tasks unprocessed.")
     else:
         logger.info(f"Loading 3D tracker once on {args.device}")
         model_3dtracker = infer.load_model(args.checkpoint).to(args.device)
@@ -1294,20 +1235,13 @@ def main() -> None:
 
     logger.info("=" * 80)
     if gpu_ids:
-        if args.gpu_schedule_mode == "static":
-            logger.info(
-                f"Done launcher mode. workers_ok={total_camera_success}, "
-                f"workers_failed={total_camera_fail}"
-            )
-        else:
-            logger.info(
-                f"Done dynamic gpu mode. camera_success={total_camera_success}, "
-                f"camera_fail={total_camera_fail}"
-            )
+        logger.info(
+            f"Done dynamic gpu mode. camera_success={total_camera_success}, "
+            f"camera_fail={total_camera_fail}"
+        )
     else:
         logger.info(
-            f"Done. shard={args.shard_index}/{args.num_shards}, "
-            f"camera_success={total_camera_success}, camera_fail={total_camera_fail}"
+            f"Done. camera_success={total_camera_success}, camera_fail={total_camera_fail}"
         )
     logger.info("=" * 80)
 

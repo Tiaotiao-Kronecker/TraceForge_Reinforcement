@@ -15,7 +15,7 @@ import json
 import sys
 from pathlib import Path
 
-from utils.video_depth_pose_utils import video_depth_pose_dict
+from utils.video_depth_pose_utils import DEFAULT_DEPTH_POSE_METHOD, video_depth_pose_dict
 from utils.traceforge_artifact_utils import (
     DEFAULT_SCENE_STORAGE_MODE,
     LEGACY_LAYOUT,
@@ -38,6 +38,7 @@ from utils.threed_utils import (
     project_tracks_3d_to_3d,
 )
 from utils.traj_filter_utils import build_traj_filter_result, compute_depth_volatility_map
+from utils.keyframe_schedule_utils import map_query_source_indices_to_local
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -57,14 +58,19 @@ def parse_args():
     parser.add_argument(
         "--checkpoint", type=str, default="./checkpoints/tapip3d_final.pth"
     )
-    parser.add_argument('--depth_pose_method', type=str, default='vggt4', choices=video_depth_pose_dict.keys())
+    parser.add_argument(
+        "--depth_pose_method",
+        type=str,
+        default=DEFAULT_DEPTH_POSE_METHOD,
+        choices=video_depth_pose_dict.keys(),
+        help="Depth/pose source. Current maintained mode is external only.",
+    )
     parser.add_argument(
         "--external_extr_mode",
         type=str,
         default="w2c",
         choices=["w2c", "c2w"],
-        help="For depth_pose_method='external': how to interpret extrinsics in external_geom_npz. "
-             "'w2c' means matrices map world→camera (TraceForge default, will be used directly); "
+        help="'w2c' means matrices map world→camera and will be used directly; "
              "'c2w' means matrices map camera→world and will be inverted internally to obtain w2c.",
     )
     parser.add_argument(
@@ -72,9 +78,8 @@ def parse_args():
         type=str,
         default=None,
         help=(
-            "Path to NPZ/H5 with external geometry. "
-            "For --depth_pose_method external: uses external intrinsics+extrinsics and skips VGGT. "
-            "For --depth_pose_method vggt4: only replaces VGGT extrinsics."
+            "Path to NPZ/H5 with external intrinsics and extrinsics. "
+            "This is required in the maintained external-only pipeline."
         ),
     )
     parser.add_argument(
@@ -86,6 +91,12 @@ def parse_args():
             "Used with --external_geom_npz."
         ),
     )
+    parser.add_argument(
+        "--query_frame_schedule_path",
+        type=str,
+        default=None,
+        help="Optional JSON manifest that stores shared raw source-frame query indices.",
+    )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num_iters", type=int, default=6)
     parser.add_argument("--fps", type=int, default=1)
@@ -96,7 +107,7 @@ def parse_args():
         default=None,
         help="Optional output video name override. If set, output folder/file names use this value.",
     )
-    parser.add_argument("--max_num_frames", type=int, default=384)
+    parser.add_argument("--max_num_frames", type=int, default=512)
     parser.add_argument("--save_video", action="store_true", default=False)
     parser.add_argument(
         "--output_layout",
@@ -112,8 +123,7 @@ def parse_args():
         choices=[SCENE_STORAGE_SOURCE_REF, SCENE_STORAGE_CACHE],
         help=(
             "Storage backend for v2 artifacts. source_ref stores source RGB/depth/geometry "
-            "references in scene_meta.json and skips scene.h5/scene_rgb.mp4; cache writes local scene caches. "
-            "source_ref currently requires --depth_pose_method external."
+            "references in scene_meta.json and skips scene.h5/scene_rgb.mp4; cache writes local scene caches."
         ),
     )
     parser.add_argument(
@@ -242,7 +252,17 @@ def parse_args():
         default=None,
         help="Depth change std threshold in meters (overrides filter_level default)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.depth_pose_method != DEFAULT_DEPTH_POSE_METHOD:
+        parser.error(
+            f"Unsupported depth_pose_method='{args.depth_pose_method}'. "
+            f"Current maintained mode is '{DEFAULT_DEPTH_POSE_METHOD}'."
+        )
+    if args.external_geom_npz is None:
+        parser.error("external-only mode requires --external_geom_npz.")
+    if args.depth_path is None:
+        parser.error("external-only mode requires --depth_path.")
+    return args
 
 def retarget_trajectories(
     trajectory: np.ndarray,
@@ -694,9 +714,7 @@ def save_structured_data(
     intrinsics,
     extrinsics,
     query_points_per_frame,
-    horizon,
     original_filenames,
-    use_all_trajectories=True,
     query_frame_results=None,
     future_len: int = 128,
     grid_size: int = 20,
@@ -710,9 +728,10 @@ def save_structured_data(
     video_source_path: str | None = None,
     depth_source_path: str | None = None,
     source_frame_indices=None,
+    query_frame_metadata: dict[str, object] | None = None,
 ):
     """Save TraceForge inference artifacts."""
-    del intrinsics, extrinsics, query_points_per_frame, horizon, use_all_trajectories
+    del intrinsics, extrinsics, query_points_per_frame
 
     layout = getattr(filter_args, "output_layout", V2_LAYOUT) if filter_args is not None else V2_LAYOUT
     scene_storage_mode = (
@@ -752,6 +771,11 @@ def save_structured_data(
         if full_video_tensor is None or full_depths is None or full_intrinsics is None or full_extrinsics is None:
             raise ValueError("v2 output requires full_video_tensor/full_depths/full_intrinsics/full_extrinsics")
 
+        query_frame_metadata = dict(query_frame_metadata or {})
+        query_frame_sampling_mode = query_frame_metadata.get("query_frame_sampling_mode")
+        frame_drop_rate = None
+        if query_frame_sampling_mode == "uniform_grid":
+            frame_drop_rate = int(getattr(filter_args, "frame_drop_rate", 1))
         full_video_uint8 = _tensor_video_to_uint8_hwc(full_video_tensor)
         full_depths_np = _tensor_to_numpy(full_depths).astype(np.float32)
         full_intrinsics_np = _tensor_to_numpy(full_intrinsics).astype(np.float32)
@@ -791,7 +815,7 @@ def save_structured_data(
                 "height": int(full_video_uint8.shape[1]),
                 "width": int(full_video_uint8.shape[2]),
                 "extrinsics_mode": "w2c",
-                "frame_drop_rate": int(getattr(filter_args, "frame_drop_rate", 1)),
+                "frame_drop_rate": frame_drop_rate,
                 "future_len": int(future_len),
                 "original_filenames": list(map(str, original_filenames)),
                 "scene_storage_mode": scene_storage_mode,
@@ -807,6 +831,17 @@ def save_structured_data(
                 "source_extrinsics_mode": getattr(filter_args, "external_extr_mode", None),
                 "depth_pose_method": getattr(filter_args, "depth_pose_method", None),
                 "source_frame_indices": source_frame_indices_np.tolist(),
+                "query_frame_sampling_mode": query_frame_sampling_mode,
+                "query_frame_schedule_path": query_frame_metadata.get("query_frame_schedule_path"),
+                "query_frame_schedule_version": query_frame_metadata.get("query_frame_schedule_version"),
+                "keyframes_per_sec_min": query_frame_metadata.get("keyframes_per_sec_min"),
+                "keyframes_per_sec_max": query_frame_metadata.get("keyframes_per_sec_max"),
+                "query_frame_indices_local": query_frame_metadata.get("query_frame_indices_local"),
+                "query_frame_source_indices": query_frame_metadata.get("query_frame_source_indices"),
+                "query_frame_missing_source_indices": query_frame_metadata.get(
+                    "query_frame_missing_source_indices"
+                ),
+                "query_frame_schedule_episode_fps": query_frame_metadata.get("query_frame_schedule_episode_fps"),
             },
         )
         for query_frame_idx, frame_data in query_frame_results.items():
@@ -861,6 +896,103 @@ def save_structured_data(
     save_path = video_output_dir / f"{video_name}.npz"
     np.savez(save_path, **main_npz)
     logger.info(f"Traditional visualization NPZ saved to {save_path}")
+
+
+def _load_query_frame_schedule(schedule_path: str) -> dict[str, object]:
+    schedule_file = Path(schedule_path)
+    if not schedule_file.is_file():
+        raise FileNotFoundError(f"Query frame schedule not found: {schedule_file}")
+
+    payload = json.loads(schedule_file.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Query frame schedule must be a JSON object: {schedule_file}")
+
+    query_frame_source_indices = payload.get("query_frame_source_indices")
+    if not isinstance(query_frame_source_indices, list):
+        raise ValueError(
+            f"Query frame schedule missing 'query_frame_source_indices' list: {schedule_file}"
+        )
+
+    payload["query_frame_source_indices"] = [
+        int(source_idx) for source_idx in query_frame_source_indices
+    ]
+    return payload
+
+
+def _resolve_query_frames(
+    args,
+    *,
+    source_frame_indices: np.ndarray,
+    video_length: int,
+) -> tuple[list[int], dict[str, object]]:
+    source_frame_indices = np.asarray(source_frame_indices, dtype=np.int32).reshape(-1)
+    if source_frame_indices.shape != (video_length,):
+        raise ValueError(
+            f"Expected source_frame_indices shape {(video_length,)}, got {source_frame_indices.shape}"
+        )
+
+    schedule_path = getattr(args, "query_frame_schedule_path", None)
+    if schedule_path:
+        schedule_payload = _load_query_frame_schedule(schedule_path)
+        requested_query_source_indices = np.asarray(
+            schedule_payload["query_frame_source_indices"],
+            dtype=np.int32,
+        )
+        local_query_frames, missing_query_source_indices = map_query_source_indices_to_local(
+            source_frame_indices,
+            requested_query_source_indices,
+        )
+        if missing_query_source_indices.size > 0:
+            missing_preview = missing_query_source_indices[:10].tolist()
+            suffix = "..." if missing_query_source_indices.size > 10 else ""
+            logger.warning(
+                "Shared query-frame schedule references frames dropped by stride/max_num_frames: "
+                f"{missing_preview}{suffix} (missing={missing_query_source_indices.size})"
+            )
+        if local_query_frames.size == 0:
+            raise ValueError(
+                "Shared query-frame schedule resolved to zero query frames after "
+                "stride/max_num_frames filtering."
+            )
+
+        resolved_query_source_indices = source_frame_indices[local_query_frames]
+        query_frames = local_query_frames.tolist()
+        schedule_file = Path(schedule_path).resolve()
+        logger.info(
+            f"Using shared query-frame schedule: {len(query_frames)} frames from {schedule_file} "
+            f"(missing={missing_query_source_indices.size})"
+        )
+        return query_frames, {
+            "query_frame_sampling_mode": "shared_schedule",
+            "query_frame_schedule_path": str(schedule_file),
+            "query_frame_schedule_version": schedule_payload.get("version"),
+            "keyframes_per_sec_min": schedule_payload.get("keyframes_per_sec_min"),
+            "keyframes_per_sec_max": schedule_payload.get("keyframes_per_sec_max"),
+            "query_frame_indices_local": query_frames,
+            "query_frame_source_indices": resolved_query_source_indices.astype(np.int32).tolist(),
+            "query_frame_missing_source_indices": missing_query_source_indices.astype(np.int32).tolist(),
+            "query_frame_schedule_episode_fps": schedule_payload.get("episode_fps"),
+        }
+
+    frame_drop_rate = int(getattr(args, "frame_drop_rate", 1))
+    if frame_drop_rate <= 0:
+        raise ValueError(f"frame_drop_rate must be >= 1, got {frame_drop_rate}")
+
+    query_frames = list(range(0, video_length, frame_drop_rate))
+    logger.info(
+        f"Using uniform grid sampling on frames: {query_frames} (frame_drop_rate={frame_drop_rate})"
+    )
+    return query_frames, {
+        "query_frame_sampling_mode": "uniform_grid",
+        "query_frame_schedule_path": None,
+        "query_frame_schedule_version": None,
+        "keyframes_per_sec_min": None,
+        "keyframes_per_sec_max": None,
+        "query_frame_indices_local": query_frames,
+        "query_frame_source_indices": source_frame_indices[query_frames].astype(np.int32).tolist(),
+        "query_frame_missing_source_indices": [],
+        "query_frame_schedule_episode_fps": None,
+    }
 
 
 def process_single_video(video_path, depth_path, args, model_3dtracker, model_depth_pose, video_name=None, output_dir=None):
@@ -985,10 +1117,10 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
     query_point = []
     tracking_segments = []  # Store info about which frames to track for each segment
 
-    # Determine which frames to query based on frame_drop_rate
-    query_frames = list(range(0, video_length, args.frame_drop_rate))
-    logger.info(
-        f"Using uniform grid sampling on frames: {query_frames} (frame_drop_rate={args.frame_drop_rate})"
+    query_frames, query_frame_metadata = _resolve_query_frames(
+        args,
+        source_frame_indices=source_frame_indices,
+        video_length=video_length,
     )
     logger.info(f"Tracking up to {args.future_len} frames from each query frame")
 
@@ -1171,14 +1303,11 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
         "query_points_per_frame": query_points_per_frame,
         "original_filenames": original_filenames,
         "source_frame_indices": source_frame_indices,
+        "query_frame_metadata": query_frame_metadata,
         "depth_conf": depth_conf_npy,
         "query_frame_results": query_frame_results,  # Add individual frame results
-        "full_intrinsics": torch.from_numpy(intrs_npy)
-        .float()
-        .to(args.device),  # Full video intrinsics
-        "full_extrinsics": torch.from_numpy(extrs_npy)
-        .float()
-        .to(args.device),  # Full video extrinsics
+        "full_intrinsics": intrs_npy.astype(np.float32),  # Keep save-time metadata on CPU.
+        "full_extrinsics": extrs_npy.astype(np.float32),
     }
 
 
@@ -1264,7 +1393,7 @@ def _collect_and_sort_frame_files(video_path, extensions):
     return files
 
 
-def load_video_and_mask(video_path, mask_dir=None, fps=1, max_num_frames=384, is_depth=False):
+def load_video_and_mask(video_path, mask_dir=None, fps=1, max_num_frames=512, is_depth=False):
     original_filenames = []
     source_frame_indices: list[int] = []
 
@@ -1514,9 +1643,7 @@ if __name__ == "__main__":
                 intrinsics=result["intrinsics"],
                 extrinsics=result["extrinsics"],
                 query_points_per_frame=result["query_points_per_frame"],
-                horizon=args.horizon,
                 original_filenames=result["original_filenames"],
-                use_all_trajectories=args.use_all_trajectories,
                 query_frame_results=result.get("query_frame_results"),
                 future_len=args.future_len,
                 grid_size=args.grid_size,
@@ -1529,6 +1656,7 @@ if __name__ == "__main__":
                 video_source_path=video_path,
                 depth_source_path=depth_path,
                 source_frame_indices=result["source_frame_indices"],
+                query_frame_metadata=result.get("query_frame_metadata"),
             )
 
         except Exception as e:
