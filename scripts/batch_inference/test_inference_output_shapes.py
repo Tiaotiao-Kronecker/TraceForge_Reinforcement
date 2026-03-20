@@ -68,6 +68,43 @@ class InferenceShapeTests(unittest.TestCase):
         self.assertEqual(visibs.shape, torch.Size([2, 4]))
         self.assertTrue(visibs.all())
 
+    def test_return_metadata_reports_support_query_count(self):
+        num_frames = 2
+        num_queries = 4
+        model = _FakeModel()
+
+        coords = torch.arange(
+            num_frames * num_queries * 3, dtype=torch.float32
+        ).reshape(1, num_frames, num_queries, 3)
+        visib_logits = torch.full((1, num_frames, num_queries), 10.0)
+
+        video = torch.rand(num_frames, 3, 4, 4)
+        depths = torch.ones(num_frames, 4, 4)
+        intrinsics = torch.eye(3).repeat(num_frames, 1, 1)
+        extrinsics = torch.eye(4).repeat(num_frames, 1, 1)
+        query_point = torch.zeros(num_queries, 4)
+
+        with mock.patch.object(
+            inference_utils,
+            "_inference_with_grid",
+            return_value=(_FakePreds(coords, visib_logits), None, 7),
+        ):
+            coords_out, visibs_out, metadata = inference_utils.inference(
+                model=model,
+                video=video,
+                depths=depths,
+                intrinsics=intrinsics,
+                extrinsics=extrinsics,
+                query_point=query_point,
+                bidrectional=False,
+                grid_size=8,
+                return_metadata=True,
+            )
+
+        self.assertEqual(coords_out.shape, torch.Size([2, 4, 3]))
+        self.assertEqual(visibs_out.shape, torch.Size([2, 4]))
+        self.assertEqual(metadata["effective_support_query_count"], 7)
+
 
 if __name__ == "__main__":
     unittest.main()

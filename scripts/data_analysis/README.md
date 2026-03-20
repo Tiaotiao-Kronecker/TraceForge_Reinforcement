@@ -10,6 +10,9 @@
 - `benchmark_depth_volatility_optimization.py`
   - 对比 depth volatility 优化前后在 baseline ref 与当前工作树上的运行耗时
   - 支持共享 query-frame schedule、external + wrist-like 相机成对测试、以及 save 阶段单独计时
+- `benchmark_inference_variants.py`
+  - 对比当前工作树内多种 inference 配置的端到端耗时与保存结果差异
+  - 支持共享 query-frame schedule、process breakdown、dense 轨迹差异统计、以及可选验证图导出
 - `analyze_action_format.py`
 - `check_action_format.py`
 - `check_action_info.py`

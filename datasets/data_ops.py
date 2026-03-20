@@ -888,11 +888,21 @@ def camera_aug(
 from utils.moge_utils3d import depth_edge, normals_edge, points_to_normals
 from scipy import ndimage
 
-def _filter_one_depth(depth: np.ndarray, depth_rtol: float, normal_tol: float, intrinsics: np.ndarray) -> np.ndarray:
+def _build_depth_filter_rays(depth_shape: Tuple[int, int], intrinsics: np.ndarray) -> np.ndarray:
     inv_intrinsics = np.linalg.inv(intrinsics)
-    uv_grid = np.meshgrid(np.arange(depth.shape[1]), np.arange(depth.shape[0]), indexing="xy")
+    uv_grid = np.meshgrid(np.arange(depth_shape[1]), np.arange(depth_shape[0]), indexing="xy")
     uv_homo = np.stack([uv_grid[0], uv_grid[1], np.ones_like(uv_grid[0])], axis=-1)
-    xyz_homo = np.einsum("ij,uvj->uvi", inv_intrinsics, uv_homo)
+    return np.einsum("ij,uvj->uvi", inv_intrinsics, uv_homo)
+
+
+def _filter_one_depth(
+    depth: np.ndarray,
+    depth_rtol: float,
+    normal_tol: float,
+    intrinsics: np.ndarray,
+    rays: np.ndarray | None = None,
+) -> np.ndarray:
+    xyz_homo = rays if rays is not None else _build_depth_filter_rays(depth.shape, intrinsics)
     xyz_homo = xyz_homo * depth[..., None]
     valid_mask = depth > 0.
     normals, normals_mask = points_to_normals(xyz_homo, mask=valid_mask)

@@ -72,6 +72,11 @@ class PressOneButtonCliSurfaceTests(unittest.TestCase):
         self.assertNotIn("--max_frames_per_video", _CLI_FLAGS)
         self.assertNotIn("--depth_volatility_mode", _CLI_FLAGS)
 
+    def test_exposes_query_prefilter_and_support_ratio_flags(self):
+        self.assertIn("--query_prefilter_mode", _CLI_FLAGS)
+        self.assertIn("--query_prefilter_wrist_rank_keep_ratio", _CLI_FLAGS)
+        self.assertIn("--support_grid_ratio", _CLI_FLAGS)
+
 
 if __name__ == "__main__":
     unittest.main()

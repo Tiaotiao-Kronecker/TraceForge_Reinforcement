@@ -1,5 +1,6 @@
 
 from typing import Tuple
+import time
 import torch
 from pathlib import Path
 from third_party.cotracker.model_utils import get_points_on_a_grid
@@ -8,6 +9,21 @@ import av
 import cv2
 import numpy as np
 from einops import repeat, rearrange
+
+
+def _sync_device_if_needed(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
+def _accumulate_profile_stat(
+    profile_stats: dict[str, float] | None,
+    key: str,
+    seconds: float,
+) -> None:
+    if profile_stats is None:
+        return
+    profile_stats[key] = float(profile_stats.get(key, 0.0) + float(seconds))
 
 def get_grid_queries(grid_size: int, depths: torch.Tensor, intrinsics: torch.Tensor, extrinsics: torch.Tensor):
     if len (depths.shape) == 3:
@@ -53,6 +69,7 @@ def _inference_with_grid(
     query_point: torch.Tensor,
     num_iters: int = 6,
     grid_size: int = 8,
+    profile_stats: dict[str, float] | None = None,
     **kwargs,
 ):
     if grid_size != 0:
@@ -62,6 +79,8 @@ def _inference_with_grid(
     else:
         N_supports = 0
 
+    _sync_device_if_needed(video.device)
+    model_forward_start = time.perf_counter()
     preds, train_data_list = model(
         rgb_obs=video,
         depth_obs=depths,
@@ -72,9 +91,26 @@ def _inference_with_grid(
         mode="inference",
         **kwargs
     )
+    _sync_device_if_needed(video.device)
+    _accumulate_profile_stat(
+        profile_stats,
+        "tracker_model_forward_seconds",
+        time.perf_counter() - model_forward_start,
+    )
     N_total = preds.coords.shape[2]
     preds = preds.query_slice(slice(0, N_total - N_supports))
-    return preds, train_data_list
+    return preds, train_data_list, int(N_supports)
+
+
+def _unpack_inference_with_grid_result(result):
+    if isinstance(result, tuple):
+        if len(result) == 3:
+            preds, train_data_list, support_query_count = result
+            return preds, train_data_list, int(support_query_count)
+        if len(result) == 2:
+            preds, train_data_list = result
+            return preds, train_data_list, 0
+    raise ValueError("Expected _inference_with_grid() to return a 2-tuple or 3-tuple")
 
 def load_model(checkpoint_path: str):
     checkpoint_path = Path(checkpoint_path)
@@ -128,7 +164,11 @@ def inference(
     grid_size: int = 8,
     bidrectional: bool = True,
     vis_threshold = 0.9,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    profile_stats: dict[str, float] | None = None,
+    return_metadata: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, dict[str, int]]:
+    _sync_device_if_needed(video.device)
+    inference_start = time.perf_counter()
     _depths = depths.clone()
     _depths = _depths[_depths > 0].reshape(-1)
     q25 = torch.kthvalue(_depths, int(0.25 * len(_depths))).values
@@ -146,29 +186,35 @@ def inference(
 
     model.set_image_size((H, W))
 
-    preds, _ = _inference_with_grid(
-        model=model,
-        video=video[None],
-        depths=depths[None],
-        intrinsics=intrinsics[None],
-        extrinsics=extrinsics[None],
-        query_point=query_point[None],
-        num_iters=num_iters,
-        depth_roi=_depth_roi,
-        grid_size=grid_size
-    )
-
-    if bidrectional and not model.bidirectional and (query_point[..., 0] > 0).any():
-        preds_backward, _ = _inference_with_grid(
+    preds, _, support_query_count = _unpack_inference_with_grid_result(
+        _inference_with_grid(
             model=model,
-            video=video[None].flip(dims=(1,)),
-            depths=depths[None].flip(dims=(1,)),
-            intrinsics=intrinsics[None].flip(dims=(1,)),
-            extrinsics=extrinsics[None].flip(dims=(1,)),
-            query_point=torch.cat([T - 1 - query_point[..., :1], query_point[..., 1:]], dim=-1)[None],
+            video=video[None],
+            depths=depths[None],
+            intrinsics=intrinsics[None],
+            extrinsics=extrinsics[None],
+            query_point=query_point[None],
             num_iters=num_iters,
             depth_roi=_depth_roi,
             grid_size=grid_size,
+            profile_stats=profile_stats,
+        )
+    )
+
+    if bidrectional and not model.bidirectional and (query_point[..., 0] > 0).any():
+        preds_backward, _, _ = _unpack_inference_with_grid_result(
+            _inference_with_grid(
+                model=model,
+                video=video[None].flip(dims=(1,)),
+                depths=depths[None].flip(dims=(1,)),
+                intrinsics=intrinsics[None].flip(dims=(1,)),
+                extrinsics=extrinsics[None].flip(dims=(1,)),
+                query_point=torch.cat([T - 1 - query_point[..., :1], query_point[..., 1:]], dim=-1)[None],
+                num_iters=num_iters,
+                depth_roi=_depth_roi,
+                grid_size=grid_size,
+                profile_stats=profile_stats,
+            )
         )
         preds.coords = torch.where(
             repeat(torch.arange(T, device=video.device), 't -> b t n 3', b=1, n=N) < repeat(query_point[..., 0][None], 'b n -> b t n 3', t=T, n=N),
@@ -183,4 +229,15 @@ def inference(
 
     coords, visib_logits = preds.coords, preds.visibs
     visibs = torch.sigmoid(visib_logits) >= vis_threshold
-    return _remove_batch_dim(coords, visibs)
+    _sync_device_if_needed(video.device)
+    _accumulate_profile_stat(
+        profile_stats,
+        "tracker_inference_total_seconds",
+        time.perf_counter() - inference_start,
+    )
+    coords_out, visibs_out = _remove_batch_dim(coords, visibs)
+    if return_metadata:
+        return coords_out, visibs_out, {
+            "effective_support_query_count": int(max(0, support_query_count)),
+        }
+    return coords_out, visibs_out

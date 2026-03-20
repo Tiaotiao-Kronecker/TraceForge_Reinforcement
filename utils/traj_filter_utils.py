@@ -50,6 +50,11 @@ VOLATILITY_LOW_PERCENTILE = 5.0
 VOLATILITY_HIGH_PERCENTILE = 95.0
 VOLATILITY_MASK_PERCENTILE = 99.0
 
+QUERY_PREFILTER_MODE_OFF = "off"
+QUERY_PREFILTER_MODE_PROFILE_AWARE_STATIC_V1 = "profile_aware_static_v1"
+DEFAULT_QUERY_PREFILTER_MODE = QUERY_PREFILTER_MODE_OFF
+DEFAULT_QUERY_PREFILTER_WRIST_RANK_KEEP_RATIO = 0.30
+
 MASK_REASON_BASE_GEOMETRY_FAIL = np.uint8(1 << 0)
 MASK_REASON_QUERY_DEPTH_FAIL = np.uint8(1 << 1)
 MASK_REASON_TEMPORAL_CONSISTENCY_FAIL = np.uint8(1 << 2)
@@ -924,6 +929,135 @@ def compute_query_depth_edge_risk_mask(
         "query_edge_mask": query_edge_mask.astype(bool),
         "patch_valid_ratio": patch_valid_ratio.astype(np.float32),
         "patch_std": patch_std.astype(np.float32),
+    }
+
+
+def build_query_prefilter_result(
+    keypoints: np.ndarray,
+    query_depth: np.ndarray,
+    *,
+    filter_args,
+    filter_config: dict | None = None,
+    query_prefilter_mode: str | None = None,
+    wrist_rank_keep_ratio: float | None = None,
+) -> dict[str, np.ndarray]:
+    """Build a light-weight query prefilter using only query-frame static signals."""
+    keypoints = np.asarray(keypoints, dtype=np.float32)
+    query_depth = np.asarray(query_depth, dtype=np.float32)
+    if keypoints.ndim != 2 or keypoints.shape[1] != 2:
+        raise ValueError(f"Expected keypoints shape (N,2), got {keypoints.shape}")
+    if query_depth.ndim != 2:
+        raise ValueError(f"Expected query_depth shape (H,W), got {query_depth.shape}")
+
+    num_tracks = int(keypoints.shape[0])
+    default_prefilter_mask = np.ones(num_tracks, dtype=bool)
+    default_reason_bits = np.zeros(num_tracks, dtype=np.uint8)
+    default_rank = np.full(num_tracks, np.nan, dtype=np.float32)
+    default_ratio = np.full(num_tracks, np.nan, dtype=np.float32)
+    default_std = np.full(num_tracks, np.nan, dtype=np.float32)
+    default_bool = np.zeros(num_tracks, dtype=bool)
+
+    if filter_config is None:
+        filter_config = resolve_traj_filter_config(filter_args)
+    profile = str(filter_config["profile"])
+    mode = (
+        str(query_prefilter_mode)
+        if query_prefilter_mode is not None
+        else str(getattr(filter_args, "query_prefilter_mode", DEFAULT_QUERY_PREFILTER_MODE))
+    )
+
+    if mode == QUERY_PREFILTER_MODE_OFF or not bool(filter_config["enabled"]):
+        return {
+            "prefilter_mask": default_prefilter_mask,
+            "reason_bits": default_reason_bits,
+            "query_depth_quality_mask": default_prefilter_mask.copy(),
+            "query_depth_edge_mask": default_bool.copy(),
+            "query_depth_edge_risk_mask": default_bool.copy(),
+            "query_depth_patch_valid_ratio": default_ratio.copy(),
+            "query_depth_patch_std": default_std.copy(),
+            "query_depth_rank": default_rank.copy(),
+        }
+    if mode != QUERY_PREFILTER_MODE_PROFILE_AWARE_STATIC_V1:
+        raise ValueError(f"Unsupported query_prefilter_mode: {mode}")
+    if profile in {
+        TRAJ_FILTER_PROFILE_EXTERNAL,
+        TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR,
+        TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR_V2,
+    }:
+        return {
+            "prefilter_mask": default_prefilter_mask,
+            "reason_bits": default_reason_bits,
+            "query_depth_quality_mask": default_prefilter_mask.copy(),
+            "query_depth_edge_mask": default_bool.copy(),
+            "query_depth_edge_risk_mask": default_bool.copy(),
+            "query_depth_patch_valid_ratio": default_ratio.copy(),
+            "query_depth_patch_std": default_std.copy(),
+            "query_depth_rank": default_rank.copy(),
+        }
+
+    patch_stats = _compute_query_depth_patch_stats(
+        keypoints,
+        query_depth,
+        min_depth=float(filter_config["min_depth"]),
+        max_depth=float(filter_config["max_depth"]),
+    )
+    query_depth_quality_mask = compute_query_depth_quality_mask(
+        keypoints,
+        query_depth,
+        min_depth=float(filter_config["min_depth"]),
+        max_depth=float(filter_config["max_depth"]),
+        patch_stats=patch_stats,
+    )
+    reason_bits = np.zeros(num_tracks, dtype=np.uint8)
+    reason_bits[~query_depth_quality_mask] |= MASK_REASON_QUERY_DEPTH_FAIL
+
+    query_depth_edge_mask = np.zeros(num_tracks, dtype=bool)
+    query_depth_edge_risk_mask = np.zeros(num_tracks, dtype=bool)
+    prefilter_mask = query_depth_quality_mask.copy()
+    if profile in {
+        TRAJ_FILTER_PROFILE_WRIST,
+        TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR_TOP95,
+        TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR,
+    }:
+        edge_result = compute_query_depth_edge_risk_mask(
+            keypoints,
+            query_depth,
+            min_depth=float(filter_config["min_depth"]),
+            max_depth=float(filter_config["max_depth"]),
+            patch_stats=patch_stats,
+        )
+        query_depth_edge_mask = np.asarray(edge_result["query_edge_mask"]).astype(bool, copy=False)
+        query_depth_edge_risk_mask = np.asarray(edge_result["mask"]).astype(bool, copy=False)
+        prefilter_mask &= ~query_depth_edge_risk_mask
+        reason_bits[query_depth_edge_risk_mask] |= MASK_REASON_QUERY_DEPTH_EDGE_FAIL
+
+    query_depth_rank = np.full(num_tracks, np.nan, dtype=np.float32)
+    if profile in {
+        TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR_TOP95,
+        TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR,
+    }:
+        rank_keep_ratio = (
+            DEFAULT_QUERY_PREFILTER_WRIST_RANK_KEEP_RATIO
+            if wrist_rank_keep_ratio is None
+            else float(wrist_rank_keep_ratio)
+        )
+        rank_keep_ratio = float(np.clip(rank_keep_ratio, 0.0, 1.0))
+        rank_input_mask = prefilter_mask.copy()
+        query_depth_values = np.asarray(patch_stats["query_values"]).astype(np.float32, copy=False)
+        query_depth_rank = _compute_query_depth_ranks(query_depth_values, rank_input_mask)
+        rank_keep_mask = rank_input_mask & np.isfinite(query_depth_rank) & (query_depth_rank <= rank_keep_ratio)
+        reason_bits[rank_input_mask & (~rank_keep_mask)] |= MASK_REASON_MANIPULATOR_DEPTH_FAIL
+        prefilter_mask = rank_keep_mask
+
+    return {
+        "prefilter_mask": prefilter_mask.astype(bool, copy=False),
+        "reason_bits": reason_bits.astype(np.uint8, copy=False),
+        "query_depth_quality_mask": query_depth_quality_mask.astype(bool, copy=False),
+        "query_depth_edge_mask": query_depth_edge_mask.astype(bool, copy=False),
+        "query_depth_edge_risk_mask": query_depth_edge_risk_mask.astype(bool, copy=False),
+        "query_depth_patch_valid_ratio": np.asarray(patch_stats["patch_valid_ratio"]).astype(np.float32, copy=False),
+        "query_depth_patch_std": np.asarray(patch_stats["patch_std"]).astype(np.float32, copy=False),
+        "query_depth_rank": query_depth_rank.astype(np.float32, copy=False),
     }
 
 

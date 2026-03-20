@@ -13,6 +13,7 @@ import argparse
 from loguru import logger
 import json
 import sys
+import time
 from pathlib import Path
 
 from utils.video_depth_pose_utils import DEFAULT_DEPTH_POSE_METHOD, video_depth_pose_dict
@@ -29,8 +30,8 @@ from utils.traceforge_artifact_utils import (
     write_scene_rgb_mp4,
 )
 
-from datasets.data_ops import _filter_one_depth
-from concurrent.futures import ThreadPoolExecutor
+from datasets.data_ops import _build_depth_filter_rays, _filter_one_depth
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Tuple
 from utils.inference_utils import load_model, inference
 from utils.threed_utils import (
@@ -38,12 +39,183 @@ from utils.threed_utils import (
     project_tracks_3d_to_3d,
 )
 from utils.traj_filter_utils import (
+    DEFAULT_QUERY_PREFILTER_MODE,
+    DEFAULT_QUERY_PREFILTER_WRIST_RANK_KEEP_RATIO,
+    QUERY_PREFILTER_MODE_OFF,
     build_traj_filter_result,
+    build_query_prefilter_result,
     compute_accessed_high_volatility_mask,
     prepare_temporal_depth_consistency_context,
     resolve_traj_filter_config,
 )
 from utils.keyframe_schedule_utils import map_query_source_indices_to_local
+
+
+def _sync_device_if_needed(device: str | torch.device | None) -> None:
+    if device is None:
+        return
+    resolved_device = device if isinstance(device, torch.device) else torch.device(device)
+    if resolved_device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(resolved_device)
+
+
+def _accumulate_profile_stat(
+    profile_stats: dict[str, float] | None,
+    key: str,
+    seconds: float,
+) -> None:
+    if profile_stats is None:
+        return
+    profile_stats[key] = float(profile_stats.get(key, 0.0) + float(seconds))
+
+
+def _timed_cuda_empty_cache(
+    *,
+    profile_stats: dict[str, float] | None,
+    key: str,
+) -> None:
+    if not torch.cuda.is_available():
+        return
+    empty_cache_start = time.perf_counter()
+    torch.cuda.empty_cache()
+    _accumulate_profile_stat(profile_stats, key, time.perf_counter() - empty_cache_start)
+
+
+def _build_tracking_frame_use_counts(
+    video_length: int,
+    tracking_segments: list[tuple[int, int]],
+) -> np.ndarray:
+    frame_use_counts = np.zeros(video_length, dtype=np.int32)
+    for start_frame, end_frame in tracking_segments:
+        frame_use_counts[start_frame:end_frame] += 1
+    return frame_use_counts
+
+
+class _DepthFilterRuntime:
+    def __init__(
+        self,
+        depths: np.ndarray,
+        intrinsics: np.ndarray,
+        tracking_segments: list[tuple[int, int]],
+        *,
+        profile_stats: dict[str, float] | None,
+        max_workers: int = 8,
+    ) -> None:
+        self._depths = depths
+        self._intrinsics = intrinsics
+        self._profile_stats = profile_stats
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._filtered_depth_cache: dict[int, np.ndarray] = {}
+        self._remaining_use_counts = _build_tracking_frame_use_counts(
+            len(depths),
+            tracking_segments,
+        )
+        self._ray_cache: dict[tuple[int, int, str, bytes], np.ndarray] = {}
+
+    def __enter__(self) -> "_DepthFilterRuntime":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=True)
+
+    def _make_ray_cache_key(
+        self,
+        depth: np.ndarray,
+        intrinsics: np.ndarray,
+    ) -> tuple[int, int, str, bytes]:
+        intrinsics_contiguous = np.ascontiguousarray(intrinsics)
+        return (
+            int(depth.shape[0]),
+            int(depth.shape[1]),
+            intrinsics_contiguous.dtype.str,
+            intrinsics_contiguous.tobytes(),
+        )
+
+    def _get_rays(
+        self,
+        depth: np.ndarray,
+        intrinsics: np.ndarray,
+    ) -> np.ndarray:
+        cache_key = self._make_ray_cache_key(depth, intrinsics)
+        cached_rays = self._ray_cache.get(cache_key)
+        if cached_rays is not None:
+            _accumulate_profile_stat(
+                self._profile_stats,
+                "prepare_depth_filter_ray_cache_hit_frames",
+                1.0,
+            )
+            return cached_rays
+
+        _accumulate_profile_stat(
+            self._profile_stats,
+            "prepare_depth_filter_ray_cache_miss_frames",
+            1.0,
+        )
+        rays = _build_depth_filter_rays(depth.shape, intrinsics)
+        self._ray_cache[cache_key] = rays
+        return rays
+
+    def get_filtered_depth_segment(
+        self,
+        start_frame: int,
+        end_frame: int,
+    ) -> np.ndarray:
+        frame_indices = range(start_frame, end_frame)
+        futures: list[tuple[int, Future[np.ndarray]]] = []
+        depth_filter_start = time.perf_counter()
+
+        for frame_idx in frame_indices:
+            cached_depth = self._filtered_depth_cache.get(frame_idx)
+            if cached_depth is not None:
+                _accumulate_profile_stat(
+                    self._profile_stats,
+                    "prepare_depth_filter_cache_hit_frames",
+                    1.0,
+                )
+                continue
+
+            _accumulate_profile_stat(
+                self._profile_stats,
+                "prepare_depth_filter_cache_miss_frames",
+                1.0,
+            )
+            depth = np.asarray(self._depths[frame_idx], dtype=np.float32)
+            intrinsics = np.asarray(self._intrinsics[frame_idx], dtype=np.float32)
+            rays = self._get_rays(depth, intrinsics)
+            futures.append(
+                (
+                    frame_idx,
+                    self._executor.submit(
+                        _filter_one_depth,
+                        depth,
+                        0.08,
+                        15,
+                        intrinsics,
+                        rays,
+                    ),
+                )
+            )
+
+        if futures:
+            for frame_idx, future in futures:
+                self._filtered_depth_cache[frame_idx] = future.result()
+            _accumulate_profile_stat(
+                self._profile_stats,
+                "prepare_depth_filter_seconds",
+                time.perf_counter() - depth_filter_start,
+            )
+
+        return np.stack([self._filtered_depth_cache[frame_idx] for frame_idx in frame_indices], axis=0)
+
+    def release_segment_frames(self, start_frame: int, end_frame: int) -> None:
+        for frame_idx in range(start_frame, end_frame):
+            remaining_uses = int(self._remaining_use_counts[frame_idx]) - 1
+            self._remaining_use_counts[frame_idx] = remaining_uses
+            if remaining_uses == 0:
+                self._filtered_depth_cache.pop(frame_idx, None)
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -193,6 +365,34 @@ def parse_args():
         help="Grid size for uniform keypoint sampling (grid_size x grid_size points per frame). Default is 20 (400 points).",
     )
     parser.add_argument(
+        "--query_prefilter_mode",
+        type=str,
+        default=DEFAULT_QUERY_PREFILTER_MODE,
+        choices=[
+            QUERY_PREFILTER_MODE_OFF,
+            "profile_aware_static_v1",
+        ],
+        help=(
+            "Optional static query prefilter before tracking. "
+            "profile_aware_static_v1 only applies aggressive prefiltering to wrist-like profiles."
+        ),
+    )
+    parser.add_argument(
+        "--query_prefilter_wrist_rank_keep_ratio",
+        type=float,
+        default=DEFAULT_QUERY_PREFILTER_WRIST_RANK_KEEP_RATIO,
+        help=(
+            "For wrist_manipulator* profiles under query prefiltering, keep the closest "
+            "query-frame depth ranks up to this ratio."
+        ),
+    )
+    parser.add_argument(
+        "--support_grid_ratio",
+        type=float,
+        default=0.8,
+        help="Support-point grid ratio relative to grid_size. 0 disables extra support points.",
+    )
+    parser.add_argument(
         "--filter_level",
         type=str,
         default="standard",
@@ -267,6 +467,10 @@ def parse_args():
         parser.error("external-only mode requires --external_geom_npz.")
     if args.depth_path is None:
         parser.error("external-only mode requires --depth_path.")
+    if args.query_prefilter_wrist_rank_keep_ratio < 0.0 or args.query_prefilter_wrist_rank_keep_ratio > 1.0:
+        parser.error("--query_prefilter_wrist_rank_keep_ratio must be within [0, 1].")
+    if args.support_grid_ratio < 0.0:
+        parser.error("--support_grid_ratio must be >= 0.")
     return args
 
 def retarget_trajectories(
@@ -421,6 +625,159 @@ def _build_grid_keypoints(frame_h: int, frame_w: int, grid_size: int) -> np.ndar
     return np.stack([xx.flatten(), yy.flatten()], axis=1).astype(np.float32)
 
 
+def _build_frame_query_points(frame_idx: int, dense_keypoints: np.ndarray) -> np.ndarray:
+    frame_column = np.full((dense_keypoints.shape[0], 1), float(frame_idx), dtype=np.float32)
+    return np.concatenate([frame_column, dense_keypoints.astype(np.float32, copy=False)], axis=1)
+
+
+def _resolve_support_grid_size(grid_size: int, support_grid_ratio: float) -> int:
+    return max(0, int(round(float(grid_size) * float(max(0.0, support_grid_ratio)))))
+
+
+def _scatter_tracked_predictions_to_dense(
+    coords: torch.Tensor,
+    visibs: torch.Tensor,
+    tracked_query_indices: np.ndarray,
+    dense_track_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    tracked_query_indices = np.asarray(tracked_query_indices, dtype=np.int64).reshape(-1)
+    if coords.shape[1] == dense_track_count:
+        return coords, visibs
+    device = coords.device
+    tracked_index_tensor = torch.as_tensor(tracked_query_indices, dtype=torch.long, device=device)
+    dense_coords = torch.full(
+        (coords.shape[0], dense_track_count, coords.shape[2]),
+        float("nan"),
+        dtype=coords.dtype,
+        device=device,
+    )
+    dense_visibs = torch.zeros(
+        (visibs.shape[0], dense_track_count),
+        dtype=visibs.dtype,
+        device=visibs.device,
+    )
+    dense_coords[:, tracked_index_tensor] = coords
+    dense_visibs[:, tracked_index_tensor] = visibs
+    return dense_coords, dense_visibs
+
+
+def _build_dense_sample_payload_from_tracked_subset(
+    *,
+    dense_keypoints: np.ndarray,
+    tracked_query_indices: np.ndarray,
+    tracked_sample_payload: dict[str, np.ndarray],
+    prefilter_result: dict[str, np.ndarray] | None,
+) -> dict[str, np.ndarray]:
+    dense_keypoints = np.asarray(dense_keypoints, dtype=np.float32)
+    tracked_query_indices = np.asarray(tracked_query_indices, dtype=np.int32).reshape(-1)
+    dense_track_count = int(dense_keypoints.shape[0])
+    num_frames = int(np.asarray(tracked_sample_payload["traj_uvz"]).shape[1])
+
+    dense_payload: dict[str, np.ndarray] = {
+        "traj_uvz": np.full((dense_track_count, num_frames, 3), np.nan, dtype=np.float32),
+        "traj_2d": np.full((dense_track_count, num_frames, 2), np.nan, dtype=np.float32),
+        "keypoints": dense_keypoints.astype(np.float32, copy=False),
+        "query_frame_index": np.asarray(tracked_sample_payload["query_frame_index"]).astype(np.int32, copy=False),
+        "segment_frame_indices": np.asarray(tracked_sample_payload["segment_frame_indices"]).astype(np.int32, copy=False),
+        "traj_valid_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_depth_consistency_ratio": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_stable_depth_consistency_ratio": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_high_volatility_hit": np.zeros(dense_track_count, dtype=bool),
+        "traj_volatility_exposure_ratio": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_compare_frame_count": np.zeros(dense_track_count, dtype=np.uint16),
+        "traj_stable_compare_frame_count": np.zeros(dense_track_count, dtype=np.uint16),
+        "traj_mask_reason_bits": np.zeros(dense_track_count, dtype=np.uint8),
+        "traj_supervision_mask": np.zeros((dense_track_count, num_frames), dtype=bool),
+        "traj_supervision_prefix_len": np.zeros(dense_track_count, dtype=np.uint16),
+        "traj_supervision_count": np.zeros(dense_track_count, dtype=np.uint16),
+        "traj_wrist_seed_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_query_depth_rank": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_query_depth_edge_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_query_depth_patch_valid_ratio": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_query_depth_patch_std": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_query_depth_edge_risk_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_motion_extent": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_motion_step_median": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_manipulator_candidate_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_manipulator_cluster_id": np.full(dense_track_count, -1, dtype=np.int16),
+        "traj_manipulator_component_size": np.zeros(dense_track_count, dtype=np.uint16),
+        "traj_manipulator_cluster_fallback_used": np.asarray(
+            tracked_sample_payload["traj_manipulator_cluster_fallback_used"], dtype=bool
+        ),
+    }
+    if "visibility" in tracked_sample_payload:
+        dense_payload["visibility"] = np.zeros((dense_track_count, num_frames), dtype=np.float16)
+
+    if prefilter_result is not None:
+        dense_payload["traj_mask_reason_bits"] = np.asarray(prefilter_result["reason_bits"]).astype(np.uint8, copy=False)
+        dense_payload["traj_query_depth_rank"] = np.asarray(prefilter_result["query_depth_rank"]).astype(
+            np.float16,
+            copy=False,
+        )
+        dense_payload["traj_query_depth_edge_mask"] = np.asarray(prefilter_result["query_depth_edge_mask"]).astype(
+            bool,
+            copy=False,
+        )
+        dense_payload["traj_query_depth_patch_valid_ratio"] = np.asarray(
+            prefilter_result["query_depth_patch_valid_ratio"]
+        ).astype(np.float16, copy=False)
+        dense_payload["traj_query_depth_patch_std"] = np.asarray(prefilter_result["query_depth_patch_std"]).astype(
+            np.float16,
+            copy=False,
+        )
+        dense_payload["traj_query_depth_edge_risk_mask"] = np.asarray(
+            prefilter_result["query_depth_edge_risk_mask"]
+        ).astype(bool, copy=False)
+
+    dense_payload["traj_uvz"][tracked_query_indices] = np.asarray(tracked_sample_payload["traj_uvz"]).astype(
+        np.float32,
+        copy=False,
+    )
+    dense_payload["traj_2d"][tracked_query_indices] = np.asarray(tracked_sample_payload["traj_2d"]).astype(
+        np.float32,
+        copy=False,
+    )
+
+    per_track_fields = (
+        "traj_valid_mask",
+        "traj_depth_consistency_ratio",
+        "traj_stable_depth_consistency_ratio",
+        "traj_high_volatility_hit",
+        "traj_volatility_exposure_ratio",
+        "traj_compare_frame_count",
+        "traj_stable_compare_frame_count",
+        "traj_mask_reason_bits",
+        "traj_supervision_prefix_len",
+        "traj_supervision_count",
+        "traj_wrist_seed_mask",
+        "traj_query_depth_rank",
+        "traj_query_depth_edge_mask",
+        "traj_query_depth_patch_valid_ratio",
+        "traj_query_depth_patch_std",
+        "traj_query_depth_edge_risk_mask",
+        "traj_motion_extent",
+        "traj_motion_step_median",
+        "traj_manipulator_candidate_mask",
+        "traj_manipulator_cluster_id",
+        "traj_manipulator_component_size",
+    )
+    for field_name in per_track_fields:
+        dense_payload[field_name][tracked_query_indices] = np.asarray(tracked_sample_payload[field_name]).astype(
+            dense_payload[field_name].dtype,
+            copy=False,
+        )
+
+    dense_payload["traj_supervision_mask"][tracked_query_indices] = np.asarray(
+        tracked_sample_payload["traj_supervision_mask"]
+    ).astype(bool, copy=False)
+    if "visibility" in tracked_sample_payload:
+        dense_payload["visibility"][tracked_query_indices] = np.asarray(tracked_sample_payload["visibility"]).astype(
+            np.float16,
+            copy=False,
+        )
+    return dense_payload
+
+
 def prepare_query_frame_sample_bundle(
     *,
     query_frame_idx: int,
@@ -441,7 +798,17 @@ def prepare_query_frame_sample_bundle(
     depths_segment = _tensor_to_numpy(frame_data["depths_segment"]).astype(np.float32)
 
     frame_h, frame_w = video_segment.shape[1:3]
-    keypoints = _build_grid_keypoints(frame_h, frame_w, grid_size)
+    dense_keypoints = (
+        np.asarray(frame_data["dense_keypoints"], dtype=np.float32)
+        if "dense_keypoints" in frame_data
+        else _build_grid_keypoints(frame_h, frame_w, grid_size)
+    )
+    tracked_query_indices = (
+        np.asarray(frame_data["tracked_query_indices"], dtype=np.int32).reshape(-1)
+        if "tracked_query_indices" in frame_data
+        else np.arange(coords_np.shape[1], dtype=np.int32)
+    )
+    keypoints = dense_keypoints[tracked_query_indices]
     query_frame_depth = depths_segment[0]
     raw_depths_segment_np = (
         np.asarray(raw_depths_segment, dtype=np.float32)
@@ -493,6 +860,10 @@ def prepare_query_frame_sample_bundle(
         "traj_uvz": traj_uvz.astype(np.float32),
         "traj_2d": tracks2d_fixed.astype(np.float32),
         "keypoints": keypoints.astype(np.float32),
+        "dense_keypoints": dense_keypoints.astype(np.float32, copy=False),
+        "tracked_query_indices": tracked_query_indices.astype(np.int32, copy=False),
+        "support_grid_size": frame_data.get("support_grid_size"),
+        "prefilter_result": frame_data.get("prefilter_result"),
         "visibs": visibs_np,
         "query_frame_img": video_segment[0],
         "query_frame_depth": query_frame_depth.astype(np.float32),
@@ -513,6 +884,12 @@ def build_query_frame_sample_data(
     traj_uvz = np.asarray(prepared_bundle["traj_uvz"], dtype=np.float32)
     traj_2d = np.asarray(prepared_bundle["traj_2d"], dtype=np.float32)
     keypoints = np.asarray(prepared_bundle["keypoints"], dtype=np.float32)
+    dense_keypoints = np.asarray(prepared_bundle.get("dense_keypoints", keypoints), dtype=np.float32)
+    tracked_query_indices = np.asarray(
+        prepared_bundle.get("tracked_query_indices", np.arange(keypoints.shape[0], dtype=np.int32)),
+        dtype=np.int32,
+    ).reshape(-1)
+    prefilter_result = prepared_bundle.get("prefilter_result")
     visibs_np = np.asarray(prepared_bundle["visibs"])
     query_frame_idx = int(prepared_bundle["query_frame_idx"])
     query_frame_depth = np.asarray(prepared_bundle["query_frame_depth"], dtype=np.float32)
@@ -535,7 +912,7 @@ def build_query_frame_sample_data(
         high_volatility_mask=high_volatility_mask,
         temporal_compare_context=prepared_bundle.get("temporal_compare_context"),
     )
-    sample_payload = {
+    tracked_sample_payload = {
         "traj_uvz": traj_uvz.astype(np.float32),
         "traj_2d": traj_2d.astype(np.float32),
         "keypoints": keypoints,
@@ -577,7 +954,17 @@ def build_query_frame_sample_data(
         visibility = visibs_np
         if visibility.shape[0] == traj_uvz.shape[1] and visibility.shape[1] == traj_uvz.shape[0]:
             visibility = visibility.T
-        sample_payload["visibility"] = visibility.astype(np.float16)
+        tracked_sample_payload["visibility"] = visibility.astype(np.float16)
+
+    if tracked_query_indices.shape[0] != dense_keypoints.shape[0]:
+        sample_payload = _build_dense_sample_payload_from_tracked_subset(
+            dense_keypoints=dense_keypoints,
+            tracked_query_indices=tracked_query_indices,
+            tracked_sample_payload=tracked_sample_payload,
+            prefilter_result=prefilter_result if prefilter_result is not None else None,
+        )
+    else:
+        sample_payload = tracked_sample_payload
 
     return {
         "sample_payload": sample_payload,
@@ -1160,6 +1547,9 @@ def _resolve_query_frames(
 def process_single_video(video_path, depth_path, args, model_3dtracker, model_depth_pose, video_name=None, output_dir=None):
     """Process a single video and return the processed data"""
     logger.info(f"Processing video: {video_path}")
+    profile_stats = {} if bool(getattr(args, "collect_profile_stats", False)) else None
+    _sync_device_if_needed(getattr(args, "device", None))
+    process_start = time.perf_counter()
 
     # --- NEW: per-episode stride based on frame count when --fps <= 0 ---
     # If user set --fps > 0, use that fixed stride; otherwise auto-compute from N.
@@ -1187,17 +1577,21 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
     )
 
     # Load RGB with computed stride
+    load_rgb_start = time.perf_counter()
     video_tensor, video_mask, original_filenames, source_frame_indices = load_video_and_mask(
         video_path, args.mask_dir, stride, args.max_num_frames
     )
+    _accumulate_profile_stat(profile_stats, "load_rgb_seconds", time.perf_counter() - load_rgb_start)
     source_frame_indices = np.asarray(source_frame_indices, dtype=np.int32)
 
     # Load depth (if provided) with the SAME stride and same frame order ( _frame_sort_key ) as RGB
     depth_tensor = None
     if depth_path is not None:
+        load_depth_start = time.perf_counter()
         depth_tensor, _, _, depth_frame_indices = load_video_and_mask(
             depth_path, None, stride, args.max_num_frames, is_depth=True
         )  # [T, H, W]
+        _accumulate_profile_stat(profile_stats, "load_depth_seconds", time.perf_counter() - load_depth_start)
         depth_frame_indices = np.asarray(depth_frame_indices, dtype=np.int32)
         if (
             source_frame_indices.shape == depth_frame_indices.shape
@@ -1240,6 +1634,8 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
         )
 
     # obtain video depth and pose
+    _sync_device_if_needed(getattr(args, "device", None))
+    depth_pose_start = time.perf_counter()
     (
         video_ten, depth_npy, depth_conf, extrs_npy, intrs_npy
     ) = model_depth_pose(
@@ -1247,6 +1643,12 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
         known_depth=depth_tensor,  # can be None
         stationary_camera=False,
         replace_with_known_depth=False,  # if known depth is given, always replace
+    )
+    _sync_device_if_needed(getattr(args, "device", None))
+    _accumulate_profile_stat(
+        profile_stats,
+        "depth_pose_wrapper_seconds",
+        time.perf_counter() - depth_pose_start,
     )
 
     # Keep depth_conf for visualization NPZ
@@ -1271,6 +1673,34 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
     source_frame_indices = np.asarray(source_frame_indices, dtype=np.int32).reshape(-1)[:video_length]
 
     frame_H, frame_W = video_ten.shape[-2:]
+    dense_query_keypoints = _build_grid_keypoints(frame_H, frame_W, args.grid_size)
+    query_prefilter_mode = str(getattr(args, "query_prefilter_mode", DEFAULT_QUERY_PREFILTER_MODE))
+    query_prefilter_rank_keep_ratio = float(
+        getattr(
+            args,
+            "query_prefilter_wrist_rank_keep_ratio",
+            DEFAULT_QUERY_PREFILTER_WRIST_RANK_KEEP_RATIO,
+        )
+    )
+    query_prefilter_filter_config = (
+        resolve_traj_filter_config(args)
+        if query_prefilter_mode != QUERY_PREFILTER_MODE_OFF
+        else None
+    )
+    query_prefilter_enabled = bool(
+        query_prefilter_filter_config is not None
+        and bool(query_prefilter_filter_config["enabled"])
+        and query_prefilter_filter_config["profile"]
+        in {
+            "wrist",
+            "wrist_manipulator_top95",
+            "wrist_manipulator",
+        }
+    )
+    support_grid_size = _resolve_support_grid_size(
+        args.grid_size,
+        float(getattr(args, "support_grid_ratio", 0.8)),
+    )
 
     # Sample query points using uniform grid and store which frame they belong to
     query_points_per_frame = {}
@@ -1292,16 +1722,7 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
         tracking_segments.append((frame_idx, end_frame))
 
         # Create uniform grid for this frame (grid_size x grid_size points)
-        grid_points = (
-            create_uniform_grid_points(
-                height=frame_H, width=frame_W, grid_size=args.grid_size, device="cpu"
-            )
-            .squeeze(0)
-            .numpy()
-        )  # Remove batch dimension and convert to numpy
-
-        # Set the correct frame index for all points
-        grid_points[:, 0] = frame_idx
+        grid_points = _build_frame_query_points(frame_idx, dense_query_keypoints)
 
         query_point.append(grid_points)
 
@@ -1319,95 +1740,167 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
 
     logger.info(f"Processing {len(tracking_segments)} independent tracking segments")
 
-    for seg_idx, (start_frame, end_frame) in enumerate(tracking_segments):
-        logger.info(
-            f"Processing query frame {start_frame}: tracking {end_frame - start_frame} frames"
-        )
-
-        # Clear CUDA cache before each segment to avoid fragmentation
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        # Extract video segment (16 frames starting from query frame)
-        video_segment = video_ten[start_frame:end_frame]
-        depth_segment = depth_npy[start_frame:end_frame]
-        intrs_segment = intrs_npy[start_frame:end_frame]
-        extrs_segment = extrs_npy[start_frame:end_frame]
-
-        # Get query points for this segment (only from the starting frame)
-        # Need to adjust the frame index to be relative to segment start (0)
-        segment_query_point = [query_point[seg_idx].copy()]
-        segment_query_point[0][:, 0] = 0  # Set frame index to 0 for segment start
-
-        # Calculate support_grid_size proportionally to grid_size
-        # Original: grid_size=20 -> support_grid_size=16 (ratio = 0.8)
-        support_grid_size = int(args.grid_size * 0.8)
-        
-        video, depths, intrinsics, extrinsics, query_point_tensor, support_grid_size = (
-            prepare_inputs(
-                video_segment,
-                depth_segment,
-                intrs_segment,
-                extrs_segment,
-                segment_query_point,
-                inference_res=(frame_H, frame_W),
-                support_grid_size=support_grid_size,
-                device=args.device,
+    with _DepthFilterRuntime(
+        depth_npy,
+        intrs_npy,
+        tracking_segments,
+        profile_stats=profile_stats,
+    ) as depth_filter_runtime:
+        for seg_idx, (start_frame, end_frame) in enumerate(tracking_segments):
+            logger.info(
+                f"Processing query frame {start_frame}: tracking {end_frame - start_frame} frames"
             )
-        )
 
-        model_3dtracker.set_image_size((frame_H, frame_W))
-
-        with torch.no_grad():
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                coords_seg, visibs_seg = inference(
-                    model=model_3dtracker,
-                    video=video,
-                    depths=depths,
-                    intrinsics=intrinsics,
-                    extrinsics=extrinsics,
-                    query_point=query_point_tensor,
-                    num_iters=args.num_iters,
-                    grid_size=support_grid_size,
-                    bidrectional=False,  # Disable backward tracking
+            try:
+                # Clear CUDA cache before each segment to avoid fragmentation
+                _timed_cuda_empty_cache(
+                    profile_stats=profile_stats,
+                    key="segment_empty_cache_seconds",
                 )
 
-        # Validate inference results before storing
-        logger.debug(
-            f"Query frame {start_frame}: coords_seg shape = {coords_seg.shape}, visibs_seg shape = {visibs_seg.shape}"
-        )
+                # Extract video segment (16 frames starting from query frame)
+                segment_slice_start = time.perf_counter()
+                video_segment = video_ten[start_frame:end_frame]
+                intrs_segment = intrs_npy[start_frame:end_frame]
+                extrs_segment = extrs_npy[start_frame:end_frame]
+                _accumulate_profile_stat(
+                    profile_stats,
+                    "segment_slice_extract_seconds",
+                    time.perf_counter() - segment_slice_start,
+                )
 
-        # Check if results have expected dimensions
-        if len(coords_seg.shape) != 3 or len(visibs_seg.shape) != 2:
-            logger.error(
-                f"Query frame {start_frame}: Invalid result shapes - coords: {coords_seg.shape}, visibs: {visibs_seg.shape}"
-            )
-            continue
+                # Get query points for this segment (only from the starting frame)
+                # Need to adjust the frame index to be relative to segment start (0)
+                dense_segment_query_point = query_point[seg_idx].copy()
+                dense_segment_query_point[:, 0] = 0  # Set frame index to 0 for segment start
+                tracked_query_indices = np.arange(dense_segment_query_point.shape[0], dtype=np.int32)
+                prefilter_result = None
 
-        # Check if we have the expected number of trajectories
-        expected_trajectories = args.grid_size * args.grid_size
-        if coords_seg.shape[1] != expected_trajectories:
-            logger.warning(
-                f"Query frame {start_frame}: Expected {expected_trajectories} trajectories, got {coords_seg.shape[1]}"
-            )
+                prepare_inputs_start = time.perf_counter()
+                filtered_depth_segment = depth_filter_runtime.get_filtered_depth_segment(
+                    start_frame,
+                    end_frame,
+                )
+                if query_prefilter_enabled:
+                    candidate_prefilter_result = build_query_prefilter_result(
+                        dense_query_keypoints,
+                        filtered_depth_segment[0],
+                        filter_args=args,
+                        filter_config=query_prefilter_filter_config,
+                        query_prefilter_mode=query_prefilter_mode,
+                        wrist_rank_keep_ratio=query_prefilter_rank_keep_ratio,
+                    )
+                    kept_query_indices = np.flatnonzero(candidate_prefilter_result["prefilter_mask"]).astype(np.int32)
+                    if kept_query_indices.size == 0:
+                        logger.warning(
+                            f"Query frame {start_frame}: query prefilter removed all dense points; falling back to full grid"
+                        )
+                    else:
+                        tracked_query_indices = kept_query_indices
+                        if tracked_query_indices.shape[0] != dense_segment_query_point.shape[0]:
+                            prefilter_result = candidate_prefilter_result
+                segment_query_point = [dense_segment_query_point[tracked_query_indices].copy()]
 
-        # Store results for this query frame (move to CPU to avoid GPU memory accumulation)
-        query_frame_results[start_frame] = {
-            "coords": coords_seg.cpu(),  # Shape: (T, grid_size*grid_size, 3)
-            "visibs": visibs_seg.cpu(),  # Shape: (T, grid_size*grid_size)
-            "video_segment": video.cpu(),
-            "depths_segment": depths.cpu(),
-            "intrinsics_segment": intrinsics.cpu(),
-            "extrinsics_segment": extrinsics.cpu(),
-        }
+                video, depths, intrinsics, extrinsics, query_point_tensor, support_grid_size = (
+                    prepare_inputs(
+                        video_segment,
+                        filtered_depth_segment,
+                        intrs_segment,
+                        extrs_segment,
+                        segment_query_point,
+                        inference_res=(frame_H, frame_W),
+                        support_grid_size=support_grid_size,
+                        device=args.device,
+                        profile_stats=profile_stats,
+                    )
+                )
+                _sync_device_if_needed(getattr(args, "device", None))
+                _accumulate_profile_stat(
+                    profile_stats,
+                    "prepare_inputs_seconds",
+                    time.perf_counter() - prepare_inputs_start,
+                )
 
-        logger.info(
-            f"Query frame {start_frame}: tracked {coords_seg.shape[1]} trajectories for {coords_seg.shape[0]} frames"
-        )
+                model_3dtracker.set_image_size((frame_H, frame_W))
 
-        # Clear cache after inference to free memory
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+                with torch.no_grad():
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                        coords_seg, visibs_seg, inference_metadata = inference(
+                            model=model_3dtracker,
+                            video=video,
+                            depths=depths,
+                            intrinsics=intrinsics,
+                            extrinsics=extrinsics,
+                            query_point=query_point_tensor,
+                            num_iters=args.num_iters,
+                            grid_size=support_grid_size,
+                            bidrectional=False,  # Disable backward tracking
+                            profile_stats=profile_stats,
+                            return_metadata=True,
+                        )
+
+                # Validate inference results before storing
+                logger.debug(
+                    f"Query frame {start_frame}: coords_seg shape = {coords_seg.shape}, visibs_seg shape = {visibs_seg.shape}"
+                )
+
+                # Check if results have expected dimensions
+                if len(coords_seg.shape) != 3 or len(visibs_seg.shape) != 2:
+                    logger.error(
+                        f"Query frame {start_frame}: Invalid result shapes - coords: {coords_seg.shape}, visibs: {visibs_seg.shape}"
+                    )
+                    continue
+
+                # Check if we have the expected number of trajectories
+                expected_trajectories = int(tracked_query_indices.shape[0])
+                if coords_seg.shape[1] != expected_trajectories:
+                    logger.warning(
+                        f"Query frame {start_frame}: Expected {expected_trajectories} trajectories, got {coords_seg.shape[1]}"
+                    )
+
+                # Store results for this query frame (move to CPU to avoid GPU memory accumulation)
+                cpu_offload_start = time.perf_counter()
+                coords_cpu = coords_seg.cpu()
+                visibs_cpu = visibs_seg.cpu()
+                video_cpu = video.cpu()
+                depths_cpu = depths.cpu()
+                intrinsics_cpu = intrinsics.cpu()
+                extrinsics_cpu = extrinsics.cpu()
+                _accumulate_profile_stat(
+                    profile_stats,
+                    "segment_result_cpu_offload_seconds",
+                    time.perf_counter() - cpu_offload_start,
+                )
+                query_frame_results[start_frame] = {
+                    "coords": coords_cpu,  # Shape: (T, grid_size*grid_size, 3)
+                    "visibs": visibs_cpu,  # Shape: (T, grid_size*grid_size)
+                    "video_segment": video_cpu,
+                    "depths_segment": depths_cpu,
+                    "intrinsics_segment": intrinsics_cpu,
+                    "extrinsics_segment": extrinsics_cpu,
+                    "dense_keypoints": dense_query_keypoints.astype(np.float32, copy=False),
+                    "tracked_query_indices": tracked_query_indices.astype(np.int32, copy=False),
+                    "prefilter_result": prefilter_result,
+                    "dense_query_count": int(dense_query_keypoints.shape[0]),
+                    "tracked_query_count": int(tracked_query_indices.shape[0]),
+                    "support_grid_size": int(support_grid_size),
+                    "effective_support_query_count": int(
+                        inference_metadata.get("effective_support_query_count", 0)
+                    ),
+                }
+
+                logger.info(
+                    f"Query frame {start_frame}: tracked {coords_seg.shape[1]}/{dense_query_keypoints.shape[0]} queries "
+                    f"for {coords_seg.shape[0]} frames (support_grid_size={support_grid_size})"
+                )
+
+                # Clear cache after inference to free memory
+                _timed_cuda_empty_cache(
+                    profile_stats=profile_stats,
+                    key="segment_empty_cache_seconds",
+                )
+            finally:
+                depth_filter_runtime.release_segment_frames(start_frame, end_frame)
 
     # For compatibility with the rest of the pipeline, use the first segment as the main result
     # But we'll save each segment independently in save_structured_data
@@ -1415,6 +1908,12 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
         first_frame = min(query_frame_results.keys())
         coords = query_frame_results[first_frame]["coords"]
         visibs = query_frame_results[first_frame]["visibs"]
+        coords, visibs = _scatter_tracked_predictions_to_dense(
+            coords,
+            visibs,
+            tracked_query_indices=query_frame_results[first_frame]["tracked_query_indices"],
+            dense_track_count=int(query_frame_results[first_frame]["dense_query_count"]),
+        )
         video = query_frame_results[first_frame]["video_segment"]
         depths = query_frame_results[first_frame]["depths_segment"]
         intrinsics = query_frame_results[first_frame]["intrinsics_segment"]
@@ -1453,6 +1952,21 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
         )
         raise ValueError(f"Frame count mismatch in inference results")
 
+    if profile_stats is not None:
+        _sync_device_if_needed(getattr(args, "device", None))
+        process_total_seconds = time.perf_counter() - process_start
+        explicit_profile_keys = (
+            "load_rgb_seconds",
+            "load_depth_seconds",
+            "depth_pose_wrapper_seconds",
+            "prepare_inputs_seconds",
+            "tracker_inference_total_seconds",
+            "tracker_model_forward_seconds",
+        )
+        explicit_total = sum(float(profile_stats.get(key, 0.0)) for key in explicit_profile_keys)
+        profile_stats["process_total_seconds"] = float(process_total_seconds)
+        profile_stats["process_other_seconds"] = float(max(0.0, process_total_seconds - explicit_total))
+
     return {
         "video_tensor": video,
         "full_video_tensor": video_ten,
@@ -1470,6 +1984,7 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
         "query_frame_results": query_frame_results,  # Add individual frame results
         "full_intrinsics": intrs_npy.astype(np.float32),  # Keep save-time metadata on CPU.
         "full_extrinsics": extrs_npy.astype(np.float32),
+        "profile_stats": profile_stats,
     }
 
 
@@ -1708,27 +2223,37 @@ def prepare_inputs(
     support_grid_size: int,
     num_threads: int = 8,
     device: str = "cuda",
+    profile_stats: dict[str, float] | None = None,
 ):
+    depths = np.asarray(depths, dtype=np.float32)
+    intrinsics = np.asarray(intrinsics, dtype=np.float32).copy()
+    extrinsics = np.asarray(extrinsics, dtype=np.float32)
     _original_res = depths.shape[1:3]
     inference_res = _original_res  # fix as the same
 
     intrinsics[:, 0, :] *= (inference_res[1] - 1) / (_original_res[1] - 1)
     intrinsics[:, 1, :] *= (inference_res[0] - 1) / (_original_res[0] - 1)
 
-    # resize & remove edges
-    with ThreadPoolExecutor(num_threads) as executor:
-        depths_futures = [
-            executor.submit(_filter_one_depth, depth, 0.08, 15, intrinsic)
-            for depth, intrinsic in zip(depths, intrinsics)
-        ]
-        depths = np.stack([future.result() for future in depths_futures])
-
+    query_points_start = time.perf_counter()
     query_point = prepare_query_points(query_point, depths, intrinsics, extrinsics)
+    _accumulate_profile_stat(
+        profile_stats,
+        "prepare_query_points_seconds",
+        time.perf_counter() - query_points_start,
+    )
+
+    h2d_start = time.perf_counter()
     query_point = torch.from_numpy(query_point).float().to(device)
     video = (video_ten.float()).to(device).clamp(0, 1)
     depths = torch.from_numpy(depths).float().to(device)
     intrinsics = torch.from_numpy(intrinsics).float().to(device)
     extrinsics = torch.from_numpy(extrinsics).float().to(device)
+    _sync_device_if_needed(device)
+    _accumulate_profile_stat(
+        profile_stats,
+        "prepare_h2d_seconds",
+        time.perf_counter() - h2d_start,
+    )
 
     return video, depths, intrinsics, extrinsics, query_point, support_grid_size
 

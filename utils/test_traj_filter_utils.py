@@ -4,6 +4,8 @@ import unittest
 import numpy as np
 
 from utils.traj_filter_utils import (
+    DEFAULT_QUERY_PREFILTER_MODE,
+    QUERY_PREFILTER_MODE_PROFILE_AWARE_STATIC_V1,
     MASK_REASON_MANIPULATOR_CLUSTER_FAIL,
     MASK_REASON_MANIPULATOR_DEPTH_FAIL,
     MASK_REASON_MANIPULATOR_MOTION_FAIL,
@@ -12,6 +14,7 @@ from utils.traj_filter_utils import (
     MASK_REASON_STABLE_TEMPORAL_FAIL,
     MASK_REASON_TEMPORAL_CONSISTENCY_FAIL,
     build_traj_filter_result,
+    build_query_prefilter_result,
     build_traj_valid_mask,
     compute_accessed_high_volatility_mask,
     compute_depth_volatility_map,
@@ -215,6 +218,106 @@ class QueryDepthQualityMaskTests(unittest.TestCase):
         )
 
         np.testing.assert_array_equal(mask, np.array([False]))
+
+
+class QueryPrefilterTests(unittest.TestCase):
+    def test_off_mode_bypasses_prefilter(self):
+        keypoints = np.array([[2.0, 2.0]], dtype=np.float32)
+        query_depth = np.zeros((6, 6), dtype=np.float32)
+
+        result = build_query_prefilter_result(
+            keypoints,
+            query_depth,
+            filter_args=SimpleNamespace(
+                filter_level="basic",
+                traj_filter_profile="wrist_manipulator_top95",
+                query_prefilter_mode=DEFAULT_QUERY_PREFILTER_MODE,
+            ),
+        )
+
+        np.testing.assert_array_equal(result["prefilter_mask"], np.array([True]))
+        np.testing.assert_array_equal(result["reason_bits"], np.array([0], dtype=np.uint8))
+        self.assertTrue(np.isnan(result["query_depth_rank"]).all())
+
+    def test_external_profile_keeps_dense_grid_under_profile_aware_mode(self):
+        keypoints = np.array([[2.0, 2.0], [4.0, 4.0]], dtype=np.float32)
+        query_depth = np.ones((8, 8), dtype=np.float32)
+        query_depth[2, 2] = 0.0
+
+        result = build_query_prefilter_result(
+            keypoints,
+            query_depth,
+            filter_args=SimpleNamespace(
+                filter_level="basic",
+                traj_filter_profile="external",
+                query_prefilter_mode=QUERY_PREFILTER_MODE_PROFILE_AWARE_STATIC_V1,
+            ),
+        )
+
+        np.testing.assert_array_equal(result["prefilter_mask"], np.array([True, True]))
+        np.testing.assert_array_equal(result["reason_bits"], np.array([0, 0], dtype=np.uint8))
+        self.assertTrue(np.isnan(result["query_depth_patch_valid_ratio"]).all())
+
+    def test_wrist_profile_prefilter_marks_query_depth_and_edge_failures(self):
+        keypoints = np.array(
+            [
+                [1.0, 1.0],
+                [2.0, 2.0],
+                [5.0, 5.0],
+            ],
+            dtype=np.float32,
+        )
+        query_depth = np.ones((8, 8), dtype=np.float32)
+        query_depth[:, :2] = 0.05
+        query_depth[1, 1] = 0.0
+
+        result = build_query_prefilter_result(
+            keypoints,
+            query_depth,
+            filter_args=SimpleNamespace(
+                filter_level="basic",
+                traj_filter_profile="wrist",
+                query_prefilter_mode=QUERY_PREFILTER_MODE_PROFILE_AWARE_STATIC_V1,
+            ),
+        )
+
+        np.testing.assert_array_equal(result["prefilter_mask"], np.array([False, False, True]))
+        self.assertTrue(bool(result["reason_bits"][0] & MASK_REASON_QUERY_DEPTH_FAIL))
+        self.assertTrue(bool(result["reason_bits"][1] & MASK_REASON_QUERY_DEPTH_EDGE_FAIL))
+        np.testing.assert_array_equal(result["query_depth_edge_risk_mask"], np.array([False, True, False]))
+
+    def test_wrist_manipulator_prefilter_keeps_nearest_depth_rank_slice(self):
+        keypoints = np.array(
+            [
+                [5.0, 5.0],
+                [15.0, 5.0],
+                [25.0, 5.0],
+                [35.0, 5.0],
+            ],
+            dtype=np.float32,
+        )
+        query_depth = np.ones((48, 48), dtype=np.float32)
+        for keypoint, value in zip(keypoints, [0.2, 0.4, 0.6, 0.8]):
+            _paint_patch(query_depth, x=float(keypoint[0]), y=float(keypoint[1]), value=float(value), radius=2)
+
+        result = build_query_prefilter_result(
+            keypoints,
+            query_depth,
+            filter_args=SimpleNamespace(
+                filter_level="basic",
+                traj_filter_profile="wrist_manipulator_top95",
+                query_prefilter_mode=QUERY_PREFILTER_MODE_PROFILE_AWARE_STATIC_V1,
+                query_prefilter_wrist_rank_keep_ratio=0.40,
+            ),
+            wrist_rank_keep_ratio=0.40,
+        )
+
+        np.testing.assert_array_equal(result["prefilter_mask"], np.array([True, True, False, False]))
+        self.assertAlmostEqual(float(result["query_depth_rank"][0]), 0.0, places=6)
+        self.assertAlmostEqual(float(result["query_depth_rank"][1]), 1.0 / 3.0, places=6)
+        self.assertAlmostEqual(float(result["query_depth_rank"][2]), 2.0 / 3.0, places=6)
+        self.assertTrue(bool(result["reason_bits"][2] & MASK_REASON_MANIPULATOR_DEPTH_FAIL))
+        self.assertTrue(bool(result["reason_bits"][3] & MASK_REASON_MANIPULATOR_DEPTH_FAIL))
 
 
 class BuildTrajValidMaskTests(unittest.TestCase):

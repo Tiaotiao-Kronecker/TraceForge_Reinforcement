@@ -290,6 +290,25 @@ def parse_args() -> argparse.Namespace:
         help="Grid size per query frame; 80 means 6400 points",
     )
     parser.add_argument(
+        "--query_prefilter_mode",
+        type=str,
+        default="off",
+        choices=["off", "profile_aware_static_v1"],
+        help="Optional static query prefilter applied before tracking.",
+    )
+    parser.add_argument(
+        "--query_prefilter_wrist_rank_keep_ratio",
+        type=float,
+        default=0.30,
+        help="For wrist_manipulator* query prefiltering, keep the nearest query-depth ranks up to this ratio.",
+    )
+    parser.add_argument(
+        "--support_grid_ratio",
+        type=float,
+        default=0.8,
+        help="Support-point grid ratio relative to grid_size. 0 disables support points.",
+    )
+    parser.add_argument(
         "--filter_level",
         type=str,
         default="standard",
@@ -361,6 +380,10 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--keyframes_per_sec_min/max must both be >= 1")
     if args.keyframes_per_sec_min > args.keyframes_per_sec_max:
         raise ValueError("--keyframes_per_sec_min must be <= --keyframes_per_sec_max")
+    if args.query_prefilter_wrist_rank_keep_ratio < 0.0 or args.query_prefilter_wrist_rank_keep_ratio > 1.0:
+        raise ValueError("--query_prefilter_wrist_rank_keep_ratio must be within [0, 1]")
+    if args.support_grid_ratio < 0.0:
+        raise ValueError("--support_grid_ratio must be >= 0")
 
     return args
 
@@ -1128,7 +1151,9 @@ def main() -> None:
             )
     logger.info(
         f"keyframes_per_sec={args.keyframes_per_sec_min}~{args.keyframes_per_sec_max}, "
-        f"future_len={args.future_len}, grid_size={args.grid_size}, load_stride={args.fps}"
+        f"future_len={args.future_len}, grid_size={args.grid_size}, "
+        f"query_prefilter={args.query_prefilter_mode}, support_grid_ratio={args.support_grid_ratio}, "
+        f"load_stride={args.fps}"
     )
     logger.info("=" * 80)
 
