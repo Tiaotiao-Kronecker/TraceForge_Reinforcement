@@ -21,6 +21,7 @@
 - [depth_volatility_optimization_plan_2026-03-19.md](depth_volatility_optimization_plan_2026-03-19.md)
 - [depth_volatility_p1_p4_implementation_plan_2026-03-19.md](depth_volatility_p1_p4_implementation_plan_2026-03-19.md)
 - [depth_volatility_benchmark_validation_2026-03-19.md](depth_volatility_benchmark_validation_2026-03-19.md)
+- [process_inference_bottleneck_analysis_2026-03-19.md](process_inference_bottleneck_analysis_2026-03-19.md)
 
 ## 当前保留的本地对比产物
 
