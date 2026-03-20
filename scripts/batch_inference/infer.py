@@ -685,6 +685,23 @@ def save_single_query_frame_legacy(
         "image_path": np.array([f"images/{video_name}_{query_frame_idx}.png"], dtype="<U64"),
         "frame_index": np.array([query_frame_idx], dtype=np.int32),
         "keypoints": sample_payload["keypoints"],
+        "dense_query_count": np.array(
+            [int(np.asarray(prepared_bundle.get("dense_keypoints", sample_payload["keypoints"])).shape[0])],
+            dtype=np.int32,
+        ),
+        "tracked_query_count": np.array(
+            [
+                int(
+                    np.asarray(
+                        prepared_bundle.get(
+                            "tracked_query_indices",
+                            np.arange(sample_payload["keypoints"].shape[0], dtype=np.int32),
+                        )
+                    ).reshape(-1).shape[0]
+                )
+            ],
+            dtype=np.int32,
+        ),
         "traj": traj.astype(np.float32),
         "traj_2d": traj_2d.astype(np.float32),
         "traj_valid_mask": sample_payload["traj_valid_mask"],
@@ -712,6 +729,8 @@ def save_single_query_frame_legacy(
         "traj_manipulator_cluster_fallback_used": sample_payload["traj_manipulator_cluster_fallback_used"],
         "valid_steps": valid_steps,
     }
+    if prepared_bundle.get("support_grid_size") is not None:
+        sample_data["support_grid_size"] = np.array([int(prepared_bundle["support_grid_size"])], dtype=np.int32)
     if "visibility" in sample_payload:
         sample_data["visibility"] = sample_payload["visibility"]
 
@@ -762,6 +781,23 @@ def save_single_query_frame_v2(
         "keypoints": sample_payload["keypoints"],
         "query_frame_index": sample_payload["query_frame_index"],
         "segment_frame_indices": sample_payload["segment_frame_indices"],
+        "dense_query_count": np.array(
+            [int(np.asarray(prepared_bundle.get("dense_keypoints", sample_payload["keypoints"])).shape[0])],
+            dtype=np.int32,
+        ),
+        "tracked_query_count": np.array(
+            [
+                int(
+                    np.asarray(
+                        prepared_bundle.get(
+                            "tracked_query_indices",
+                            np.arange(sample_payload["keypoints"].shape[0], dtype=np.int32),
+                        )
+                    ).reshape(-1).shape[0]
+                )
+            ],
+            dtype=np.int32,
+        ),
         "traj_valid_mask": sample_payload["traj_valid_mask"],
         "traj_depth_consistency_ratio": sample_payload["traj_depth_consistency_ratio"],
         "traj_stable_depth_consistency_ratio": sample_payload["traj_stable_depth_consistency_ratio"],
@@ -786,6 +822,8 @@ def save_single_query_frame_v2(
         "traj_manipulator_component_size": sample_payload["traj_manipulator_component_size"],
         "traj_manipulator_cluster_fallback_used": sample_payload["traj_manipulator_cluster_fallback_used"],
     }
+    if prepared_bundle.get("support_grid_size") is not None:
+        sample_data["support_grid_size"] = np.array([int(prepared_bundle["support_grid_size"])], dtype=np.int32)
     if "visibility" in sample_payload:
         sample_data["visibility"] = sample_payload["visibility"]
 

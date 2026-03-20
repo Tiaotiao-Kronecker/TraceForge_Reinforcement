@@ -311,6 +311,21 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 if "traj_valid_mask" in data
                 else np.ones(traj_uvz.shape[0], dtype=bool)
             )
+            dense_query_count = (
+                int(np.asarray(data["dense_query_count"]).reshape(-1)[0])
+                if "dense_query_count" in data
+                else int(traj_uvz.shape[0])
+            )
+            tracked_query_count = (
+                int(np.asarray(data["tracked_query_count"]).reshape(-1)[0])
+                if "tracked_query_count" in data
+                else int(np.isfinite(traj_uvz).any(axis=(1, 2)).sum())
+            )
+            support_grid_size = (
+                int(np.asarray(data["support_grid_size"]).reshape(-1)[0])
+                if "support_grid_size" in data
+                else None
+            )
             visibility = data["visibility"].astype(np.float16) if "visibility" in data else None
             traj_depth_consistency_ratio = (
                 data["traj_depth_consistency_ratio"].astype(np.float16)
@@ -429,6 +444,9 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 "keypoints": keypoints,
                 "query_frame_index": query_frame_index,
                 "segment_frame_indices": segment_frame_indices,
+                "dense_query_count": dense_query_count,
+                "tracked_query_count": tracked_query_count,
+                "support_grid_size": support_grid_size,
                 "traj_valid_mask": traj_valid_mask,
                 "visibility": visibility,
                 "traj_depth_consistency_ratio": traj_depth_consistency_ratio,
@@ -469,6 +487,21 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
             traj_valid_mask = np.asarray(data["traj_valid_mask"]).astype(bool, copy=False)
         else:
             traj_valid_mask = np.ones(traj_uvz.shape[0], dtype=bool)
+        dense_query_count = (
+            int(np.asarray(data["dense_query_count"]).reshape(-1)[0])
+            if "dense_query_count" in data
+            else int(traj_uvz.shape[0])
+        )
+        tracked_query_count = (
+            int(np.asarray(data["tracked_query_count"]).reshape(-1)[0])
+            if "tracked_query_count" in data
+            else int(np.isfinite(traj_uvz).any(axis=(1, 2)).sum())
+        )
+        support_grid_size = (
+            int(np.asarray(data["support_grid_size"]).reshape(-1)[0])
+            if "support_grid_size" in data
+            else None
+        )
 
         if "valid_steps" in data:
             valid_steps = np.asarray(data["valid_steps"]).astype(bool, copy=False)
@@ -488,6 +521,9 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
             "keypoints": keypoints,
             "query_frame_index": query_frame_index,
             "segment_frame_indices": segment_frame_indices,
+            "dense_query_count": dense_query_count,
+            "tracked_query_count": tracked_query_count,
+            "support_grid_size": support_grid_size,
             "traj_valid_mask": traj_valid_mask,
             "visibility": None,
             "traj_depth_consistency_ratio": (

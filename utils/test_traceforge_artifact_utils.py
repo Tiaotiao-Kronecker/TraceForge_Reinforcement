@@ -230,6 +230,33 @@ class NormalizeSampleDataTests(unittest.TestCase):
             np.array([0.01], dtype=np.float16),
         )
 
+    def test_reads_dense_query_metadata_from_v2_sample(self):
+        traj_uvz = np.array(
+            [
+                [[1.0, 1.0, 1.0]],
+                [[np.nan, np.nan, np.nan]],
+            ],
+            dtype=np.float32,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sample_path = Path(tmpdir) / "sample.npz"
+            np.savez(
+                sample_path,
+                traj_uvz=traj_uvz,
+                keypoints=np.array([[1.0, 1.0], [2.0, 2.0]], dtype=np.float32),
+                query_frame_index=np.array([0], dtype=np.int32),
+                segment_frame_indices=np.array([0], dtype=np.int32),
+                dense_query_count=np.array([4], dtype=np.int32),
+                tracked_query_count=np.array([1], dtype=np.int32),
+                support_grid_size=np.array([48], dtype=np.int32),
+            )
+
+            sample = normalize_sample_data(sample_path)
+
+        self.assertEqual(sample["dense_query_count"], 4)
+        self.assertEqual(sample["tracked_query_count"], 1)
+        self.assertEqual(sample["support_grid_size"], 48)
+
 
 def _write_rgb_png(path: Path, value: int, *, hw: tuple[int, int] = (2, 3)) -> None:
     image = np.full((*hw, 3), value, dtype=np.uint8)
