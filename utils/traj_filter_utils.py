@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import warnings
 
 import numpy as np
@@ -55,6 +56,22 @@ QUERY_PREFILTER_MODE_PROFILE_AWARE_STATIC_V1 = "profile_aware_static_v1"
 DEFAULT_QUERY_PREFILTER_MODE = QUERY_PREFILTER_MODE_OFF
 DEFAULT_QUERY_PREFILTER_WRIST_RANK_KEEP_RATIO = 0.30
 
+TRAJ_FILTER_ABLATION_MODE_NONE = "none"
+TRAJ_FILTER_ABLATION_MODE_WRIST_SEED_TOP95 = "wrist_seed_top95"
+TRAJ_FILTER_ABLATION_MODE_WRIST_NO_QUERY_EDGE = "wrist_no_query_edge"
+TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_DEPTH = "wrist_no_manipulator_depth"
+TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_MOTION = "wrist_no_manipulator_motion"
+TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_CLUSTER = "wrist_no_manipulator_cluster"
+
+TRAJ_FILTER_ABLATION_MODES = (
+    TRAJ_FILTER_ABLATION_MODE_NONE,
+    TRAJ_FILTER_ABLATION_MODE_WRIST_SEED_TOP95,
+    TRAJ_FILTER_ABLATION_MODE_WRIST_NO_QUERY_EDGE,
+    TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_DEPTH,
+    TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_MOTION,
+    TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_CLUSTER,
+)
+
 MASK_REASON_BASE_GEOMETRY_FAIL = np.uint8(1 << 0)
 MASK_REASON_QUERY_DEPTH_FAIL = np.uint8(1 << 1)
 MASK_REASON_TEMPORAL_CONSISTENCY_FAIL = np.uint8(1 << 2)
@@ -63,6 +80,25 @@ MASK_REASON_MANIPULATOR_DEPTH_FAIL = np.uint8(1 << 4)
 MASK_REASON_MANIPULATOR_MOTION_FAIL = np.uint8(1 << 5)
 MASK_REASON_MANIPULATOR_CLUSTER_FAIL = np.uint8(1 << 6)
 MASK_REASON_QUERY_DEPTH_EDGE_FAIL = np.uint8(1 << 7)
+
+
+def _accumulate_profile_stat(
+    profile_stats: dict[str, float] | None,
+    key: str,
+    seconds: float,
+) -> None:
+    if profile_stats is None:
+        return
+    profile_stats[key] = float(profile_stats.get(key, 0.0) + float(seconds))
+
+
+def _get_profile_stat(
+    profile_stats: dict[str, float] | None,
+    key: str,
+) -> float:
+    if profile_stats is None:
+        return 0.0
+    return float(profile_stats.get(key, 0.0))
 
 
 def _normalize_visibility(
@@ -428,7 +464,23 @@ def _apply_manipulator_aware_filter(
     min_component_size: int,
     component_keep_mode: str = "largest",
     major_component_ratio: float | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]:
+    apply_near_depth_filter: bool = True,
+    apply_motion_filter: bool = True,
+    apply_cluster_filter: bool = True,
+    profile_stats: dict[str, float] | None = None,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    bool,
+]:
     traj = np.asarray(traj, dtype=np.float32)
     keypoints = np.asarray(keypoints, dtype=np.float32)
     seed_mask = np.asarray(seed_mask, dtype=bool)
@@ -436,14 +488,22 @@ def _apply_manipulator_aware_filter(
     intrinsics_segment = np.asarray(intrinsics_segment, dtype=np.float32)
     extrinsics_segment = np.asarray(extrinsics_segment, dtype=np.float32)
 
+    near_depth_start = time.perf_counter()
     query_depth_values = traj[:, 0, 2].astype(np.float32, copy=False)
     traj_query_depth_rank = _compute_query_depth_ranks(query_depth_values, seed_mask)
-    near_depth_mask = (
+    near_depth_mask_raw = (
         seed_mask
         & np.isfinite(traj_query_depth_rank)
         & (traj_query_depth_rank <= float(max_depth_rank))
     )
+    near_depth_mask = near_depth_mask_raw if apply_near_depth_filter else seed_mask.copy()
+    _accumulate_profile_stat(
+        profile_stats,
+        "filter_result_manipulator_near_depth_seconds",
+        time.perf_counter() - near_depth_start,
+    )
 
+    world_lift_start = time.perf_counter()
     world_tracks = traj_uvz_to_world_coordinates(
         traj,
         query_intrinsics=intrinsics_segment[0],
@@ -451,17 +511,40 @@ def _apply_manipulator_aware_filter(
         min_depth=min_depth,
         max_depth=max_depth,
     )
+    _accumulate_profile_stat(
+        profile_stats,
+        "filter_result_manipulator_world_lift_seconds",
+        time.perf_counter() - world_lift_start,
+    )
+    motion_start = time.perf_counter()
     traj_motion_extent, traj_motion_step_median = _compute_supervised_motion_metrics(
         world_tracks,
         supervision_mask,
     )
-    motion_mask = (
+    motion_mask_raw = (
         seed_mask
         & np.isfinite(traj_motion_extent)
         & (traj_motion_extent >= float(min_motion_extent))
     )
+    motion_mask = motion_mask_raw if apply_motion_filter else seed_mask.copy()
+    _accumulate_profile_stat(
+        profile_stats,
+        "filter_result_manipulator_motion_seconds",
+        time.perf_counter() - motion_start,
+    )
     traj_manipulator_candidate_mask = seed_mask & near_depth_mask & motion_mask
-    if component_keep_mode == "largest":
+    cluster_start = time.perf_counter()
+    if not apply_cluster_filter:
+        final_mask = traj_manipulator_candidate_mask.copy()
+        traj_manipulator_cluster_id = np.full(seed_mask.shape, -1, dtype=np.int16)
+        traj_manipulator_component_size = np.zeros(seed_mask.shape, dtype=np.uint16)
+        if np.any(traj_manipulator_candidate_mask):
+            candidate_count = int(np.count_nonzero(traj_manipulator_candidate_mask))
+            traj_manipulator_cluster_id[traj_manipulator_candidate_mask] = np.int16(0)
+            traj_manipulator_component_size[traj_manipulator_candidate_mask] = np.uint16(candidate_count)
+        cluster_mask = final_mask.copy()
+        fallback_used = False
+    elif component_keep_mode == "largest":
         (
             final_mask,
             traj_manipulator_cluster_id,
@@ -498,6 +581,13 @@ def _apply_manipulator_aware_filter(
         )
     else:
         raise ValueError(f"Unsupported component_keep_mode: {component_keep_mode}")
+    if apply_cluster_filter:
+        cluster_mask = final_mask.copy()
+    _accumulate_profile_stat(
+        profile_stats,
+        "filter_result_manipulator_cluster_seconds",
+        time.perf_counter() - cluster_start,
+    )
     return (
         final_mask,
         traj_query_depth_rank,
@@ -508,6 +598,7 @@ def _apply_manipulator_aware_filter(
         traj_manipulator_component_size,
         near_depth_mask,
         motion_mask,
+        cluster_mask,
         bool(fallback_used),
     )
 
@@ -543,34 +634,49 @@ def compute_traj_base_geometry(
     depth_values = traj[:, :, 2]
     u_values = traj[:, :, 0]
     v_values = traj[:, :, 1]
+    eligible_tracks = valid_count_mask
+    if np.any(eligible_tracks):
+        valid_depth_range = (depth_values >= min_depth) & (depth_values <= max_depth)
+        depth_range_mask[eligible_tracks] = np.all(
+            (~valid_frames[eligible_tracks]) | valid_depth_range[eligible_tracks],
+            axis=1,
+        )
 
-    for track_idx in range(num_tracks):
-        if not valid_count_mask[track_idx]:
-            continue
+        in_bounds = (
+            (u_values >= -boundary_margin)
+            & (u_values <= image_width + boundary_margin)
+            & (v_values >= -boundary_margin)
+            & (v_values <= image_height + boundary_margin)
+        )
+        boundary_mask[eligible_tracks] = np.all(
+            (~valid_frames[eligible_tracks]) | in_bounds[eligible_tracks],
+            axis=1,
+        )
 
-        valid_depths = depth_values[track_idx, valid_frames[track_idx]]
-        if len(valid_depths) > 0:
-            if (valid_depths < min_depth).any() or (valid_depths > max_depth).any():
-                depth_range_mask[track_idx] = False
+        if visibility is not None:
+            vis_count = (visibility & valid_frames).sum(axis=1).astype(np.float32, copy=False)
+            vis_ratio = np.zeros(num_tracks, dtype=np.float32)
+            positive_counts = valid_counts > 0
+            vis_ratio[positive_counts] = vis_count[positive_counts] / valid_counts[positive_counts].astype(
+                np.float32,
+                copy=False,
+            )
+            visibility_mask[eligible_tracks] = vis_ratio[eligible_tracks] >= float(visibility_threshold)
 
-        valid_u = u_values[track_idx, valid_frames[track_idx]]
-        valid_v = v_values[track_idx, valid_frames[track_idx]]
-        if len(valid_u) > 0:
-            u_in_bounds = (valid_u >= -boundary_margin) & (valid_u <= image_width + boundary_margin)
-            v_in_bounds = (valid_v >= -boundary_margin) & (valid_v <= image_height + boundary_margin)
-            if not (u_in_bounds.all() and v_in_bounds.all()):
-                boundary_mask[track_idx] = False
-
-        if visibility is not None and valid_counts[track_idx] > 0:
-            vis_count = int((visibility[track_idx] & valid_frames[track_idx]).sum())
-            vis_ratio = vis_count / valid_counts[track_idx]
-            if vis_ratio < visibility_threshold:
-                visibility_mask[track_idx] = False
-
-        if check_depth_smoothness and len(valid_depths) > 1:
-            depth_diff = np.diff(valid_depths)
-            if np.std(depth_diff) > depth_change_threshold:
-                depth_smooth_mask[track_idx] = False
+        smooth_tracks = eligible_tracks & (valid_counts > 1)
+        if check_depth_smoothness and np.any(smooth_tracks):
+            compact_col_idx = np.cumsum(valid_frames, axis=1, dtype=np.int32) - 1
+            compact_depths = np.full((num_tracks, num_frames), np.nan, dtype=np.float32)
+            valid_track_idx, valid_frame_idx = np.nonzero(valid_frames)
+            compact_depths[valid_track_idx, compact_col_idx[valid_track_idx, valid_frame_idx]] = depth_values[
+                valid_track_idx,
+                valid_frame_idx,
+            ]
+            depth_diffs = np.diff(compact_depths, axis=1)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                depth_diff_std = np.nanstd(depth_diffs, axis=1)
+            depth_smooth_mask[smooth_tracks] = depth_diff_std[smooth_tracks] <= float(depth_change_threshold)
 
     traj_valid_mask = (
         valid_count_mask
@@ -768,6 +874,22 @@ def resolve_traj_filter_config(filter_args) -> dict:
     return config
 
 
+def resolve_traj_filter_ablation_mode(filter_args) -> str:
+    """Resolve the optional save-time trajectory-filter ablation mode."""
+    mode = (
+        getattr(filter_args, "traj_filter_ablation_mode", TRAJ_FILTER_ABLATION_MODE_NONE)
+        if filter_args is not None
+        else TRAJ_FILTER_ABLATION_MODE_NONE
+    )
+    mode = str(mode)
+    if mode not in TRAJ_FILTER_ABLATION_MODES:
+        raise ValueError(
+            f"Unsupported traj_filter_ablation_mode: {mode}. "
+            f"Expected one of {list(TRAJ_FILTER_ABLATION_MODES)}"
+        )
+    return mode
+
+
 def compute_query_depth_quality_mask(
     keypoints: np.ndarray,
     query_depth: np.ndarray,
@@ -844,24 +966,37 @@ def _compute_query_depth_patch_stats(
     ys = np.clip(np.round(keypoints[:, 1]).astype(np.int32), 0, height - 1)
     query_values = query_depth[ys, xs].astype(np.float32, copy=False)
     query_valid = np.isfinite(query_values) & (query_values > min_depth) & (query_values < max_depth)
+    offsets = np.arange(-patch_radius, patch_radius + 1, dtype=np.int32)
+    offset_y, offset_x = np.meshgrid(offsets, offsets, indexing="ij")
+    patch_y = ys[:, None] + offset_y.reshape(1, -1)
+    patch_x = xs[:, None] + offset_x.reshape(1, -1)
+    in_bounds = (
+        (patch_y >= 0)
+        & (patch_y < height)
+        & (patch_x >= 0)
+        & (patch_x < width)
+    )
+    patch_y_clip = np.clip(patch_y, 0, height - 1)
+    patch_x_clip = np.clip(patch_x, 0, width - 1)
+    patch_values = query_depth[patch_y_clip, patch_x_clip].astype(np.float32, copy=False)
+    patch_valid = (
+        in_bounds
+        & np.isfinite(patch_values)
+        & (patch_values > min_depth)
+        & (patch_values < max_depth)
+    )
+    patch_area = in_bounds.sum(axis=1).astype(np.float32, copy=False)
     patch_valid_ratio = np.zeros(num_tracks, dtype=np.float32)
-    patch_median = np.full(num_tracks, np.nan, dtype=np.float32)
-    patch_std = np.full(num_tracks, np.nan, dtype=np.float32)
-
-    for track_idx, (x_coord, y_coord) in enumerate(zip(xs, ys)):
-        y0 = max(0, y_coord - patch_radius)
-        y1 = min(height, y_coord + patch_radius + 1)
-        x0 = max(0, x_coord - patch_radius)
-        x1 = min(width, x_coord + patch_radius + 1)
-        patch = query_depth[y0:y1, x0:x1]
-        patch_valid = np.isfinite(patch) & (patch > min_depth) & (patch < max_depth)
-        if patch_valid.size > 0:
-            patch_valid_ratio[track_idx] = float(patch_valid.mean())
-        patch_values = patch[patch_valid]
-        if patch_values.size == 0:
-            continue
-        patch_median[track_idx] = float(np.median(patch_values))
-        patch_std[track_idx] = float(np.std(patch_values))
+    valid_patch_area = patch_area > 0
+    patch_valid_ratio[valid_patch_area] = (
+        patch_valid.sum(axis=1)[valid_patch_area].astype(np.float32, copy=False)
+        / patch_area[valid_patch_area]
+    )
+    patch_values_masked = np.where(patch_valid, patch_values, np.nan)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        patch_median = np.nanmedian(patch_values_masked, axis=1).astype(np.float32, copy=False)
+        patch_std = np.nanstd(patch_values_masked, axis=1).astype(np.float32, copy=False)
 
     return {
         "xs": xs,
@@ -1127,6 +1262,46 @@ def compute_high_volatility_mask(
     return hit_mask.reshape(volatility_map.shape), threshold
 
 
+def _compute_linear_percentiles_for_masked_columns(
+    values: np.ndarray,
+    valid: np.ndarray,
+    *,
+    percentiles: tuple[float, ...],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Match NumPy's default linear percentile interpolation for a masked (T, M) matrix."""
+    values = np.asarray(values, dtype=np.float32)
+    valid = np.asarray(valid, dtype=bool)
+    if values.ndim != 2:
+        raise ValueError(f"Expected values shape (T,M), got {values.shape}")
+    if valid.shape != values.shape:
+        raise ValueError(f"Expected valid shape {values.shape}, got {valid.shape}")
+
+    percentiles_np = np.asarray(percentiles, dtype=np.float64).reshape(-1)
+    if percentiles_np.size == 0:
+        raise ValueError("percentiles must contain at least one value")
+
+    valid_counts = valid.sum(axis=0).astype(np.int32, copy=False)
+    result = np.full((percentiles_np.size, values.shape[1]), np.nan, dtype=np.float64)
+    valid_columns = valid_counts > 0
+    if not np.any(valid_columns):
+        return result, valid_counts
+
+    sorted_values = np.sort(np.where(valid, values, np.inf), axis=0)
+    cols = np.flatnonzero(valid_columns).astype(np.int32, copy=False)
+    counts = valid_counts[cols].astype(np.float64, copy=False)
+    max_indices = counts - 1.0
+    for percentile_idx, percentile in enumerate(percentiles_np.tolist()):
+        rank = np.clip(float(percentile), 0.0, 100.0) / 100.0 * max_indices
+        low_idx = np.floor(rank).astype(np.int32, copy=False)
+        high_idx = np.ceil(rank).astype(np.int32, copy=False)
+        interp = rank - low_idx.astype(np.float64, copy=False)
+        low_values = sorted_values[low_idx, cols].astype(np.float64, copy=False)
+        high_values = sorted_values[high_idx, cols].astype(np.float64, copy=False)
+        result[percentile_idx, cols] = low_values + interp * (high_values - low_values)
+
+    return result, valid_counts
+
+
 def compute_accessed_high_volatility_mask(
     full_depths: np.ndarray,
     *,
@@ -1136,7 +1311,8 @@ def compute_accessed_high_volatility_mask(
     low_percentile: float = VOLATILITY_LOW_PERCENTILE,
     high_percentile: float = VOLATILITY_HIGH_PERCENTILE,
     mask_percentile: float = VOLATILITY_MASK_PERCENTILE,
-) -> tuple[np.ndarray, float]:
+    return_stats: bool = False,
+) -> tuple[np.ndarray, float] | tuple[np.ndarray, float, dict[str, float]]:
     """Compute a dense high-volatility mask using only accessed pixel locations."""
     full_depths = np.asarray(full_depths, dtype=np.float32)
     accessed_pixel_mask = np.asarray(accessed_pixel_mask, dtype=bool)
@@ -1148,32 +1324,52 @@ def compute_accessed_high_volatility_mask(
         )
 
     high_volatility_mask = np.zeros(full_depths.shape[1:], dtype=bool)
+    accessed_pixel_count = int(np.count_nonzero(accessed_pixel_mask))
     ys, xs = np.nonzero(accessed_pixel_mask)
     if ys.size == 0:
+        stats = {
+            "accessed_pixel_count": float(accessed_pixel_count),
+            "valid_pixel_count": 0.0,
+            "threshold": float("nan"),
+        }
+        if return_stats:
+            return high_volatility_mask, float("nan"), stats
         return high_volatility_mask, float("nan")
 
     accessed_depths = full_depths[:, ys, xs]
     valid = np.isfinite(accessed_depths) & (accessed_depths > min_depth) & (accessed_depths < max_depth)
+    valid_pixel_count = int(np.count_nonzero(valid.any(axis=0)))
     if not np.any(valid):
+        stats = {
+            "accessed_pixel_count": float(accessed_pixel_count),
+            "valid_pixel_count": float(valid_pixel_count),
+            "threshold": float("nan"),
+        }
+        if return_stats:
+            return high_volatility_mask, float("nan"), stats
         return high_volatility_mask, float("nan")
 
-    depths_nan = np.where(valid, accessed_depths, np.nan)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=RuntimeWarning)
-        depth_lo, depth_hi = np.nanpercentile(
-            depths_nan,
-            [low_percentile, high_percentile],
-            axis=0,
-        )
+    percentile_values, valid_counts = _compute_linear_percentiles_for_masked_columns(
+        accessed_depths,
+        valid,
+        percentiles=(float(low_percentile), float(high_percentile)),
+    )
+    depth_lo, depth_hi = percentile_values
 
     volatility_values = np.nan_to_num(depth_hi - depth_lo, nan=0.0, posinf=0.0, neginf=0.0)
-    valid_counts = valid.sum(axis=0)
     volatility_values[valid_counts < 2] = 0.0
     hit_mask, threshold = _threshold_high_volatility_values(
         volatility_values,
         percentile=mask_percentile,
     )
     high_volatility_mask[ys[hit_mask], xs[hit_mask]] = True
+    stats = {
+        "accessed_pixel_count": float(accessed_pixel_count),
+        "valid_pixel_count": float(valid_pixel_count),
+        "threshold": float(threshold),
+    }
+    if return_stats:
+        return high_volatility_mask, threshold, stats
     return high_volatility_mask, threshold
 
 
@@ -1458,8 +1654,10 @@ def build_traj_filter_result(
     high_volatility_mask: np.ndarray | None = None,
     depth_volatility_map: np.ndarray | None = None,
     temporal_compare_context: dict[str, np.ndarray | int] | None = None,
+    profile_stats: dict[str, float] | None = None,
 ) -> dict[str, np.ndarray]:
     """Build per-trajectory mask plus debug metadata."""
+    filter_result_start = time.perf_counter()
     traj = np.asarray(traj, dtype=np.float32)
     num_tracks, num_frames, _ = traj.shape
     config = resolve_traj_filter_config(filter_args)
@@ -1473,6 +1671,34 @@ def build_traj_filter_result(
         TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR,
     }:
         raise ValueError(f"Unsupported traj_filter_profile: {profile}")
+    ablation_mode = resolve_traj_filter_ablation_mode(filter_args)
+    wrist_like_profiles = {
+        TRAJ_FILTER_PROFILE_WRIST,
+        TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR_TOP95,
+        TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR,
+    }
+    wrist_manipulator_profiles = {
+        TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR_TOP95,
+        TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR,
+    }
+    manipulator_stage_ablation_modes = {
+        TRAJ_FILTER_ABLATION_MODE_WRIST_SEED_TOP95,
+        TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_DEPTH,
+        TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_MOTION,
+        TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_CLUSTER,
+    }
+    if ablation_mode != TRAJ_FILTER_ABLATION_MODE_NONE and profile not in wrist_like_profiles:
+        raise ValueError(
+            f"traj_filter_ablation_mode='{ablation_mode}' requires a wrist-like traj_filter_profile, got '{profile}'"
+        )
+    if (
+        ablation_mode in manipulator_stage_ablation_modes
+        and profile not in wrist_manipulator_profiles
+    ):
+        raise ValueError(
+            f"traj_filter_ablation_mode='{ablation_mode}' requires traj_filter_profile to be one of "
+            f"{sorted(wrist_manipulator_profiles)}, got '{profile}'"
+        )
 
     default_ratio = np.full(num_tracks, np.nan, dtype=np.float32)
     default_counts = np.zeros(num_tracks, dtype=np.uint16)
@@ -1489,9 +1715,21 @@ def build_traj_filter_result(
     default_query_depth_edge_mask = np.zeros(num_tracks, dtype=bool)
     default_query_depth_patch_valid_ratio = np.full(num_tracks, np.nan, dtype=np.float32)
     default_query_depth_patch_std = np.full(num_tracks, np.nan, dtype=np.float32)
+    default_all_true_mask = np.ones(num_tracks, dtype=bool)
+    filter_result_base_geometry_seconds = 0.0
+    filter_result_query_depth_patch_stats_seconds = 0.0
+    filter_result_query_depth_quality_seconds = 0.0
+    filter_result_query_depth_edge_risk_seconds = 0.0
+    filter_result_temporal_seconds = 0.0
+    filter_result_manipulator_near_depth_seconds = 0.0
+    filter_result_manipulator_world_lift_seconds = 0.0
+    filter_result_manipulator_motion_seconds = 0.0
+    filter_result_manipulator_cluster_seconds = 0.0
+    filter_result_top95_seconds = 0.0
 
     if not config["enabled"]:
-        return {
+        filter_result_total_seconds = time.perf_counter() - filter_result_start
+        result = {
             "traj_valid_mask": np.ones(num_tracks, dtype=bool),
             "traj_depth_consistency_ratio": default_ratio,
             "traj_stable_depth_consistency_ratio": default_ratio.copy(),
@@ -1515,8 +1753,24 @@ def build_traj_filter_result(
             "traj_query_depth_patch_valid_ratio": default_query_depth_patch_valid_ratio.copy(),
             "traj_query_depth_patch_std": default_query_depth_patch_std.copy(),
             "traj_query_depth_edge_risk_mask": default_query_depth_edge_mask.copy(),
+            "traj_base_mask": default_all_true_mask.copy(),
+            "traj_query_depth_quality_mask": default_all_true_mask.copy(),
+            "traj_query_depth_keep_mask": default_all_true_mask.copy(),
+            "traj_supervision_support_mask": default_all_true_mask.copy(),
+            "traj_near_depth_mask": default_manipulator_mask.copy(),
+            "traj_motion_mask": default_manipulator_mask.copy(),
+            "traj_cluster_mask": default_manipulator_mask.copy(),
+            "traj_pre_top95_mask": default_all_true_mask.copy(),
         }
+        _accumulate_profile_stat(
+            profile_stats,
+            "filter_result_total_seconds",
+            filter_result_total_seconds,
+        )
+        _accumulate_profile_stat(profile_stats, "filter_result_other_seconds", filter_result_total_seconds)
+        return result
 
+    base_geometry_start = time.perf_counter()
     visibility = _normalize_visibility(visibs, num_tracks=num_tracks, num_frames=num_frames)
     visibs_for_filter = visibility if config["use_visibility"] else None
 
@@ -1532,6 +1786,12 @@ def build_traj_filter_result(
         visibility_threshold=config["visibility_threshold"],
         check_depth_smoothness=config["check_depth_smoothness"],
         depth_change_threshold=config["depth_change_threshold"],
+    )
+    filter_result_base_geometry_seconds = time.perf_counter() - base_geometry_start
+    _accumulate_profile_stat(
+        profile_stats,
+        "filter_result_base_geometry_seconds",
+        filter_result_base_geometry_seconds,
     )
     base_mask = np.asarray(base_geometry["traj_valid_mask"]).astype(bool, copy=False)
     wrist_base_mask = (
@@ -1554,12 +1814,20 @@ def build_traj_filter_result(
             raise ValueError(
                 f"Expected keypoints and trajectories to share track count, got {keypoints.shape[0]} and {traj.shape[0]}"
             )
+        query_depth_patch_start = time.perf_counter()
         query_depth_patch_stats = _compute_query_depth_patch_stats(
             keypoints,
             query_depth,
             min_depth=config["min_depth"],
             max_depth=config["max_depth"],
         )
+        filter_result_query_depth_patch_stats_seconds = time.perf_counter() - query_depth_patch_start
+        _accumulate_profile_stat(
+            profile_stats,
+            "filter_result_query_depth_patch_stats_seconds",
+            filter_result_query_depth_patch_stats_seconds,
+        )
+        query_depth_quality_start = time.perf_counter()
         query_depth_quality_mask = compute_query_depth_quality_mask(
             keypoints,
             query_depth,
@@ -1567,12 +1835,15 @@ def build_traj_filter_result(
             max_depth=config["max_depth"],
             patch_stats=query_depth_patch_stats,
         )
+        filter_result_query_depth_quality_seconds = time.perf_counter() - query_depth_quality_start
+        _accumulate_profile_stat(
+            profile_stats,
+            "filter_result_query_depth_quality_seconds",
+            filter_result_query_depth_quality_seconds,
+        )
         query_depth_mask = query_depth_quality_mask.copy()
-        if profile in {
-            TRAJ_FILTER_PROFILE_WRIST,
-            TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR_TOP95,
-            TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR,
-        }:
+        if profile in wrist_like_profiles:
+            query_depth_edge_start = time.perf_counter()
             query_depth_edge_result = compute_query_depth_edge_risk_mask(
                 keypoints,
                 query_depth,
@@ -1592,7 +1863,15 @@ def build_traj_filter_result(
             traj_query_depth_edge_risk_mask = np.asarray(query_depth_edge_result["mask"]).astype(
                 bool, copy=False
             )
-            query_depth_mask &= ~traj_query_depth_edge_risk_mask
+            filter_result_query_depth_edge_risk_seconds = time.perf_counter() - query_depth_edge_start
+            _accumulate_profile_stat(
+                profile_stats,
+                "filter_result_query_depth_edge_risk_seconds",
+                filter_result_query_depth_edge_risk_seconds,
+            )
+            if ablation_mode != TRAJ_FILTER_ABLATION_MODE_WRIST_NO_QUERY_EDGE:
+                query_depth_mask &= ~traj_query_depth_edge_risk_mask
+    traj_query_depth_keep_mask = query_depth_mask.copy()
 
     temporal_mask = np.ones(num_tracks, dtype=bool)
     depth_consistency_ratio = default_ratio.copy()
@@ -1616,6 +1895,7 @@ def build_traj_filter_result(
                 raise ValueError("high_volatility_mask is required when volatility guidance is enabled")
             temporal_high_volatility_mask = high_volatility_mask
 
+        temporal_start = time.perf_counter()
         temporal_result = evaluate_temporal_depth_consistency(
             traj,
             visibs=visibility,
@@ -1630,6 +1910,12 @@ def build_traj_filter_result(
             depth_rel_tol=config["temporal_depth_rel_tol"],
             high_volatility_mask=temporal_high_volatility_mask,
             temporal_compare_context=temporal_compare_context,
+        )
+        filter_result_temporal_seconds = time.perf_counter() - temporal_start
+        _accumulate_profile_stat(
+            profile_stats,
+            "filter_result_temporal_seconds",
+            filter_result_temporal_seconds,
         )
         temporal_mask = np.asarray(temporal_result["mask"]).astype(bool, copy=False)
         depth_consistency_ratio = np.asarray(temporal_result["consistency_ratio"]).astype(np.float32, copy=False)
@@ -1665,6 +1951,12 @@ def build_traj_filter_result(
     traj_manipulator_cluster_id = default_cluster_id.copy()
     traj_manipulator_component_size = default_component_size.copy()
     traj_manipulator_cluster_fallback_used = default_fallback_used.copy()
+    traj_base_mask = base_mask.copy()
+    traj_supervision_support_mask = temporal_mask.copy()
+    traj_near_depth_mask = default_manipulator_mask.copy()
+    traj_motion_mask = default_manipulator_mask.copy()
+    traj_cluster_mask = default_manipulator_mask.copy()
+    traj_pre_top95_mask = default_manipulator_mask.copy()
     external_seed_mask = base_mask & query_depth_mask & temporal_mask
 
     if profile in {
@@ -1678,6 +1970,7 @@ def build_traj_filter_result(
         reason_bits[stable_temporal_fail & (~temporal_mask)] |= MASK_REASON_STABLE_TEMPORAL_FAIL
         if profile == TRAJ_FILTER_PROFILE_EXTERNAL:
             final_mask = external_seed_mask
+            traj_pre_top95_mask = final_mask.copy()
         else:
             wrist_seed_mask = external_seed_mask.copy()
             raw_depths_segment, intrinsics_segment, extrinsics_segment = _require_segment_geometry(
@@ -1697,6 +1990,7 @@ def build_traj_filter_result(
                 "image_width": image_width,
                 "min_depth": config["min_depth"],
                 "max_depth": config["max_depth"],
+                "profile_stats": profile_stats,
             }
             if profile == TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR:
                 manipulator_filter_kwargs.update(
@@ -1723,6 +2017,18 @@ def build_traj_filter_result(
                         "major_component_ratio": config["external_manipulator_v2_major_component_ratio"],
                     }
                 )
+            manipulator_near_depth_before = _get_profile_stat(
+                profile_stats, "filter_result_manipulator_near_depth_seconds"
+            )
+            manipulator_world_lift_before = _get_profile_stat(
+                profile_stats, "filter_result_manipulator_world_lift_seconds"
+            )
+            manipulator_motion_before = _get_profile_stat(
+                profile_stats, "filter_result_manipulator_motion_seconds"
+            )
+            manipulator_cluster_before = _get_profile_stat(
+                profile_stats, "filter_result_manipulator_cluster_seconds"
+            )
             (
                 final_mask,
                 traj_query_depth_rank,
@@ -1731,16 +2037,39 @@ def build_traj_filter_result(
                 traj_manipulator_candidate_mask,
                 traj_manipulator_cluster_id,
                 traj_manipulator_component_size,
-                near_depth_mask,
-                motion_mask,
+                traj_near_depth_mask,
+                traj_motion_mask,
+                traj_cluster_mask,
                 fallback_used,
             ) = _apply_manipulator_aware_filter(**manipulator_filter_kwargs)
+            filter_result_manipulator_near_depth_seconds += max(
+                0.0,
+                _get_profile_stat(profile_stats, "filter_result_manipulator_near_depth_seconds")
+                - manipulator_near_depth_before,
+            )
+            filter_result_manipulator_world_lift_seconds += max(
+                0.0,
+                _get_profile_stat(profile_stats, "filter_result_manipulator_world_lift_seconds")
+                - manipulator_world_lift_before,
+            )
+            filter_result_manipulator_motion_seconds += max(
+                0.0,
+                _get_profile_stat(profile_stats, "filter_result_manipulator_motion_seconds")
+                - manipulator_motion_before,
+            )
+            filter_result_manipulator_cluster_seconds += max(
+                0.0,
+                _get_profile_stat(profile_stats, "filter_result_manipulator_cluster_seconds")
+                - manipulator_cluster_before,
+            )
             traj_manipulator_cluster_fallback_used = np.asarray(fallback_used, dtype=bool)
+            traj_pre_top95_mask = final_mask.copy()
 
-            reason_bits[wrist_seed_mask & (~near_depth_mask)] |= MASK_REASON_MANIPULATOR_DEPTH_FAIL
-            reason_bits[wrist_seed_mask & (~motion_mask)] |= MASK_REASON_MANIPULATOR_MOTION_FAIL
-            reason_bits[traj_manipulator_candidate_mask & (~final_mask)] |= MASK_REASON_MANIPULATOR_CLUSTER_FAIL
+            reason_bits[wrist_seed_mask & (~traj_near_depth_mask)] |= MASK_REASON_MANIPULATOR_DEPTH_FAIL
+            reason_bits[wrist_seed_mask & (~traj_motion_mask)] |= MASK_REASON_MANIPULATOR_MOTION_FAIL
+            reason_bits[traj_manipulator_candidate_mask & (~traj_cluster_mask)] |= MASK_REASON_MANIPULATOR_CLUSTER_FAIL
     else:
+        traj_base_mask = wrist_base_mask.copy()
         required_prefix_frames = _resolve_support_frame_requirement(
             num_frames=num_frames,
             min_frames=config["wrist_min_prefix_frames"],
@@ -1756,20 +2085,47 @@ def build_traj_filter_result(
         ) & (
             supervision_count >= required_support_frames
         )
+        traj_supervision_support_mask = supervision_support_mask.copy()
         reason_bits[~wrist_base_mask] |= MASK_REASON_BASE_GEOMETRY_FAIL
         reason_bits[~query_depth_quality_mask] |= MASK_REASON_QUERY_DEPTH_FAIL
-        reason_bits[traj_query_depth_edge_risk_mask] |= MASK_REASON_QUERY_DEPTH_EDGE_FAIL
+        if ablation_mode != TRAJ_FILTER_ABLATION_MODE_WRIST_NO_QUERY_EDGE:
+            reason_bits[traj_query_depth_edge_risk_mask] |= MASK_REASON_QUERY_DEPTH_EDGE_FAIL
         reason_bits[~supervision_support_mask] |= MASK_REASON_TEMPORAL_CONSISTENCY_FAIL
         wrist_seed_mask = wrist_base_mask & query_depth_mask & supervision_support_mask
 
         if profile == TRAJ_FILTER_PROFILE_WRIST:
             final_mask = wrist_seed_mask
+            traj_pre_top95_mask = final_mask.copy()
         else:
             raw_depths_segment, intrinsics_segment, extrinsics_segment = _require_segment_geometry(
                 raw_depths_segment=raw_depths_segment,
                 intrinsics_segment=intrinsics_segment,
                 extrinsics_segment=extrinsics_segment,
                 expected_num_frames=num_frames,
+            )
+            apply_near_depth_filter = (
+                ablation_mode != TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_DEPTH
+                and ablation_mode != TRAJ_FILTER_ABLATION_MODE_WRIST_SEED_TOP95
+            )
+            apply_motion_filter = (
+                ablation_mode != TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_MOTION
+                and ablation_mode != TRAJ_FILTER_ABLATION_MODE_WRIST_SEED_TOP95
+            )
+            apply_cluster_filter = (
+                ablation_mode != TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_CLUSTER
+                and ablation_mode != TRAJ_FILTER_ABLATION_MODE_WRIST_SEED_TOP95
+            )
+            manipulator_near_depth_before = _get_profile_stat(
+                profile_stats, "filter_result_manipulator_near_depth_seconds"
+            )
+            manipulator_world_lift_before = _get_profile_stat(
+                profile_stats, "filter_result_manipulator_world_lift_seconds"
+            )
+            manipulator_motion_before = _get_profile_stat(
+                profile_stats, "filter_result_manipulator_motion_seconds"
+            )
+            manipulator_cluster_before = _get_profile_stat(
+                profile_stats, "filter_result_manipulator_cluster_seconds"
             )
             (
                 manipulator_final_mask,
@@ -1779,8 +2135,9 @@ def build_traj_filter_result(
                 traj_manipulator_candidate_mask,
                 traj_manipulator_cluster_id,
                 traj_manipulator_component_size,
-                near_depth_mask,
-                motion_mask,
+                traj_near_depth_mask,
+                traj_motion_mask,
+                traj_cluster_mask,
                 fallback_used,
             ) = _apply_manipulator_aware_filter(
                 traj=traj,
@@ -1799,22 +2156,75 @@ def build_traj_filter_result(
                 cluster_radius_min_px=config["wrist_manipulator_cluster_radius_min_px"],
                 min_component_ratio=config["wrist_manipulator_min_component_ratio"],
                 min_component_size=config["wrist_manipulator_min_component_size"],
+                apply_near_depth_filter=apply_near_depth_filter,
+                apply_motion_filter=apply_motion_filter,
+                apply_cluster_filter=apply_cluster_filter,
+                profile_stats=profile_stats,
+            )
+            filter_result_manipulator_near_depth_seconds += max(
+                0.0,
+                _get_profile_stat(profile_stats, "filter_result_manipulator_near_depth_seconds")
+                - manipulator_near_depth_before,
+            )
+            filter_result_manipulator_world_lift_seconds += max(
+                0.0,
+                _get_profile_stat(profile_stats, "filter_result_manipulator_world_lift_seconds")
+                - manipulator_world_lift_before,
+            )
+            filter_result_manipulator_motion_seconds += max(
+                0.0,
+                _get_profile_stat(profile_stats, "filter_result_manipulator_motion_seconds")
+                - manipulator_motion_before,
+            )
+            filter_result_manipulator_cluster_seconds += max(
+                0.0,
+                _get_profile_stat(profile_stats, "filter_result_manipulator_cluster_seconds")
+                - manipulator_cluster_before,
             )
             traj_manipulator_cluster_fallback_used = np.asarray(fallback_used, dtype=bool)
 
-            reason_bits[wrist_seed_mask & (~near_depth_mask)] |= MASK_REASON_MANIPULATOR_DEPTH_FAIL
-            reason_bits[wrist_seed_mask & (~motion_mask)] |= MASK_REASON_MANIPULATOR_MOTION_FAIL
-            reason_bits[traj_manipulator_candidate_mask & (~manipulator_final_mask)] |= MASK_REASON_MANIPULATOR_CLUSTER_FAIL
-            if profile == TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR_TOP95:
+            if apply_near_depth_filter:
+                reason_bits[wrist_seed_mask & (~traj_near_depth_mask)] |= MASK_REASON_MANIPULATOR_DEPTH_FAIL
+            if apply_motion_filter:
+                reason_bits[wrist_seed_mask & (~traj_motion_mask)] |= MASK_REASON_MANIPULATOR_MOTION_FAIL
+            if apply_cluster_filter:
+                reason_bits[traj_manipulator_candidate_mask & (~traj_cluster_mask)] |= (
+                    MASK_REASON_MANIPULATOR_CLUSTER_FAIL
+                )
+
+            if ablation_mode == TRAJ_FILTER_ABLATION_MODE_WRIST_SEED_TOP95:
+                traj_pre_top95_mask = wrist_seed_mask.copy()
+                top95_start = time.perf_counter()
                 final_mask = _apply_top_motion_extent_filter(
-                    seed_mask=manipulator_final_mask,
+                    seed_mask=wrist_seed_mask,
                     motion_extent=traj_motion_extent,
                     keep_ratio=config["wrist_manipulator_top95_keep_ratio"],
                 )
+                filter_result_top95_seconds = time.perf_counter() - top95_start
+                _accumulate_profile_stat(
+                    profile_stats,
+                    "filter_result_top95_seconds",
+                    filter_result_top95_seconds,
+                )
+            elif profile == TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR_TOP95:
+                traj_pre_top95_mask = manipulator_final_mask.copy()
+                top95_start = time.perf_counter()
+                final_mask = _apply_top_motion_extent_filter(
+                    seed_mask=traj_pre_top95_mask,
+                    motion_extent=traj_motion_extent,
+                    keep_ratio=config["wrist_manipulator_top95_keep_ratio"],
+                )
+                filter_result_top95_seconds = time.perf_counter() - top95_start
+                _accumulate_profile_stat(
+                    profile_stats,
+                    "filter_result_top95_seconds",
+                    filter_result_top95_seconds,
+                )
             else:
                 final_mask = manipulator_final_mask
+                traj_pre_top95_mask = final_mask.copy()
 
-    return {
+    result = {
         "traj_valid_mask": final_mask.astype(bool),
         "traj_depth_consistency_ratio": depth_consistency_ratio.astype(np.float32),
         "traj_stable_depth_consistency_ratio": stable_depth_consistency_ratio.astype(np.float32),
@@ -1840,7 +2250,35 @@ def build_traj_filter_result(
         "traj_query_depth_patch_valid_ratio": traj_query_depth_patch_valid_ratio.astype(np.float32),
         "traj_query_depth_patch_std": traj_query_depth_patch_std.astype(np.float32),
         "traj_query_depth_edge_risk_mask": traj_query_depth_edge_risk_mask.astype(bool),
+        "traj_base_mask": traj_base_mask.astype(bool),
+        "traj_query_depth_quality_mask": query_depth_quality_mask.astype(bool),
+        "traj_query_depth_keep_mask": traj_query_depth_keep_mask.astype(bool),
+        "traj_supervision_support_mask": traj_supervision_support_mask.astype(bool),
+        "traj_near_depth_mask": traj_near_depth_mask.astype(bool),
+        "traj_motion_mask": traj_motion_mask.astype(bool),
+        "traj_cluster_mask": traj_cluster_mask.astype(bool),
+        "traj_pre_top95_mask": traj_pre_top95_mask.astype(bool),
     }
+    filter_result_total_seconds = time.perf_counter() - filter_result_start
+    _accumulate_profile_stat(profile_stats, "filter_result_total_seconds", filter_result_total_seconds)
+    filter_result_explicit_seconds = (
+        filter_result_base_geometry_seconds
+        + filter_result_query_depth_patch_stats_seconds
+        + filter_result_query_depth_quality_seconds
+        + filter_result_query_depth_edge_risk_seconds
+        + filter_result_temporal_seconds
+        + filter_result_manipulator_near_depth_seconds
+        + filter_result_manipulator_world_lift_seconds
+        + filter_result_manipulator_motion_seconds
+        + filter_result_manipulator_cluster_seconds
+        + filter_result_top95_seconds
+    )
+    _accumulate_profile_stat(
+        profile_stats,
+        "filter_result_other_seconds",
+        max(0.0, filter_result_total_seconds - filter_result_explicit_seconds),
+    )
+    return result
 
 
 def build_traj_valid_mask(

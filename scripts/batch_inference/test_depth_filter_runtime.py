@@ -4,7 +4,7 @@ from unittest import mock
 import numpy as np
 import torch
 
-from datasets.data_ops import _build_depth_filter_rays, _filter_one_depth
+from datasets.data_ops import _build_depth_filter_rays, _filter_one_depth, _filter_one_depth_profiled
 from scripts.batch_inference import infer
 
 
@@ -53,6 +53,30 @@ class DepthFilterPrimitiveTests(unittest.TestCase):
 
         np.testing.assert_array_equal(filtered_default, filtered_cached)
 
+    def test_filter_one_depth_profiled_reports_nonnegative_stage_times(self):
+        depth = np.full((4, 4), 1.0, dtype=np.float32)
+        intrinsics = _make_intrinsics()
+
+        filtered_depth, profile = _filter_one_depth_profiled(
+            depth,
+            0.08,
+            15,
+            intrinsics,
+        )
+
+        self.assertEqual(filtered_depth.shape, depth.shape)
+        expected_keys = {
+            "ray_scale_seconds",
+            "points_to_normals_seconds",
+            "edge_mask_seconds",
+            "distance_transform_seconds",
+            "fill_seconds",
+            "total_seconds",
+        }
+        self.assertEqual(set(profile.keys()), expected_keys)
+        for value in profile.values():
+            self.assertGreaterEqual(float(value), 0.0)
+
 
 class DepthFilterRuntimeTests(unittest.TestCase):
     def test_overlapping_segments_only_filter_unique_frames_once(self):
@@ -61,9 +85,16 @@ class DepthFilterRuntimeTests(unittest.TestCase):
 
         def fake_filter(depth, depth_rtol, normal_tol, intrinsic, rays=None):
             self.assertIsNotNone(rays)
-            return depth + 0.5
+            return depth + 0.5, {
+                "ray_scale_seconds": 0.01,
+                "points_to_normals_seconds": 0.02,
+                "edge_mask_seconds": 0.03,
+                "distance_transform_seconds": 0.04,
+                "fill_seconds": 0.05,
+                "total_seconds": 0.15,
+            }
 
-        with mock.patch.object(infer, "_filter_one_depth", side_effect=fake_filter) as filter_mock:
+        with mock.patch.object(infer, "_filter_one_depth_profiled", side_effect=fake_filter) as filter_mock:
             with infer._DepthFilterRuntime(
                 depths,
                 intrinsics,
@@ -79,14 +110,18 @@ class DepthFilterRuntimeTests(unittest.TestCase):
         np.testing.assert_array_equal(first_segment[1], second_segment[0])
         self.assertEqual(profile_stats["prepare_depth_filter_cache_miss_frames"], 3.0)
         self.assertEqual(profile_stats["prepare_depth_filter_cache_hit_frames"], 1.0)
+        self.assertEqual(profile_stats["prepare_depth_filter_unique_frame_count"], 3.0)
+        self.assertAlmostEqual(profile_stats["prepare_depth_filter_worker_total_seconds"], 0.45)
+        self.assertAlmostEqual(profile_stats["prepare_depth_filter_distance_transform_seconds"], 0.12)
+        self.assertGreaterEqual(profile_stats["prepare_depth_filter_stack_seconds"], 0.0)
 
     def test_release_segment_frames_evicts_completed_frames(self):
         depths, intrinsics = _make_runtime_fixture()
 
         with mock.patch.object(
             infer,
-            "_filter_one_depth",
-            side_effect=lambda depth, depth_rtol, normal_tol, intrinsic, rays=None: depth,
+            "_filter_one_depth_profiled",
+            side_effect=lambda depth, depth_rtol, normal_tol, intrinsic, rays=None: (depth, {"total_seconds": 0.0}),
         ):
             with infer._DepthFilterRuntime(
                 depths,
@@ -117,8 +152,8 @@ class DepthFilterRuntimeTests(unittest.TestCase):
             return_value=np.ones((4, 4, 3), dtype=np.float32),
         ) as ray_builder, mock.patch.object(
             infer,
-            "_filter_one_depth",
-            side_effect=lambda depth, depth_rtol, normal_tol, intrinsic, rays=None: depth,
+            "_filter_one_depth_profiled",
+            side_effect=lambda depth, depth_rtol, normal_tol, intrinsic, rays=None: (depth, {"total_seconds": 0.0}),
         ):
             with infer._DepthFilterRuntime(
                 depths,

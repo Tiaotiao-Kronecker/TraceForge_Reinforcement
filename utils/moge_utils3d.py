@@ -3,6 +3,7 @@
 import numpy as np
 from typing import Tuple, Union
 from numbers import Number
+from scipy import ndimage
 
 def sliding_window_1d(x: np.ndarray, window_size: int, stride: int, axis: int = -1):
     """
@@ -63,6 +64,12 @@ def max_pool_2d(x: np.ndarray, kernel_size: Union[int, Tuple[int, int]], stride:
     axis = tuple(axis)
     return max_pool_nd(x, kernel_size, stride, padding, axis)
 
+
+def _last2d_filter_size(ndim: int, kernel_size: int) -> tuple[int, ...]:
+    if ndim < 2:
+        raise ValueError(f"Expected array with at least 2 dims, got ndim={ndim}")
+    return (1,) * (ndim - 2) + (int(kernel_size), int(kernel_size))
+
 def depth_edge(depth: np.ndarray, atol: float = None, rtol: float = None, kernel_size: int = 3, mask: np.ndarray = None) -> np.ndarray:
     """
     Compute the edge mask from depth map. The edge is defined as the pixels whose neighbors have large difference in depth.
@@ -75,10 +82,25 @@ def depth_edge(depth: np.ndarray, atol: float = None, rtol: float = None, kernel
     Returns:
         edge (np.ndarray): shape (..., height, width) of dtype torch.bool
     """
+    filter_size = _last2d_filter_size(depth.ndim, kernel_size)
     if mask is None:
-        diff = (max_pool_2d(depth, kernel_size, stride=1, padding=kernel_size // 2) + max_pool_2d(-depth, kernel_size, stride=1, padding=kernel_size // 2))
+        local_max = ndimage.maximum_filter(depth, size=filter_size, mode="constant", cval=-np.inf)
+        local_min = ndimage.minimum_filter(depth, size=filter_size, mode="constant", cval=np.inf)
     else:
-        diff = (max_pool_2d(np.where(mask, depth, -np.inf), kernel_size, stride=1, padding=kernel_size // 2) + max_pool_2d(np.where(mask, -depth, -np.inf), kernel_size, stride=1, padding=kernel_size // 2))
+        local_max = ndimage.maximum_filter(
+            np.where(mask, depth, -np.inf),
+            size=filter_size,
+            mode="constant",
+            cval=-np.inf,
+        )
+        local_min = ndimage.minimum_filter(
+            np.where(mask, depth, np.inf),
+            size=filter_size,
+            mode="constant",
+            cval=np.inf,
+        )
+
+    diff = local_max - local_min
 
     edge = np.zeros_like(depth, dtype=bool)
     if atol is not None:
@@ -101,28 +123,52 @@ def normals_edge(normals: np.ndarray, tol: float, kernel_size: int = 3, mask: np
     """
     assert normals.ndim >= 3 and normals.shape[-1] == 3, "normal should be of shape (..., height, width, 3)"
     normals = normals / (np.linalg.norm(normals, axis=-1, keepdims=True) + 1e-12)
-    
-    padding = kernel_size // 2
-    normals_window = sliding_window_2d(
-        np.pad(normals, (*([(0, 0)] * (normals.ndim - 3)), (padding, padding), (padding, padding), (0, 0)), mode='edge'), 
-        window_size=kernel_size, 
-        stride=1, 
-        axis=(-3, -2)
-    )
-    if mask is None:
-        angle_diff = np.arccos((normals[..., None, None] * normals_window).sum(axis=-3)).max(axis=(-2, -1))
-    else:
-        mask_window = sliding_window_2d(
-            np.pad(mask, (*([(0, 0)] * (mask.ndim - 3)), (padding, padding), (padding, padding)), mode='edge'), 
-            window_size=kernel_size, 
-            stride=1, 
-            axis=(-3, -2)
-        )
-        angle_diff = np.where(mask_window, np.arccos((normals[..., None, None] * normals_window).sum(axis=-3)), 0).max(axis=(-2, -1))
 
-    angle_diff = max_pool_2d(angle_diff, kernel_size, stride=1, padding=kernel_size // 2)
-    edge = angle_diff > np.deg2rad(tol)
-    return edge
+    height, width = normals.shape[-3:-1]
+    padding = kernel_size // 2
+    normals_pad = np.pad(
+        normals,
+        (*([(0, 0)] * (normals.ndim - 3)), (padding, padding), (padding, padding), (0, 0)),
+        mode="edge",
+    )
+    mask_pad = None
+    if mask is not None:
+        mask_pad = np.pad(
+            mask,
+            (*([(0, 0)] * (mask.ndim - 2)), (padding, padding), (padding, padding)),
+            mode="edge",
+        )
+
+    cos_tol = np.cos(np.deg2rad(tol))
+    base_edge = np.zeros(normals.shape[:-1], dtype=bool)
+    for dy in range(kernel_size):
+        y_slice = slice(dy, dy + height)
+        for dx in range(kernel_size):
+            x_slice = slice(dx, dx + width)
+            neighbor_normals = normals_pad[..., y_slice, x_slice, :]
+            dot = (normals * neighbor_normals).sum(axis=-1)
+            neighbor_edge = (dot >= -1.0) & (dot <= 1.0) & (dot < cos_tol)
+            if mask_pad is not None:
+                neighbor_edge &= mask_pad[..., y_slice, x_slice]
+            base_edge |= neighbor_edge
+
+    edge = ndimage.maximum_filter(
+        base_edge,
+        size=_last2d_filter_size(base_edge.ndim, kernel_size),
+        mode="constant",
+        cval=False,
+    )
+    return edge.astype(bool, copy=False)
+
+def _accumulate_normalized_cross(
+    accum: np.ndarray,
+    vec_a: np.ndarray,
+    vec_b: np.ndarray,
+    valid: np.ndarray,
+) -> None:
+    cross = np.cross(vec_a, vec_b, axis=-1)
+    cross /= np.linalg.norm(cross, axis=-1, keepdims=True) + 1e-12
+    accum += cross * valid[..., None]
 
 def points_to_normals(point: np.ndarray, mask: np.ndarray = None) -> np.ndarray:
     """
@@ -144,28 +190,45 @@ def points_to_normals(point: np.ndarray, mask: np.ndarray = None) -> np.ndarray:
 
     pts = np.zeros((height + 2, width + 2, 3), dtype=point.dtype)
     pts[1:-1, 1:-1, :] = point
-    up = pts[:-2, 1:-1, :] - pts[1:-1, 1:-1, :]
-    left = pts[1:-1, :-2, :] - pts[1:-1, 1:-1, :]
-    down = pts[2:, 1:-1, :] - pts[1:-1, 1:-1, :]
-    right = pts[1:-1, 2:, :] - pts[1:-1, 1:-1, :]
-    normal = np.stack([
-        np.cross(up, left, axis=-1),
-        np.cross(left, down, axis=-1),
-        np.cross(down, right, axis=-1),
-        np.cross(right, up, axis=-1),
-    ])
-    normal = normal / (np.linalg.norm(normal, axis=-1, keepdims=True) + 1e-12)
-    valid = np.stack([
-        mask[:-2, 1:-1] & mask[1:-1, :-2],
-        mask[1:-1, :-2] & mask[2:, 1:-1],
-        mask[2:, 1:-1] & mask[1:-1, 2:],
-        mask[1:-1, 2:] & mask[:-2, 1:-1],
-    ]) & mask[None, 1:-1, 1:-1]
-    normal = (normal * valid[..., None]).sum(axis=0)
+    center = pts[1:-1, 1:-1, :]
+    up = pts[:-2, 1:-1, :] - center
+    left = pts[1:-1, :-2, :] - center
+    down = pts[2:, 1:-1, :] - center
+    right = pts[1:-1, 2:, :] - center
+
+    center_mask = mask[1:-1, 1:-1]
+    up_mask = mask[:-2, 1:-1]
+    left_mask = mask[1:-1, :-2]
+    down_mask = mask[2:, 1:-1]
+    right_mask = mask[1:-1, 2:]
+
+    normal = np.zeros_like(center)
+    valid_any = np.zeros((height, width), dtype=bool) if has_mask else None
+
+    valid = center_mask & up_mask & left_mask
+    _accumulate_normalized_cross(normal, up, left, valid)
+    if has_mask:
+        valid_any |= valid
+
+    valid = center_mask & left_mask & down_mask
+    _accumulate_normalized_cross(normal, left, down, valid)
+    if has_mask:
+        valid_any |= valid
+
+    valid = center_mask & down_mask & right_mask
+    _accumulate_normalized_cross(normal, down, right, valid)
+    if has_mask:
+        valid_any |= valid
+
+    valid = center_mask & right_mask & up_mask
+    _accumulate_normalized_cross(normal, right, up, valid)
+    if has_mask:
+        valid_any |= valid
+
     normal = normal / (np.linalg.norm(normal, axis=-1, keepdims=True) + 1e-12)
     
     if has_mask:
-        normal_mask =  valid.any(axis=0)
+        normal_mask = valid_any
         normal = np.where(normal_mask[..., None], normal, 0)
         return normal, normal_mask
     else:

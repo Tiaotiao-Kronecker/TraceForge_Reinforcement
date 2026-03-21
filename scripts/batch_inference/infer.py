@@ -30,7 +30,7 @@ from utils.traceforge_artifact_utils import (
     write_scene_rgb_mp4,
 )
 
-from datasets.data_ops import _build_depth_filter_rays, _filter_one_depth
+from datasets.data_ops import _build_depth_filter_rays, _filter_one_depth_profiled
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Tuple
 from utils.inference_utils import load_model, inference
@@ -42,6 +42,12 @@ from utils.traj_filter_utils import (
     DEFAULT_QUERY_PREFILTER_MODE,
     DEFAULT_QUERY_PREFILTER_WRIST_RANK_KEEP_RATIO,
     QUERY_PREFILTER_MODE_OFF,
+    TRAJ_FILTER_ABLATION_MODE_NONE,
+    TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_CLUSTER,
+    TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_DEPTH,
+    TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_MOTION,
+    TRAJ_FILTER_ABLATION_MODE_WRIST_NO_QUERY_EDGE,
+    TRAJ_FILTER_ABLATION_MODE_WRIST_SEED_TOP95,
     build_traj_filter_result,
     build_query_prefilter_result,
     compute_accessed_high_volatility_mask,
@@ -69,6 +75,71 @@ def _accumulate_profile_stat(
     profile_stats[key] = float(profile_stats.get(key, 0.0) + float(seconds))
 
 
+def _set_profile_stat(
+    profile_stats: dict[str, float] | None,
+    key: str,
+    value: float,
+) -> None:
+    if profile_stats is None:
+        return
+    profile_stats[key] = float(value)
+
+
+def _get_profile_stat(
+    profile_stats: dict[str, float] | None,
+    key: str,
+) -> float:
+    if profile_stats is None:
+        return 0.0
+    return float(profile_stats.get(key, 0.0))
+
+
+def _count_true(mask: np.ndarray | None) -> int:
+    if mask is None:
+        return 0
+    return int(np.count_nonzero(np.asarray(mask, dtype=bool)))
+
+
+def _build_sample_filter_debug_record(
+    *,
+    query_frame_idx: int,
+    prepared_bundle: dict[str, object],
+    sample_payload: dict[str, np.ndarray],
+    traj_filter_result: dict[str, np.ndarray],
+) -> dict[str, object]:
+    tracked_query_indices = np.asarray(
+        prepared_bundle.get(
+            "tracked_query_indices",
+            np.arange(sample_payload["keypoints"].shape[0], dtype=np.int32),
+        ),
+        dtype=np.int32,
+    ).reshape(-1)
+    dense_keypoints = np.asarray(
+        prepared_bundle.get("dense_keypoints", sample_payload["keypoints"]),
+        dtype=np.float32,
+    )
+    stage_counts = {
+        "base_mask": _count_true(traj_filter_result.get("traj_base_mask")),
+        "query_depth_quality": _count_true(traj_filter_result.get("traj_query_depth_quality_mask")),
+        "query_depth_keep": _count_true(traj_filter_result.get("traj_query_depth_keep_mask")),
+        "query_depth_edge_risk": _count_true(traj_filter_result.get("traj_query_depth_edge_risk_mask")),
+        "supervision_support": _count_true(traj_filter_result.get("traj_supervision_support_mask")),
+        "wrist_seed": _count_true(traj_filter_result.get("traj_wrist_seed_mask")),
+        "near_depth": _count_true(traj_filter_result.get("traj_near_depth_mask")),
+        "motion": _count_true(traj_filter_result.get("traj_motion_mask")),
+        "cluster": _count_true(traj_filter_result.get("traj_cluster_mask")),
+        "pre_top95": _count_true(traj_filter_result.get("traj_pre_top95_mask")),
+        "final": _count_true(traj_filter_result.get("traj_valid_mask")),
+    }
+    return {
+        "query_frame_index": int(query_frame_idx),
+        "dense_query_count": int(dense_keypoints.shape[0]),
+        "tracked_query_count": int(tracked_query_indices.shape[0]),
+        "valid_track_count": int(np.count_nonzero(np.asarray(sample_payload["traj_valid_mask"], dtype=bool))),
+        "stage_counts": stage_counts,
+    }
+
+
 def _timed_cuda_empty_cache(
     *,
     profile_stats: dict[str, float] | None,
@@ -79,6 +150,92 @@ def _timed_cuda_empty_cache(
     empty_cache_start = time.perf_counter()
     torch.cuda.empty_cache()
     _accumulate_profile_stat(profile_stats, key, time.perf_counter() - empty_cache_start)
+
+
+def _record_high_volatility_mask_profile_stats(
+    *,
+    profile_stats: dict[str, float] | None,
+    stats: dict[str, float] | None,
+) -> None:
+    if profile_stats is None or stats is None:
+        return
+    _set_profile_stat(
+        profile_stats,
+        "high_volatility_accessed_pixel_count",
+        float(stats.get("accessed_pixel_count", 0.0)),
+    )
+    _set_profile_stat(
+        profile_stats,
+        "high_volatility_valid_pixel_count",
+        float(stats.get("valid_pixel_count", 0.0)),
+    )
+    _set_profile_stat(
+        profile_stats,
+        "high_volatility_threshold",
+        float(stats.get("threshold", float("nan"))),
+    )
+
+
+def _finalize_save_profile_stats(
+    *,
+    profile_stats: dict[str, float] | None,
+    save_start: float,
+) -> None:
+    if profile_stats is None:
+        return
+
+    prepare_bundle_explicit = (
+        "prepare_bundle_tensor_to_numpy_seconds",
+        "prepare_bundle_projection_seconds",
+        "prepare_bundle_filter_anomalies_seconds",
+        "prepare_bundle_temporal_context_seconds",
+    )
+    prepare_bundle_other_seconds = max(
+        0.0,
+        _get_profile_stat(profile_stats, "prepare_bundles_seconds")
+        - sum(_get_profile_stat(profile_stats, key) for key in prepare_bundle_explicit),
+    )
+    _set_profile_stat(profile_stats, "prepare_bundle_other_seconds", prepare_bundle_other_seconds)
+
+    high_volatility_mask_compute_seconds = max(
+        0.0,
+        _get_profile_stat(profile_stats, "high_volatility_mask_seconds")
+        - _get_profile_stat(profile_stats, "accessed_pixel_mask_seconds"),
+    )
+    if (
+        "high_volatility_mask_seconds" in profile_stats
+        or "accessed_pixel_mask_seconds" in profile_stats
+    ):
+        _set_profile_stat(
+            profile_stats,
+            "high_volatility_mask_compute_seconds",
+            high_volatility_mask_compute_seconds,
+        )
+
+    query_frame_save_other_seconds = max(
+        0.0,
+        _get_profile_stat(profile_stats, "query_frame_save_loop_seconds")
+        - _get_profile_stat(profile_stats, "filter_eval_seconds")
+        - _get_profile_stat(profile_stats, "sample_write_seconds"),
+    )
+    _set_profile_stat(profile_stats, "query_frame_save_other_seconds", query_frame_save_other_seconds)
+
+    save_total_seconds = time.perf_counter() - save_start
+    explicit_profile_keys = (
+        "scene_video_uint8_seconds",
+        "scene_depths_numpy_seconds",
+        "scene_intrinsics_numpy_seconds",
+        "scene_extrinsics_numpy_seconds",
+        "prepare_bundles_seconds",
+        "high_volatility_mask_seconds",
+        "scene_cache_write_seconds",
+        "scene_meta_write_seconds",
+        "query_frame_save_loop_seconds",
+        "main_npz_write_seconds",
+    )
+    explicit_total = sum(_get_profile_stat(profile_stats, key) for key in explicit_profile_keys)
+    _set_profile_stat(profile_stats, "save_total_seconds", save_total_seconds)
+    _set_profile_stat(profile_stats, "save_other_seconds", max(0.0, save_total_seconds - explicit_total))
 
 
 def _build_tracking_frame_use_counts(
@@ -164,7 +321,7 @@ class _DepthFilterRuntime:
         end_frame: int,
     ) -> np.ndarray:
         frame_indices = range(start_frame, end_frame)
-        futures: list[tuple[int, Future[np.ndarray]]] = []
+        futures: list[tuple[int, Future[tuple[np.ndarray, dict[str, float]]]]] = []
         depth_filter_start = time.perf_counter()
 
         for frame_idx in frame_indices:
@@ -189,7 +346,7 @@ class _DepthFilterRuntime:
                 (
                     frame_idx,
                     self._executor.submit(
-                        _filter_one_depth,
+                        _filter_one_depth_profiled,
                         depth,
                         0.08,
                         15,
@@ -200,15 +357,69 @@ class _DepthFilterRuntime:
             )
 
         if futures:
+            future_wait_seconds = 0.0
             for frame_idx, future in futures:
-                self._filtered_depth_cache[frame_idx] = future.result()
+                future_wait_start = time.perf_counter()
+                filtered_depth, worker_profile = future.result()
+                future_wait_seconds += time.perf_counter() - future_wait_start
+                self._filtered_depth_cache[frame_idx] = filtered_depth
+                _accumulate_profile_stat(
+                    self._profile_stats,
+                    "prepare_depth_filter_unique_frame_count",
+                    1.0,
+                )
+                _accumulate_profile_stat(
+                    self._profile_stats,
+                    "prepare_depth_filter_worker_total_seconds",
+                    float(worker_profile.get("total_seconds", 0.0)),
+                )
+                _accumulate_profile_stat(
+                    self._profile_stats,
+                    "prepare_depth_filter_ray_scale_seconds",
+                    float(worker_profile.get("ray_scale_seconds", 0.0)),
+                )
+                _accumulate_profile_stat(
+                    self._profile_stats,
+                    "prepare_depth_filter_points_to_normals_seconds",
+                    float(worker_profile.get("points_to_normals_seconds", 0.0)),
+                )
+                _accumulate_profile_stat(
+                    self._profile_stats,
+                    "prepare_depth_filter_edge_mask_seconds",
+                    float(worker_profile.get("edge_mask_seconds", 0.0)),
+                )
+                _accumulate_profile_stat(
+                    self._profile_stats,
+                    "prepare_depth_filter_distance_transform_seconds",
+                    float(worker_profile.get("distance_transform_seconds", 0.0)),
+                )
+                _accumulate_profile_stat(
+                    self._profile_stats,
+                    "prepare_depth_filter_fill_seconds",
+                    float(worker_profile.get("fill_seconds", 0.0)),
+                )
+            _accumulate_profile_stat(
+                self._profile_stats,
+                "prepare_depth_filter_future_wait_seconds",
+                future_wait_seconds,
+            )
             _accumulate_profile_stat(
                 self._profile_stats,
                 "prepare_depth_filter_seconds",
                 time.perf_counter() - depth_filter_start,
             )
 
-        return np.stack([self._filtered_depth_cache[frame_idx] for frame_idx in frame_indices], axis=0)
+        stack_start = time.perf_counter()
+        filtered_segment = np.stack(
+            [self._filtered_depth_cache[frame_idx] for frame_idx in frame_indices],
+            axis=0,
+        )
+        _accumulate_profile_stat(
+            self._profile_stats,
+            "prepare_depth_filter_stack_seconds",
+            time.perf_counter() - stack_start,
+        )
+        return filtered_segment
 
     def release_segment_frames(self, start_frame: int, end_frame: int) -> None:
         for frame_idx in range(start_frame, end_frame):
@@ -275,7 +486,7 @@ def parse_args():
         help="Optional JSON manifest that stores shared raw source-frame query indices.",
     )
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--num_iters", type=int, default=6)
+    parser.add_argument("--num_iters", type=int, default=5)
     parser.add_argument("--fps", type=int, default=1)
     parser.add_argument("--out_dir", type=str, default="outputs")
     parser.add_argument(
@@ -419,6 +630,23 @@ def parse_args():
             "wrist_manipulator_top95 keeps wrist_manipulator as the baseline and removes the lowest-motion 5 percent "
             "from its final tracks per sample; "
             "wrist_manipulator adds near-field and motion-aware pruning on top of wrist."
+        ),
+    )
+    parser.add_argument(
+        "--traj_filter_ablation_mode",
+        type=str,
+        default=TRAJ_FILTER_ABLATION_MODE_NONE,
+        choices=[
+            TRAJ_FILTER_ABLATION_MODE_NONE,
+            TRAJ_FILTER_ABLATION_MODE_WRIST_SEED_TOP95,
+            TRAJ_FILTER_ABLATION_MODE_WRIST_NO_QUERY_EDGE,
+            TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_DEPTH,
+            TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_MOTION,
+            TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_CLUSTER,
+        ],
+        help=(
+            "Optional save-time wrist filter ablation for analysis only. "
+            "Default 'none' preserves the maintained production behavior."
         ),
     )
     parser.add_argument(
@@ -618,6 +846,14 @@ def _tensor_video_to_uint8_hwc(video_tensor):
     return video_np.transpose(0, 2, 3, 1)
 
 
+def _tensor_frame_to_uint8_hwc(frame_tensor):
+    frame_np = _tensor_to_numpy(frame_tensor)
+    if frame_np.ndim != 3 or frame_np.shape[0] not in (1, 3):
+        raise ValueError(f"Expected frame tensor with shape (3,H,W), got {frame_np.shape}")
+    frame_np = np.clip(np.round(frame_np * 255.0), 0, 255).astype(np.uint8)
+    return frame_np.transpose(1, 2, 0)
+
+
 def _build_grid_keypoints(frame_h: int, frame_w: int, grid_size: int) -> np.ndarray:
     y_coords = np.linspace(0, frame_h - 1, grid_size)
     x_coords = np.linspace(0, frame_w - 1, grid_size)
@@ -787,17 +1023,28 @@ def prepare_query_frame_sample_bundle(
     filter_config: dict | None = None,
     raw_depths_segment: np.ndarray | None = None,
     prepare_temporal_context: bool = False,
+    profile_stats: dict[str, float] | None = None,
+    include_query_frame_image: bool = True,
 ):
+    tensor_to_numpy_start = time.perf_counter()
     coords_np = _tensor_to_numpy(frame_data["coords"])
     visibs_np = _tensor_to_numpy(frame_data["visibs"])
     if visibs_np.ndim == 3 and visibs_np.shape[-1] == 1:
         visibs_np = visibs_np.squeeze(-1)
-    video_segment = _tensor_video_to_uint8_hwc(frame_data["video_segment"])
-    intrinsics_np = _tensor_to_numpy(frame_data["intrinsics_segment"]).astype(np.float32)
-    extrinsics_np = _tensor_to_numpy(frame_data["extrinsics_segment"]).astype(np.float32)
-    depths_segment = _tensor_to_numpy(frame_data["depths_segment"]).astype(np.float32)
+    query_frame_img = None
+    if include_query_frame_image:
+        query_frame_img = _tensor_frame_to_uint8_hwc(frame_data["video_segment"][0])
+    intrinsics_np = _tensor_to_numpy(frame_data["intrinsics_segment"]).astype(np.float32, copy=False)
+    extrinsics_np = _tensor_to_numpy(frame_data["extrinsics_segment"]).astype(np.float32, copy=False)
+    depths_segment = _tensor_to_numpy(frame_data["depths_segment"]).astype(np.float32, copy=False)
+    _accumulate_profile_stat(
+        profile_stats,
+        "prepare_bundle_tensor_to_numpy_seconds",
+        time.perf_counter() - tensor_to_numpy_start,
+    )
 
-    frame_h, frame_w = video_segment.shape[1:3]
+    frame_h = int(depths_segment.shape[1])
+    frame_w = int(depths_segment.shape[2])
     dense_keypoints = (
         np.asarray(frame_data["dense_keypoints"], dtype=np.float32)
         if "dense_keypoints" in frame_data
@@ -822,6 +1069,7 @@ def prepare_query_frame_sample_bundle(
         "width": frame_w,
     }
 
+    projection_start = time.perf_counter()
     try:
         tracks2d_fixed = project_tracks_3d_to_2d(
             tracks3d=coords_np,
@@ -835,13 +1083,25 @@ def prepare_query_frame_sample_bundle(
         logger.error(f"Error projecting tracks for frame {query_frame_idx}: {e}")
         tracks2d_fixed = coords_np[:, :, :2].transpose(1, 0, 2).astype(np.float32)
         traj_uvz = coords_np.transpose(1, 0, 2).astype(np.float32)
+    _accumulate_profile_stat(
+        profile_stats,
+        "prepare_bundle_projection_seconds",
+        time.perf_counter() - projection_start,
+    )
 
+    filter_anomalies_start = time.perf_counter()
     traj_uvz = filter_anomalous_trajectories(traj_uvz)
+    _accumulate_profile_stat(
+        profile_stats,
+        "prepare_bundle_filter_anomalies_seconds",
+        time.perf_counter() - filter_anomalies_start,
+    )
     if filter_config is None:
         filter_config = resolve_traj_filter_config(filter_args)
 
     temporal_compare_context = None
     if prepare_temporal_context:
+        temporal_context_start = time.perf_counter()
         temporal_compare_context = prepare_temporal_depth_consistency_context(
             traj_uvz,
             visibs=visibs_np,
@@ -854,6 +1114,11 @@ def prepare_query_frame_sample_bundle(
             depth_rel_tol=float(filter_config["temporal_depth_rel_tol"]),
             include_reprojected_uvz=False,
         )
+        _accumulate_profile_stat(
+            profile_stats,
+            "prepare_bundle_temporal_context_seconds",
+            time.perf_counter() - temporal_context_start,
+        )
 
     return {
         "query_frame_idx": int(query_frame_idx),
@@ -865,7 +1130,7 @@ def prepare_query_frame_sample_bundle(
         "support_grid_size": frame_data.get("support_grid_size"),
         "prefilter_result": frame_data.get("prefilter_result"),
         "visibs": visibs_np,
-        "query_frame_img": video_segment[0],
+        "query_frame_img": query_frame_img,
         "query_frame_depth": query_frame_depth.astype(np.float32),
         "raw_depths_segment": raw_depths_segment_np.astype(np.float32, copy=False),
         "intrinsics_segment": intrinsics_np.astype(np.float32, copy=False),
@@ -880,7 +1145,11 @@ def build_query_frame_sample_data(
     filter_args=None,
     save_visibility: bool = False,
     high_volatility_mask: np.ndarray | None = None,
+    profile_stats: dict[str, float] | None = None,
 ):
+    filter_eval_start = time.perf_counter()
+    filter_result_total_before = _get_profile_stat(profile_stats, "filter_result_total_seconds")
+    array_prepare_start = time.perf_counter()
     traj_uvz = np.asarray(prepared_bundle["traj_uvz"], dtype=np.float32)
     traj_2d = np.asarray(prepared_bundle["traj_2d"], dtype=np.float32)
     keypoints = np.asarray(prepared_bundle["keypoints"], dtype=np.float32)
@@ -897,6 +1166,12 @@ def build_query_frame_sample_data(
     intrinsics_np = np.asarray(prepared_bundle["intrinsics_segment"], dtype=np.float32)
     extrinsics_np = np.asarray(prepared_bundle["extrinsics_segment"], dtype=np.float32)
     frame_h, frame_w = query_frame_depth.shape
+    filter_array_prepare_seconds = time.perf_counter() - array_prepare_start
+    _accumulate_profile_stat(
+        profile_stats,
+        "filter_array_prepare_seconds",
+        filter_array_prepare_seconds,
+    )
 
     traj_filter_result = build_traj_filter_result(
         traj=traj_uvz,
@@ -911,7 +1186,9 @@ def build_query_frame_sample_data(
         extrinsics_segment=extrinsics_np,
         high_volatility_mask=high_volatility_mask,
         temporal_compare_context=prepared_bundle.get("temporal_compare_context"),
+        profile_stats=profile_stats,
     )
+    payload_pack_start = time.perf_counter()
     tracked_sample_payload = {
         "traj_uvz": traj_uvz.astype(np.float32),
         "traj_2d": traj_2d.astype(np.float32),
@@ -955,21 +1232,55 @@ def build_query_frame_sample_data(
         if visibility.shape[0] == traj_uvz.shape[1] and visibility.shape[1] == traj_uvz.shape[0]:
             visibility = visibility.T
         tracked_sample_payload["visibility"] = visibility.astype(np.float16)
+    filter_payload_pack_seconds = time.perf_counter() - payload_pack_start
+    _accumulate_profile_stat(
+        profile_stats,
+        "filter_payload_pack_seconds",
+        filter_payload_pack_seconds,
+    )
 
+    filter_dense_payload_expand_seconds = 0.0
     if tracked_query_indices.shape[0] != dense_keypoints.shape[0]:
+        dense_expand_start = time.perf_counter()
         sample_payload = _build_dense_sample_payload_from_tracked_subset(
             dense_keypoints=dense_keypoints,
             tracked_query_indices=tracked_query_indices,
             tracked_sample_payload=tracked_sample_payload,
             prefilter_result=prefilter_result if prefilter_result is not None else None,
         )
+        filter_dense_payload_expand_seconds = time.perf_counter() - dense_expand_start
+        _accumulate_profile_stat(
+            profile_stats,
+            "filter_dense_payload_expand_seconds",
+            filter_dense_payload_expand_seconds,
+        )
     else:
         sample_payload = tracked_sample_payload
+    filter_eval_seconds = time.perf_counter() - filter_eval_start
+    _accumulate_profile_stat(profile_stats, "filter_eval_seconds", filter_eval_seconds)
+    filter_result_total_delta = max(
+        0.0,
+        _get_profile_stat(profile_stats, "filter_result_total_seconds") - filter_result_total_before,
+    )
+    filter_eval_other_seconds = max(
+        0.0,
+        filter_eval_seconds
+        - filter_array_prepare_seconds
+        - filter_result_total_delta
+        - filter_payload_pack_seconds
+        - filter_dense_payload_expand_seconds
+    )
+    _accumulate_profile_stat(profile_stats, "filter_eval_other_seconds", filter_eval_other_seconds)
 
     return {
         "sample_payload": sample_payload,
-        "query_frame_img": np.asarray(prepared_bundle["query_frame_img"]),
+        "query_frame_img": (
+            None
+            if prepared_bundle["query_frame_img"] is None
+            else np.asarray(prepared_bundle["query_frame_img"])
+        ),
         "query_frame_depth": query_frame_depth,
+        "traj_filter_result": traj_filter_result,
     }
 
 
@@ -980,6 +1291,8 @@ def _prepare_query_frame_sample_bundles(
     filter_args,
     filter_config: dict,
     full_depths: np.ndarray | None,
+    profile_stats: dict[str, float] | None = None,
+    include_query_frame_image: bool = True,
 ) -> dict[int, dict[str, object]]:
     prepare_temporal_context = bool(filter_config["enabled"] and filter_config["use_temporal_depth_consistency"])
     prepared_bundles: dict[int, dict[str, object]] = {}
@@ -998,6 +1311,8 @@ def _prepare_query_frame_sample_bundles(
             filter_config=filter_config,
             raw_depths_segment=raw_depths_segment,
             prepare_temporal_context=prepare_temporal_context,
+            profile_stats=profile_stats,
+            include_query_frame_image=include_query_frame_image,
         )
     return prepared_bundles
 
@@ -1031,6 +1346,8 @@ def save_single_query_frame_legacy(
     future_len: int,
     filter_args=None,
     high_volatility_mask: np.ndarray | None = None,
+    save_profile_stats: dict[str, float] | None = None,
+    sample_debug_records: list[dict[str, object]] | None = None,
 ):
     video_output_dir = os.path.join(output_dir, video_name)
     images_dir = os.path.join(video_output_dir, "images")
@@ -1044,8 +1361,10 @@ def save_single_query_frame_legacy(
         filter_args=filter_args,
         save_visibility=getattr(filter_args, "save_visibility", False),
         high_volatility_mask=high_volatility_mask,
+        profile_stats=save_profile_stats,
     )
     sample_payload = bundle["sample_payload"]
+    traj_filter_result = bundle["traj_filter_result"]
     traj = sample_payload["traj_uvz"]
     traj_2d = sample_payload["traj_2d"]
     traj_supervision_mask = sample_payload["traj_supervision_mask"]
@@ -1121,6 +1440,7 @@ def save_single_query_frame_legacy(
     if "visibility" in sample_payload:
         sample_data["visibility"] = sample_payload["visibility"]
 
+    sample_write_start = time.perf_counter()
     img_path = os.path.join(images_dir, f"{video_name}_{query_frame_idx}.png")
     Image.fromarray(bundle["query_frame_img"]).save(img_path)
 
@@ -1140,6 +1460,16 @@ def save_single_query_frame_legacy(
     )
     np.savez(os.path.join(depth_dir, f"{video_name}_{query_frame_idx}_raw.npz"), depth=query_frame_depth)
     np.savez(os.path.join(samples_dir, f"{video_name}_{query_frame_idx}.npz"), **sample_data)
+    _accumulate_profile_stat(save_profile_stats, "sample_write_seconds", time.perf_counter() - sample_write_start)
+    if sample_debug_records is not None:
+        sample_debug_records.append(
+            _build_sample_filter_debug_record(
+                query_frame_idx=query_frame_idx,
+                prepared_bundle=prepared_bundle,
+                sample_payload=sample_payload,
+                traj_filter_result=traj_filter_result,
+            )
+        )
     logger.info(f"Saved legacy query frame {query_frame_idx}")
 
 
@@ -1151,6 +1481,8 @@ def save_single_query_frame_v2(
     prepared_bundle,
     filter_args=None,
     high_volatility_mask: np.ndarray | None = None,
+    save_profile_stats: dict[str, float] | None = None,
+    sample_debug_records: list[dict[str, object]] | None = None,
 ):
     video_output_dir = os.path.join(output_dir, video_name)
     samples_dir = os.path.join(video_output_dir, "samples")
@@ -1161,8 +1493,10 @@ def save_single_query_frame_v2(
         filter_args=filter_args,
         save_visibility=getattr(filter_args, "save_visibility", False),
         high_volatility_mask=high_volatility_mask,
+        profile_stats=save_profile_stats,
     )
     sample_payload = bundle["sample_payload"]
+    traj_filter_result = bundle["traj_filter_result"]
     sample_data = {
         "traj_uvz": sample_payload["traj_uvz"],
         "keypoints": sample_payload["keypoints"],
@@ -1214,7 +1548,18 @@ def save_single_query_frame_v2(
     if "visibility" in sample_payload:
         sample_data["visibility"] = sample_payload["visibility"]
 
+    sample_write_start = time.perf_counter()
     np.savez(os.path.join(samples_dir, f"{video_name}_{query_frame_idx}.npz"), **sample_data)
+    _accumulate_profile_stat(save_profile_stats, "sample_write_seconds", time.perf_counter() - sample_write_start)
+    if sample_debug_records is not None:
+        sample_debug_records.append(
+            _build_sample_filter_debug_record(
+                query_frame_idx=query_frame_idx,
+                prepared_bundle=prepared_bundle,
+                sample_payload=sample_payload,
+                traj_filter_result=traj_filter_result,
+            )
+        )
     logger.info(f"Saved v2 query frame {query_frame_idx}")
 
 
@@ -1255,10 +1600,21 @@ def save_structured_data(
     )
     video_output_dir = Path(output_dir) / video_name
     video_output_dir.mkdir(parents=True, exist_ok=True)
+    save_profile_stats = {} if bool(getattr(filter_args, "collect_profile_stats", False)) else None
+    sample_debug_records = (
+        []
+        if bool(getattr(filter_args, "collect_filter_stage_diagnostics", False))
+        else None
+    )
+    save_start = time.perf_counter()
 
     if query_frame_results is None:
         logger.warning(f"No query frame results to save for {video_name}")
-        return
+        _finalize_save_profile_stats(profile_stats=save_profile_stats, save_start=save_start)
+        return {
+            "save_profile_stats": save_profile_stats or {},
+            "sample_debug_records": sample_debug_records or [],
+        }
 
     if scene_storage_mode not in (SCENE_STORAGE_SOURCE_REF, SCENE_STORAGE_CACHE):
         raise ValueError(
@@ -1295,11 +1651,44 @@ def save_structured_data(
         frame_drop_rate = None
         if query_frame_sampling_mode == "uniform_grid":
             frame_drop_rate = int(getattr(filter_args, "frame_drop_rate", 1))
-        full_video_uint8 = _tensor_video_to_uint8_hwc(full_video_tensor)
-        full_depths_np = _tensor_to_numpy(full_depths).astype(np.float32)
-        full_intrinsics_np = _tensor_to_numpy(full_intrinsics).astype(np.float32)
-        full_extrinsics_np = _tensor_to_numpy(full_extrinsics).astype(np.float32)
-        frame_count = int(full_video_uint8.shape[0])
+        full_video_shape = tuple(int(dim) for dim in full_video_tensor.shape)
+        if len(full_video_shape) != 4 or full_video_shape[1] not in (1, 3):
+            raise ValueError(
+                f"Expected full_video_tensor shape (T,3,H,W), got {full_video_shape}"
+            )
+        frame_count = int(full_video_shape[0])
+        frame_height = int(full_video_shape[2])
+        frame_width = int(full_video_shape[3])
+        full_video_uint8 = None
+        if scene_storage_mode == SCENE_STORAGE_CACHE:
+            scene_video_uint8_start = time.perf_counter()
+            full_video_uint8 = _tensor_video_to_uint8_hwc(full_video_tensor)
+            _accumulate_profile_stat(
+                save_profile_stats,
+                "scene_video_uint8_seconds",
+                time.perf_counter() - scene_video_uint8_start,
+            )
+        scene_depths_numpy_start = time.perf_counter()
+        full_depths_np = _tensor_to_numpy(full_depths).astype(np.float32, copy=False)
+        _accumulate_profile_stat(
+            save_profile_stats,
+            "scene_depths_numpy_seconds",
+            time.perf_counter() - scene_depths_numpy_start,
+        )
+        scene_intrinsics_numpy_start = time.perf_counter()
+        full_intrinsics_np = _tensor_to_numpy(full_intrinsics).astype(np.float32, copy=False)
+        _accumulate_profile_stat(
+            save_profile_stats,
+            "scene_intrinsics_numpy_seconds",
+            time.perf_counter() - scene_intrinsics_numpy_start,
+        )
+        scene_extrinsics_numpy_start = time.perf_counter()
+        full_extrinsics_np = _tensor_to_numpy(full_extrinsics).astype(np.float32, copy=False)
+        _accumulate_profile_stat(
+            save_profile_stats,
+            "scene_extrinsics_numpy_seconds",
+            time.perf_counter() - scene_extrinsics_numpy_start,
+        )
         if source_frame_indices is None:
             source_frame_indices_np = np.arange(frame_count, dtype=np.int32)
         else:
@@ -1309,21 +1698,40 @@ def save_structured_data(
                 f"Expected source_frame_indices shape {(frame_count,)}, got {source_frame_indices_np.shape}"
             )
 
+        prepare_bundles_start = time.perf_counter()
         prepared_bundles = _prepare_query_frame_sample_bundles(
             query_frame_results=query_frame_results,
             grid_size=grid_size,
             filter_args=filter_args,
             filter_config=filter_config,
             full_depths=full_depths_np,
+            profile_stats=save_profile_stats,
+            include_query_frame_image=False,
+        )
+        _accumulate_profile_stat(
+            save_profile_stats,
+            "prepare_bundles_seconds",
+            time.perf_counter() - prepare_bundles_start,
         )
         high_volatility_mask = None
         if use_depth_volatility_guidance:
+            high_volatility_mask_start = time.perf_counter()
+            accessed_pixel_mask_start = time.perf_counter()
             accessed_pixel_mask = _build_accessed_pixel_mask(
                 prepared_bundles,
                 image_height=int(full_depths_np.shape[1]),
                 image_width=int(full_depths_np.shape[2]),
             )
-            high_volatility_mask, _ = compute_accessed_high_volatility_mask(
+            _accumulate_profile_stat(
+                save_profile_stats,
+                "accessed_pixel_mask_seconds",
+                time.perf_counter() - accessed_pixel_mask_start,
+            )
+            (
+                high_volatility_mask,
+                _,
+                high_volatility_mask_stats,
+            ) = compute_accessed_high_volatility_mask(
                 full_depths_np,
                 accessed_pixel_mask=accessed_pixel_mask,
                 min_depth=float(filter_config["min_depth"]),
@@ -1331,11 +1739,22 @@ def save_structured_data(
                 low_percentile=float(filter_config["volatility_low_percentile"]),
                 high_percentile=float(filter_config["volatility_high_percentile"]),
                 mask_percentile=float(filter_config["volatility_mask_percentile"]),
+                return_stats=True,
+            )
+            _record_high_volatility_mask_profile_stats(
+                profile_stats=save_profile_stats,
+                stats=high_volatility_mask_stats,
+            )
+            _accumulate_profile_stat(
+                save_profile_stats,
+                "high_volatility_mask_seconds",
+                time.perf_counter() - high_volatility_mask_start,
             )
         scene_h5_relpath = "scene.h5" if scene_storage_mode == SCENE_STORAGE_CACHE else None
         rgb_cache_relpath = "scene_rgb.mp4" if scene_storage_mode == SCENE_STORAGE_CACHE else None
         source_geom_path = getattr(filter_args, "external_geom_npz", None) if filter_args is not None else None
         if scene_storage_mode == SCENE_STORAGE_CACHE:
+            scene_cache_write_start = time.perf_counter()
             write_scene_h5(
                 video_output_dir / "scene.h5",
                 depths=full_depths_np,
@@ -1343,14 +1762,20 @@ def save_structured_data(
                 extrinsics_w2c=full_extrinsics_np,
             )
             write_scene_rgb_mp4(video_output_dir / "scene_rgb.mp4", video_frames=full_video_uint8, fps=10)
+            _accumulate_profile_stat(
+                save_profile_stats,
+                "scene_cache_write_seconds",
+                time.perf_counter() - scene_cache_write_start,
+            )
+        scene_meta_write_start = time.perf_counter()
         write_scene_meta(
             video_output_dir / "scene_meta.json",
             {
                 "layout_version": 2,
                 "video_name": video_name,
                 "frame_count": frame_count,
-                "height": int(full_video_uint8.shape[1]),
-                "width": int(full_video_uint8.shape[2]),
+                "height": frame_height,
+                "width": frame_width,
                 "extrinsics_mode": "w2c",
                 "frame_drop_rate": frame_drop_rate,
                 "future_len": int(future_len),
@@ -1381,7 +1806,13 @@ def save_structured_data(
                 "query_frame_schedule_episode_fps": query_frame_metadata.get("query_frame_schedule_episode_fps"),
             },
         )
+        _accumulate_profile_stat(
+            save_profile_stats,
+            "scene_meta_write_seconds",
+            time.perf_counter() - scene_meta_write_start,
+        )
         for query_frame_idx, prepared_bundle in prepared_bundles.items():
+            query_frame_save_loop_start = time.perf_counter()
             save_single_query_frame_v2(
                 video_name=video_name,
                 output_dir=output_dir,
@@ -1389,27 +1820,66 @@ def save_structured_data(
                 prepared_bundle=prepared_bundle,
                 filter_args=filter_args,
                 high_volatility_mask=high_volatility_mask,
+                save_profile_stats=save_profile_stats,
+                sample_debug_records=sample_debug_records,
             )
-        return
+            _accumulate_profile_stat(
+                save_profile_stats,
+                "query_frame_save_loop_seconds",
+                time.perf_counter() - query_frame_save_loop_start,
+            )
+        _finalize_save_profile_stats(profile_stats=save_profile_stats, save_start=save_start)
+        return {
+            "save_profile_stats": save_profile_stats or {},
+            "sample_debug_records": sample_debug_records or [],
+        }
 
-    full_depths_np = _tensor_to_numpy(full_depths).astype(np.float32) if full_depths is not None else None
+    if full_depths is not None:
+        scene_depths_numpy_start = time.perf_counter()
+        full_depths_np = _tensor_to_numpy(full_depths).astype(np.float32)
+        _accumulate_profile_stat(
+            save_profile_stats,
+            "scene_depths_numpy_seconds",
+            time.perf_counter() - scene_depths_numpy_start,
+        )
+    else:
+        full_depths_np = None
+    prepare_bundles_start = time.perf_counter()
     prepared_bundles = _prepare_query_frame_sample_bundles(
         query_frame_results=query_frame_results,
         grid_size=grid_size,
         filter_args=filter_args,
         filter_config=filter_config,
         full_depths=full_depths_np,
+        profile_stats=save_profile_stats,
+        include_query_frame_image=True,
+    )
+    _accumulate_profile_stat(
+        save_profile_stats,
+        "prepare_bundles_seconds",
+        time.perf_counter() - prepare_bundles_start,
     )
     high_volatility_mask = None
     if use_depth_volatility_guidance:
         if full_depths_np is None:
             raise ValueError("full_depths is required when depth volatility guidance is enabled")
+        high_volatility_mask_start = time.perf_counter()
+        accessed_pixel_mask_start = time.perf_counter()
         accessed_pixel_mask = _build_accessed_pixel_mask(
             prepared_bundles,
             image_height=int(full_depths_np.shape[1]),
             image_width=int(full_depths_np.shape[2]),
         )
-        high_volatility_mask, _ = compute_accessed_high_volatility_mask(
+        _accumulate_profile_stat(
+            save_profile_stats,
+            "accessed_pixel_mask_seconds",
+            time.perf_counter() - accessed_pixel_mask_start,
+        )
+        (
+            high_volatility_mask,
+            _,
+            high_volatility_mask_stats,
+        ) = compute_accessed_high_volatility_mask(
             full_depths_np,
             accessed_pixel_mask=accessed_pixel_mask,
             min_depth=float(filter_config["min_depth"]),
@@ -1417,8 +1887,19 @@ def save_structured_data(
             low_percentile=float(filter_config["volatility_low_percentile"]),
             high_percentile=float(filter_config["volatility_high_percentile"]),
             mask_percentile=float(filter_config["volatility_mask_percentile"]),
+            return_stats=True,
+        )
+        _record_high_volatility_mask_profile_stats(
+            profile_stats=save_profile_stats,
+            stats=high_volatility_mask_stats,
+        )
+        _accumulate_profile_stat(
+            save_profile_stats,
+            "high_volatility_mask_seconds",
+            time.perf_counter() - high_volatility_mask_start,
         )
     for query_frame_idx, prepared_bundle in prepared_bundles.items():
+        query_frame_save_loop_start = time.perf_counter()
         save_single_query_frame_legacy(
             video_name=video_name,
             output_dir=output_dir,
@@ -1427,6 +1908,13 @@ def save_structured_data(
             future_len=future_len,
             filter_args=filter_args,
             high_volatility_mask=high_volatility_mask,
+            save_profile_stats=save_profile_stats,
+            sample_debug_records=sample_debug_records,
+        )
+        _accumulate_profile_stat(
+            save_profile_stats,
+            "query_frame_save_loop_seconds",
+            time.perf_counter() - query_frame_save_loop_start,
         )
 
     main_npz = {
@@ -1443,8 +1931,19 @@ def save_structured_data(
     if getattr(filter_args, "save_video", False):
         main_npz["video"] = _tensor_to_numpy(video_tensor)
     save_path = video_output_dir / f"{video_name}.npz"
+    main_npz_write_start = time.perf_counter()
     np.savez(save_path, **main_npz)
+    _accumulate_profile_stat(
+        save_profile_stats,
+        "main_npz_write_seconds",
+        time.perf_counter() - main_npz_write_start,
+    )
     logger.info(f"Traditional visualization NPZ saved to {save_path}")
+    _finalize_save_profile_stats(profile_stats=save_profile_stats, save_start=save_start)
+    return {
+        "save_profile_stats": save_profile_stats or {},
+        "sample_debug_records": sample_debug_records or [],
+    }
 
 
 def _load_query_frame_schedule(schedule_path: str) -> dict[str, object]:

@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import time
 from datasets.datatypes import RawSliceData
 from typing import Callable, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
@@ -895,6 +896,49 @@ def _build_depth_filter_rays(depth_shape: Tuple[int, int], intrinsics: np.ndarra
     return np.einsum("ij,uvj->uvi", inv_intrinsics, uv_homo)
 
 
+def _filter_one_depth_profiled(
+    depth: np.ndarray,
+    depth_rtol: float,
+    normal_tol: float,
+    intrinsics: np.ndarray,
+    rays: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, float]]:
+    total_start = time.perf_counter()
+    ray_scale_start = total_start
+    xyz_homo = rays if rays is not None else _build_depth_filter_rays(depth.shape, intrinsics)
+    xyz_homo = xyz_homo * depth[..., None]
+    ray_scale_seconds = time.perf_counter() - ray_scale_start
+    valid_mask = depth > 0.
+
+    points_to_normals_start = time.perf_counter()
+    normals, normals_mask = points_to_normals(xyz_homo, mask=valid_mask)
+    points_to_normals_seconds = time.perf_counter() - points_to_normals_start
+
+    edge_mask_start = time.perf_counter()
+    depth_in = depth.copy().astype(np.float32)
+    assert np.all(depth_in < 1e9)
+    depth_in[~ valid_mask] = 1e9
+    edge_mask = (depth_edge(depth_in, rtol=depth_rtol, mask=valid_mask) & normals_edge(normals, tol=normal_tol, mask=normals_mask))
+    edge_mask_seconds = time.perf_counter() - edge_mask_start
+
+    distance_transform_start = time.perf_counter()
+    distance, indices = ndimage.distance_transform_edt(edge_mask | (~valid_mask), return_indices=True) # type: ignore
+    distance_transform_seconds = time.perf_counter() - distance_transform_start
+
+    fill_start = time.perf_counter()
+    filled_depth = depth.copy()
+    filled_depth[edge_mask] = depth[tuple(indices)][edge_mask]
+    fill_seconds = time.perf_counter() - fill_start
+    return filled_depth, {
+        "ray_scale_seconds": float(ray_scale_seconds),
+        "points_to_normals_seconds": float(points_to_normals_seconds),
+        "edge_mask_seconds": float(edge_mask_seconds),
+        "distance_transform_seconds": float(distance_transform_seconds),
+        "fill_seconds": float(fill_seconds),
+        "total_seconds": float(time.perf_counter() - total_start),
+    }
+
+
 def _filter_one_depth(
     depth: np.ndarray,
     depth_rtol: float,
@@ -902,17 +946,13 @@ def _filter_one_depth(
     intrinsics: np.ndarray,
     rays: np.ndarray | None = None,
 ) -> np.ndarray:
-    xyz_homo = rays if rays is not None else _build_depth_filter_rays(depth.shape, intrinsics)
-    xyz_homo = xyz_homo * depth[..., None]
-    valid_mask = depth > 0.
-    normals, normals_mask = points_to_normals(xyz_homo, mask=valid_mask)
-    depth_in = depth.copy().astype(np.float32)
-    assert np.all(depth_in < 1e9)
-    depth_in[~ valid_mask] = 1e9
-    edge_mask = (depth_edge(depth_in, rtol=depth_rtol, mask=valid_mask) & normals_edge(normals, tol=normal_tol, mask=normals_mask))
-    distance, indices = ndimage.distance_transform_edt(edge_mask | (~valid_mask), return_indices=True) # type: ignore
-    filled_depth = depth.copy()
-    filled_depth[edge_mask] = depth[tuple(indices)][edge_mask]
+    filled_depth, _ = _filter_one_depth_profiled(
+        depth,
+        depth_rtol,
+        normal_tol,
+        intrinsics,
+        rays=rays,
+    )
     return filled_depth
 
 @register_transform("resize")
