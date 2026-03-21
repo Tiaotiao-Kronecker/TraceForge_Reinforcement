@@ -24,6 +24,7 @@
 - [process_inference_bottleneck_analysis_2026-03-19.md](process_inference_bottleneck_analysis_2026-03-19.md)
 - [save_timing_alignment_status_2026-03-21.md](save_timing_alignment_status_2026-03-21.md)
 - [process_num_iters_sweep_2026-03-21.md](process_num_iters_sweep_2026-03-21.md)
+- [processing_speed_optimization_summary_2026-03-21.md](processing_speed_optimization_summary_2026-03-21.md)
 
 ## 当前保留的本地对比产物
 
