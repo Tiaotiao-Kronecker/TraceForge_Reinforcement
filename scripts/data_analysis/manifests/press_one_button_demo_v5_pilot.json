@@ -1,0 +1,6 @@
+{
+  "dataset_root": "/data2/yaoxuran/press_one_button_demo_v5",
+  "episodes": [
+    "episode_00001_green"
+  ]
+}
