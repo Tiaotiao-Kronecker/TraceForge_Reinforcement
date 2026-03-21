@@ -105,7 +105,7 @@ def parse_args() -> argparse.Namespace:
         default="cuda:0",
         help="Torch device passed to infer.py, e.g. cuda:1",
     )
-    parser.add_argument("--num-iters", type=int, default=6)
+    parser.add_argument("--num-iters", type=int, default=5)
     parser.add_argument("--fps", type=int, default=1, help="Load stride passed to infer.py")
     parser.add_argument("--max-num-frames", type=int, default=512)
     parser.add_argument("--future-len", type=int, default=32)

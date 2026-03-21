@@ -33,7 +33,30 @@ def _collect_cli_flags(func_ast: ast.FunctionDef) -> set[str]:
     return flags
 
 
+def _collect_cli_defaults(func_ast: ast.FunctionDef) -> dict[str, object]:
+    defaults: dict[str, object] = {}
+    for node in ast.walk(func_ast):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != "add_argument":
+            continue
+        flag = None
+        for arg in node.args:
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str) and arg.value.startswith("--"):
+                flag = arg.value
+                break
+        if flag is None:
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == "default" and isinstance(keyword.value, ast.Constant):
+                defaults[flag] = keyword.value.value
+    return defaults
+
+
 _CLI_FLAGS = _collect_cli_flags(_PARSE_ARGS_FUNC_AST)
+_CLI_DEFAULTS = _collect_cli_defaults(_PARSE_ARGS_FUNC_AST)
 
 
 class ResolveTrajFilterProfileTests(unittest.TestCase):
@@ -76,6 +99,10 @@ class PressOneButtonCliSurfaceTests(unittest.TestCase):
         self.assertIn("--query_prefilter_mode", _CLI_FLAGS)
         self.assertIn("--query_prefilter_wrist_rank_keep_ratio", _CLI_FLAGS)
         self.assertIn("--support_grid_ratio", _CLI_FLAGS)
+        self.assertIn("--traj_filter_ablation_mode", _CLI_FLAGS)
+
+    def test_num_iters_default_is_five(self):
+        self.assertEqual(_CLI_DEFAULTS.get("--num_iters"), 5)
 
 
 if __name__ == "__main__":

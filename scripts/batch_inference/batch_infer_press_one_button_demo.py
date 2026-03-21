@@ -226,7 +226,7 @@ def parse_args() -> argparse.Namespace:
         default="cuda",
         help="Single-GPU execution device. In --gpu_id mode each worker binds its own CUDA device automatically.",
     )
-    parser.add_argument("--num_iters", type=int, default=6)
+    parser.add_argument("--num_iters", type=int, default=5)
     parser.add_argument("--fps", type=int, default=1)
     parser.add_argument("--max_num_frames", type=int, default=512)
     parser.add_argument("--save_video", action="store_true", default=False)
@@ -334,6 +334,20 @@ def parse_args() -> argparse.Namespace:
             "external_manipulator, external_manipulator_v2, wrist_manipulator_top95, and wrist_manipulator "
             "must be requested explicitly."
         ),
+    )
+    parser.add_argument(
+        "--traj_filter_ablation_mode",
+        type=str,
+        default="none",
+        choices=[
+            "none",
+            "wrist_seed_top95",
+            "wrist_no_query_edge",
+            "wrist_no_manipulator_depth",
+            "wrist_no_manipulator_motion",
+            "wrist_no_manipulator_cluster",
+        ],
+        help="Optional save-time wrist filter ablation for analysis only.",
     )
     parser.add_argument(
         "--min_valid_frames",

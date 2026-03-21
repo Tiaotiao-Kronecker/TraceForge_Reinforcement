@@ -91,7 +91,7 @@ in multi-GPU mode and no longer exposes `--frame_drop_rate`, `--horizon`, or
 `--keyframes_per_sec_min` and `--keyframes_per_sec_max` to the same value.
 Its maintained defaults already cover `camera_names=varied_camera_1,2,3`,
 `depth_pose_method=external`, `external_geom_name=trajectory_valid.h5`,
-`fps=1`, `max_num_frames=512`, `future_len=32`, `grid_size=80`,
+`fps=1`, `max_num_frames=512`, `future_len=32`, `num_iters=5`, `grid_size=80`,
 `filter_level=standard`, and `traj_filter_profile=auto`.
 
 ### 3D visualization

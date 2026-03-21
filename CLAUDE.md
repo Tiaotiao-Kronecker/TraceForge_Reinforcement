@@ -133,7 +133,7 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 - `batch_infer_press_one_button_demo.py` samples shared keyframes per episode at `keyframes_per_sec_min~keyframes_per_sec_max` (default `2~3`)
 - The maintained batch entry no longer exposes `--frame_drop_rate`, `--horizon`, or `--max_frames_per_video`
 - To request a fixed per-second keyframe count in batch mode, set `keyframes_per_sec_min == keyframes_per_sec_max`
-- The maintained batch defaults already cover cameras `varied_camera_1,2,3`, `depth_pose_method=external`, `external_geom_name=trajectory_valid.h5`, `fps=1`, `max_num_frames=512`, `future_len=32`, `grid_size=80`, `filter_level=standard`, and `traj_filter_profile=auto`
+- The maintained batch defaults already cover cameras `varied_camera_1,2,3`, `depth_pose_method=external`, `external_geom_name=trajectory_valid.h5`, `fps=1`, `max_num_frames=512`, `future_len=32`, `num_iters=5`, `grid_size=80`, `filter_level=standard`, and `traj_filter_profile=auto`
 - The true episode frame rate comes from `trajectory_valid.h5` root attr `fps`
 - `--fps` is only the load stride; default `1`
 - `--max_num_frames` is the post-stride frame cap; default `512`
