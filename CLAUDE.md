@@ -51,6 +51,7 @@ python scripts/batch_inference/infer.py \
 python scripts/batch_inference/batch_infer_press_one_button_demo.py \
     --base_path <dataset_base_path> \
     --gpu_id 0,1,2,3,4,5,6,7 \
+    --workers_per_gpu 1 \
     --min_free_gpu_mem_gb 40 \
     --gpu_recovery_poll_sec 60 \
     --keyframes_per_sec_min 2 \
@@ -132,7 +133,7 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 - Generic `infer.py` uses `--frame_drop_rate` only when no shared schedule is provided
 - `batch_infer_press_one_button_demo.py` samples shared keyframes per episode at `keyframes_per_sec_min~keyframes_per_sec_max` (default `2~3`)
 - The maintained batch entry no longer exposes `--frame_drop_rate`, `--horizon`, or `--max_frames_per_video`
-- To request a fixed per-second keyframe count in batch mode, set `keyframes_per_sec_min == keyframes_per_sec_max`
+- To request a fixed per-second keyframe count in batch mode, set `keyframes_per_sec_min == keyframes_per_sec_max` (for example `5` and `5` for 5 random keyframes/sec)
 - The maintained batch defaults already cover cameras `varied_camera_1,2,3`, `depth_pose_method=external`, `external_geom_name=trajectory_valid.h5`, `fps=1`, `max_num_frames=512`, `future_len=32`, `grid_size=80`, `filter_level=standard`, and `traj_filter_profile=auto`
 - The true episode frame rate comes from `trajectory_valid.h5` root attr `fps`
 - `--fps` is only the load stride; default `1`
@@ -144,9 +145,27 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 - Fixed `third_party/pointops2/functions/pointops.py` to use input tensor devices instead of hardcoded cuda:0
 - `batch_infer_press_one_button_demo.py` supports one-command multi-GPU execution via `--gpu_id`
 - The maintained multi-GPU path is dynamic-only
-- Multi-GPU batch inference keeps a resident worker per GPU and schedules `episode/camera` tasks from a shared queue
-- `--gpu_id` should list the actual currently usable physical GPU indices; the list may be sparse if some cards are unavailable (for example `1,3,5,6`)
+- The maintained shared-GPU path uses `multiprocessing` `spawn` workers, not threaded multi-GPU inference inside one Python process
+- Each worker is an isolated Python process with its own resident tracker model; this avoids the `CUDA illegal memory access` failures seen in the old threaded path
+- `--workers_per_gpu N` launches `N` resident workers per listed physical GPU; use `1` as the conservative default and `2` on lightly loaded shared cards when memory headroom is available
+- One physical GPU can therefore host multiple independent inference processes when sharing a card with other users
+- `--min_free_gpu_mem_gb` is a worker startup gate in dynamic mode; workers below the threshold wait and retry instead of failing immediately
+- `--gpu_id` should list the actual currently usable physical GPU indices; the list may be sparse if some cards are unavailable (for example `0,3,4,5,6,7`)
 - The shared query-frame schedule design keeps multi-camera keyframes aligned without breaking dynamic multi-GPU scheduling
+
+Shared-GPU example with sparse cards, two workers per card, and fixed 5 random keyframes/sec:
+
+```bash
+python scripts/batch_inference/batch_infer_press_one_button_demo.py \
+    --base_path <dataset_base_path> \
+    --gpu_id 0,3,4,5,6,7 \
+    --workers_per_gpu 2 \
+    --min_free_gpu_mem_gb 20 \
+    --gpu_recovery_poll_sec 60 \
+    --keyframes_per_sec_min 5 \
+    --keyframes_per_sec_max 5 \
+    --skip_existing
+```
 
 **Keypoint Sampling**:
 - `--grid_size N`: Samples N×N keypoints per frame (e.g., 20 = 400 points, 80 = 6400 points)

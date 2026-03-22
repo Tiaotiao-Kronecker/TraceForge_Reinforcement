@@ -75,6 +75,7 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
 python scripts/batch_inference/batch_infer_press_one_button_demo.py \
   --base_path <dataset_root> \
   --gpu_id 0,1,2,3 \
+  --workers_per_gpu 1 \
   --min_free_gpu_mem_gb 40 \
   --gpu_recovery_poll_sec 60 \
   --keyframes_per_sec_min 2 \
@@ -89,10 +90,36 @@ the cap applied after that stride. The maintained batch entry is dynamic-only
 in multi-GPU mode and no longer exposes `--frame_drop_rate`, `--horizon`, or
 `--max_frames_per_video`; for a fixed per-second keyframe count, set
 `--keyframes_per_sec_min` and `--keyframes_per_sec_max` to the same value.
+For example, set both to `5` to request 5 random keyframes per second.
 Its maintained defaults already cover `camera_names=varied_camera_1,2,3`,
 `depth_pose_method=external`, `external_geom_name=trajectory_valid.h5`,
 `fps=1`, `max_num_frames=512`, `future_len=32`, `grid_size=80`,
 `filter_level=standard`, and `traj_filter_profile=auto`.
+
+Shared-GPU maintained mode now uses isolated `multiprocessing` `spawn`
+workers rather than running multi-GPU inference threads inside one Python
+process. Each worker keeps its own resident tracker model, so one physical GPU
+can host multiple independent inference processes when there is enough headroom.
+Use `--workers_per_gpu 1` as the conservative default, and raise it to `2` on
+lightly loaded shared cards if memory usage stays comfortable. The
+`--min_free_gpu_mem_gb` threshold only controls when a worker is allowed to
+start; workers below the threshold wait and retry instead of failing
+immediately. Sparse physical GPU lists are supported, for example
+`--gpu_id 0,3,4,5,6,7`.
+
+Example shared-GPU launch with two workers per card and fixed 5 keyframes/sec:
+
+```bash
+python scripts/batch_inference/batch_infer_press_one_button_demo.py \
+  --base_path <dataset_root> \
+  --gpu_id 0,3,4,5,6,7 \
+  --workers_per_gpu 2 \
+  --min_free_gpu_mem_gb 20 \
+  --gpu_recovery_poll_sec 60 \
+  --keyframes_per_sec_min 5 \
+  --keyframes_per_sec_max 5 \
+  --skip_existing
+```
 
 ### 3D visualization
 
