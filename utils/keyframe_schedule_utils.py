@@ -103,7 +103,17 @@ def sample_query_source_indices_per_second(
 
     if not selected_chunks:
         return np.zeros((0,), dtype=np.int32)
-    return np.concatenate(selected_chunks, axis=0).astype(np.int32, copy=False)
+
+    sampled = np.concatenate(selected_chunks, axis=0).astype(np.int32, copy=False)
+
+    # Always include source frame 0 when it is a schedulable candidate.
+    if np.any(candidate_source_indices == 0) and not np.any(sampled == 0):
+        sampled = np.concatenate(
+            [np.array([0], dtype=np.int32), sampled],
+            axis=0,
+        )
+
+    return sampled
 
 
 def map_query_source_indices_to_local(

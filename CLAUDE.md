@@ -100,6 +100,7 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 **Inference Scripts** (`scripts/batch_inference/`):
 - `infer.py`: Single/batch video inference with full pipeline
 - `batch_infer_press_one_button_demo.py`: button/sim episode batch processing
+- `batch_infer_mcap_v1.py`: MCAP v1 batch processing for numeric episode directories like `00000`
 - `batch_droid_external.py`: DROID external-only batch processing
 
 **Utilities** (`utils/`):
@@ -138,7 +139,9 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 - The true episode frame rate comes from `trajectory_valid.h5` root attr `fps`
 - `--fps` is only the load stride; default `1`
 - `--max_num_frames` is the post-stride frame cap; default `512`
-- Shared schedule manifests are written to `<episode_output>/_shared/query_frame_schedule_v1_<hash>.json`
+- Source frame `0` is always forced into the shared query-frame schedule when it survives stride/cap filtering
+- This means the first second may contain one extra query frame beyond the nominal `keyframes_per_sec_min~max` sample count
+- Shared schedule manifests are written to `<episode_output>/_shared/query_frame_schedule_v2_<hash>.json`
 - `infer.py` consumes raw source-frame indices from the manifest, then maps them to the current local frame indices after stride/cap filtering
 
 **Multi-GPU Processing**:
@@ -191,6 +194,12 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
 - `trajectory_valid.h5` root attr `fps` drives the per-second query-frame schedule
 - All cameras under one episode share the same raw query-frame indices
 
+**MCAP v1 Dataset**:
+- Use `batch_infer_mcap_v1.py`
+- Supports numeric episode directories such as `00000`, `00001`, ...
+- Expected per-episode files include `trajectory_valid.h5`, `rgb/<camera>`, and `depth/<camera>`
+- Reuses the maintained external-only batch pipeline and shared query-frame schedule logic
+
 **Sim360 Dataset**:
 - Branch `curation/sim-360-extrinsics-fixed` contains extrinsics fixes
 - See `docs/history/camera_extrinsics_investigation_2026-03-12.md` for details
@@ -233,7 +242,7 @@ For button/sim episode outputs written in-place:
 ```
 <episode_dir>/trajectory/
 ├── _shared/
-│   └── query_frame_schedule_v1_<hash>.json
+│   └── query_frame_schedule_v2_<hash>.json
 ├── varied_camera_1/
 ├── varied_camera_2/
 └── varied_camera_3/
