@@ -2043,32 +2043,28 @@ def _resolve_query_frames(
     }
 
 
-def process_single_video(video_path, depth_path, args, model_3dtracker, model_depth_pose, video_name=None, output_dir=None):
-    """Process a single video and return the processed data"""
+def _resolve_video_stride(video_path, args) -> tuple[int, int]:
+    if args.fps and int(args.fps) > 0:
+        return int(args.fps), 0
+
+    stride = 1
+    n_frames = 0
+    if os.path.isdir(video_path):
+        img_files = _collect_and_sort_frame_files(video_path, ["jpg", "jpeg", "png"])
+        n_frames = len(img_files)
+        target = max(1, int(getattr(args, "max_frames_per_video", 150)))
+        stride = max(1, math.ceil(n_frames / target)) if n_frames > 0 else 1
+    return stride, n_frames
+
+
+def load_scene_context(video_path, depth_path, args, model_depth_pose):
+    """Load one scene once so query frames can be scheduled independently."""
     logger.info(f"Processing video: {video_path}")
     profile_stats = {} if bool(getattr(args, "collect_profile_stats", False)) else None
     _sync_device_if_needed(getattr(args, "device", None))
     process_start = time.perf_counter()
 
-    # --- NEW: per-episode stride based on frame count when --fps <= 0 ---
-    # If user set --fps > 0, use that fixed stride; otherwise auto-compute from N.
-    if args.fps and int(args.fps) > 0:
-        stride = int(args.fps)
-        n_frames = 0  # unknown/not needed in fixed stride mode
-    else:
-        stride = 1
-        n_frames = 0
-        if os.path.isdir(video_path):
-            # Count frames（与 load_video_and_mask 相同的收集与排序逻辑，保证 stride 一致）
-            img_files = _collect_and_sort_frame_files(video_path, ["jpg", "jpeg", "png"])
-            n_frames = len(img_files)
-
-            # Auto stride: ceil(N / target), where target = --max_frames_per_video
-            target = max(1, int(getattr(args, "max_frames_per_video", 150)))
-            stride = max(1, math.ceil(n_frames / target)) if n_frames > 0 else 1
-        else:
-            # For video files (.mp4, etc.), we keep stride=1 (or you can extend to probe length)
-            stride = 1
+    stride, n_frames = _resolve_video_stride(video_path, args)
 
     logger.info(
         f"[{os.path.basename(video_path)}] frames={n_frames if n_frames else 'n/a'} "
@@ -2201,208 +2197,489 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
         float(getattr(args, "support_grid_ratio", 0.8)),
     )
 
-    # Sample query points using uniform grid and store which frame they belong to
     query_points_per_frame = {}
-
-    # Use uniform grid sampling (grid_size x grid_size points per frame)
-    query_point = []
-    tracking_segments = []  # Store info about which frames to track for each segment
 
     query_frames, query_frame_metadata = _resolve_query_frames(
         args,
         source_frame_indices=source_frame_indices,
         video_length=video_length,
     )
-    logger.info(f"Tracking up to {args.future_len} frames from each query frame")
-
     for frame_idx in query_frames:
-        # Calculate the end frame for this tracking segment (16 frames max)
-        end_frame = min(frame_idx + args.future_len, video_length)
-        tracking_segments.append((frame_idx, end_frame))
-
-        # Create uniform grid for this frame (grid_size x grid_size points)
         grid_points = _build_frame_query_points(frame_idx, dense_query_keypoints)
+        if len(grid_points) > 0:
+            query_points_per_frame[int(frame_idx)] = grid_points[:, 1:3]
 
-        query_point.append(grid_points)
+    return {
+        "video_path": str(video_path),
+        "depth_path": str(depth_path) if depth_path is not None else None,
+        "stride": int(stride),
+        "video_ten": video_ten,
+        "depth_npy": depth_npy.astype(np.float32),
+        "depth_conf": depth_conf_npy,
+        "extrs_npy": extrs_npy.astype(np.float32),
+        "intrs_npy": intrs_npy.astype(np.float32),
+        "video_length": int(video_length),
+        "frame_H": int(frame_H),
+        "frame_W": int(frame_W),
+        "dense_query_keypoints": dense_query_keypoints.astype(np.float32, copy=False),
+        "query_frames": [int(frame_idx) for frame_idx in query_frames],
+        "query_points_per_frame": query_points_per_frame,
+        "query_frame_metadata": dict(query_frame_metadata),
+        "original_filenames": list(original_filenames),
+        "source_frame_indices": source_frame_indices.astype(np.int32, copy=False),
+        "query_prefilter_mode": query_prefilter_mode,
+        "query_prefilter_rank_keep_ratio": float(query_prefilter_rank_keep_ratio),
+        "query_prefilter_filter_config": query_prefilter_filter_config,
+        "query_prefilter_enabled": bool(query_prefilter_enabled),
+        "support_grid_size": int(support_grid_size),
+        "process_start": float(process_start),
+        "profile_stats": profile_stats,
+    }
 
-    # Group query points by frame
-    for query_frame_points in query_point:
-        if len(query_frame_points) > 0:
-            frame_idx = int(query_frame_points[0, 0])
-            points_xy = query_frame_points[:, 1:3]  # Extract x, y coordinates
-            query_points_per_frame[frame_idx] = points_xy
 
-    # All wrappers now return w2c directly; keep that convention unchanged.
+def _run_query_frame_core(
+    *,
+    scene_ctx: dict[str, object],
+    start_frame: int,
+    args,
+    model_3dtracker,
+    depth_filter_runtime: "_DepthFilterRuntime",
+    profile_stats: dict[str, float] | None,
+) -> dict[str, object]:
+    video_length = int(scene_ctx["video_length"])
+    frame_H = int(scene_ctx["frame_H"])
+    frame_W = int(scene_ctx["frame_W"])
+    end_frame = min(int(start_frame) + int(args.future_len), video_length)
+    logger.info(
+        f"Processing query frame {start_frame}: tracking {end_frame - start_frame} frames"
+    )
 
-    # Store results for each query frame
+    try:
+        _timed_cuda_empty_cache(
+            profile_stats=profile_stats,
+            key="segment_empty_cache_seconds",
+        )
+
+        segment_slice_start = time.perf_counter()
+        video_segment = scene_ctx["video_ten"][start_frame:end_frame]
+        intrs_segment = scene_ctx["intrs_npy"][start_frame:end_frame]
+        extrs_segment = scene_ctx["extrs_npy"][start_frame:end_frame]
+        _accumulate_profile_stat(
+            profile_stats,
+            "segment_slice_extract_seconds",
+            time.perf_counter() - segment_slice_start,
+        )
+
+        dense_query_keypoints = np.asarray(scene_ctx["dense_query_keypoints"], dtype=np.float32)
+        dense_segment_query_point = _build_frame_query_points(start_frame, dense_query_keypoints)
+        dense_segment_query_point[:, 0] = 0
+        tracked_query_indices = np.arange(dense_segment_query_point.shape[0], dtype=np.int32)
+        prefilter_result = None
+
+        prepare_inputs_start = time.perf_counter()
+        filtered_depth_segment = depth_filter_runtime.get_filtered_depth_segment(
+            start_frame,
+            end_frame,
+        )
+        if bool(scene_ctx["query_prefilter_enabled"]):
+            candidate_prefilter_result = build_query_prefilter_result(
+                dense_query_keypoints,
+                filtered_depth_segment[0],
+                filter_args=args,
+                filter_config=scene_ctx["query_prefilter_filter_config"],
+                query_prefilter_mode=str(scene_ctx["query_prefilter_mode"]),
+                wrist_rank_keep_ratio=float(scene_ctx["query_prefilter_rank_keep_ratio"]),
+            )
+            kept_query_indices = np.flatnonzero(candidate_prefilter_result["prefilter_mask"]).astype(np.int32)
+            if kept_query_indices.size == 0:
+                logger.warning(
+                    f"Query frame {start_frame}: query prefilter removed all dense points; falling back to full grid"
+                )
+            else:
+                tracked_query_indices = kept_query_indices
+                if tracked_query_indices.shape[0] != dense_segment_query_point.shape[0]:
+                    prefilter_result = candidate_prefilter_result
+        segment_query_point = [dense_segment_query_point[tracked_query_indices].copy()]
+
+        video, depths, intrinsics, extrinsics, query_point_tensor, support_grid_size = (
+            prepare_inputs(
+                video_segment,
+                filtered_depth_segment,
+                intrs_segment,
+                extrs_segment,
+                segment_query_point,
+                inference_res=(frame_H, frame_W),
+                support_grid_size=int(scene_ctx["support_grid_size"]),
+                device=args.device,
+                profile_stats=profile_stats,
+            )
+        )
+        _sync_device_if_needed(getattr(args, "device", None))
+        _accumulate_profile_stat(
+            profile_stats,
+            "prepare_inputs_seconds",
+            time.perf_counter() - prepare_inputs_start,
+        )
+
+        model_3dtracker.set_image_size((frame_H, frame_W))
+
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                coords_seg, visibs_seg, inference_metadata = inference(
+                    model=model_3dtracker,
+                    video=video,
+                    depths=depths,
+                    intrinsics=intrinsics,
+                    extrinsics=extrinsics,
+                    query_point=query_point_tensor,
+                    num_iters=args.num_iters,
+                    grid_size=int(support_grid_size),
+                    bidrectional=False,
+                    profile_stats=profile_stats,
+                    return_metadata=True,
+                )
+
+        logger.debug(
+            f"Query frame {start_frame}: coords_seg shape = {coords_seg.shape}, visibs_seg shape = {visibs_seg.shape}"
+        )
+        if len(coords_seg.shape) != 3 or len(visibs_seg.shape) != 2:
+            raise ValueError(
+                f"Query frame {start_frame}: invalid result shapes coords={coords_seg.shape} visibs={visibs_seg.shape}"
+            )
+
+        expected_trajectories = int(tracked_query_indices.shape[0])
+        if coords_seg.shape[1] != expected_trajectories:
+            logger.warning(
+                f"Query frame {start_frame}: Expected {expected_trajectories} trajectories, got {coords_seg.shape[1]}"
+            )
+
+        cpu_offload_start = time.perf_counter()
+        coords_cpu = coords_seg.cpu()
+        visibs_cpu = visibs_seg.cpu()
+        video_cpu = video.cpu()
+        depths_cpu = depths.cpu()
+        intrinsics_cpu = intrinsics.cpu()
+        extrinsics_cpu = extrinsics.cpu()
+        _accumulate_profile_stat(
+            profile_stats,
+            "segment_result_cpu_offload_seconds",
+            time.perf_counter() - cpu_offload_start,
+        )
+
+        logger.info(
+            f"Query frame {start_frame}: tracked {coords_seg.shape[1]}/{dense_query_keypoints.shape[0]} queries "
+            f"for {coords_seg.shape[0]} frames (support_grid_size={support_grid_size})"
+        )
+
+        _timed_cuda_empty_cache(
+            profile_stats=profile_stats,
+            key="segment_empty_cache_seconds",
+        )
+        return {
+            "coords": coords_cpu,
+            "visibs": visibs_cpu,
+            "video_segment": video_cpu,
+            "depths_segment": depths_cpu,
+            "intrinsics_segment": intrinsics_cpu,
+            "extrinsics_segment": extrinsics_cpu,
+            "dense_keypoints": dense_query_keypoints.astype(np.float32, copy=False),
+            "tracked_query_indices": tracked_query_indices.astype(np.int32, copy=False),
+            "prefilter_result": prefilter_result,
+            "dense_query_count": int(dense_query_keypoints.shape[0]),
+            "tracked_query_count": int(tracked_query_indices.shape[0]),
+            "support_grid_size": int(support_grid_size),
+            "effective_support_query_count": int(
+                inference_metadata.get("effective_support_query_count", 0)
+            ),
+        }
+    finally:
+        depth_filter_runtime.release_segment_frames(start_frame, end_frame)
+
+
+def run_single_query_frame(
+    *,
+    scene_ctx: dict[str, object],
+    query_frame_idx: int,
+    args,
+    model_3dtracker,
+) -> dict[str, object]:
+    profile_stats = {} if bool(getattr(args, "collect_profile_stats", False)) else None
+    _sync_device_if_needed(getattr(args, "device", None))
+    process_start = time.perf_counter()
+    start_frame = int(query_frame_idx)
+    end_frame = min(start_frame + int(args.future_len), int(scene_ctx["video_length"]))
+    with _DepthFilterRuntime(
+        np.asarray(scene_ctx["depth_npy"], dtype=np.float32),
+        np.asarray(scene_ctx["intrs_npy"], dtype=np.float32),
+        [(start_frame, end_frame)],
+        profile_stats=profile_stats,
+    ) as depth_filter_runtime:
+        query_frame_result = _run_query_frame_core(
+            scene_ctx=scene_ctx,
+            start_frame=start_frame,
+            args=args,
+            model_3dtracker=model_3dtracker,
+            depth_filter_runtime=depth_filter_runtime,
+            profile_stats=profile_stats,
+        )
+
+    if profile_stats is not None:
+        _sync_device_if_needed(getattr(args, "device", None))
+        process_total_seconds = time.perf_counter() - process_start
+        explicit_profile_keys = (
+            "prepare_inputs_seconds",
+            "tracker_inference_total_seconds",
+            "tracker_model_forward_seconds",
+        )
+        explicit_total = sum(float(profile_stats.get(key, 0.0)) for key in explicit_profile_keys)
+        profile_stats["process_total_seconds"] = float(process_total_seconds)
+        profile_stats["process_other_seconds"] = float(max(0.0, process_total_seconds - explicit_total))
+
+    return {
+        "query_frame_idx": start_frame,
+        "query_frame_result": query_frame_result,
+        "profile_stats": profile_stats or {},
+    }
+
+
+def build_scene_bundle_from_context(scene_ctx: dict[str, object]) -> dict[str, object]:
+    return {
+        "frame_count": int(scene_ctx["video_length"]),
+        "frame_height": int(scene_ctx["frame_H"]),
+        "frame_width": int(scene_ctx["frame_W"]),
+        "original_filenames": list(scene_ctx["original_filenames"]),
+        "source_frame_indices": np.asarray(scene_ctx["source_frame_indices"], dtype=np.int32),
+        "query_frame_metadata": dict(scene_ctx["query_frame_metadata"]),
+        "full_depths": np.asarray(scene_ctx["depth_npy"], dtype=np.float32),
+        "full_intrinsics": np.asarray(scene_ctx["intrs_npy"], dtype=np.float32),
+        "full_extrinsics": np.asarray(scene_ctx["extrs_npy"], dtype=np.float32),
+    }
+
+
+def save_source_ref_v2_query_results(
+    *,
+    video_name,
+    output_dir,
+    query_frame_results,
+    original_filenames,
+    future_len: int,
+    grid_size: int,
+    filter_args,
+    full_depths,
+    full_intrinsics,
+    full_extrinsics,
+    video_source_path: str | None,
+    depth_source_path: str | None,
+    source_frame_indices,
+    query_frame_metadata: dict[str, object] | None,
+    frame_count: int,
+    frame_height: int,
+    frame_width: int,
+):
+    scene_storage_mode = (
+        getattr(filter_args, "scene_storage_mode", DEFAULT_SCENE_STORAGE_MODE)
+        if filter_args is not None
+        else DEFAULT_SCENE_STORAGE_MODE
+    )
+    layout = getattr(filter_args, "output_layout", V2_LAYOUT) if filter_args is not None else V2_LAYOUT
+    if layout != V2_LAYOUT:
+        raise ValueError("save_source_ref_v2_query_results only supports v2 layout")
+    if scene_storage_mode != SCENE_STORAGE_SOURCE_REF:
+        raise ValueError("save_source_ref_v2_query_results only supports source_ref scene storage")
+    if query_frame_results is None:
+        raise ValueError("query_frame_results is required")
+
+    video_output_dir = Path(output_dir) / video_name
+    video_output_dir.mkdir(parents=True, exist_ok=True)
+    save_profile_stats = {} if bool(getattr(filter_args, "collect_profile_stats", False)) else None
+    sample_debug_records = (
+        []
+        if bool(getattr(filter_args, "collect_filter_stage_diagnostics", False))
+        else None
+    )
+    save_start = time.perf_counter()
+    logger.info(f"Saving {len(query_frame_results)} query frame results using layout={layout}")
+
+    filter_config = resolve_traj_filter_config(filter_args)
+    use_temporal_depth_consistency = bool(filter_config["enabled"] and filter_config["use_temporal_depth_consistency"])
+    use_depth_volatility_guidance = bool(
+        use_temporal_depth_consistency and filter_config["use_depth_volatility_guidance"]
+    )
+
+    full_depths_np = np.asarray(full_depths, dtype=np.float32)
+    full_intrinsics_np = np.asarray(full_intrinsics, dtype=np.float32)
+    full_extrinsics_np = np.asarray(full_extrinsics, dtype=np.float32)
+    source_frame_indices_np = np.asarray(source_frame_indices, dtype=np.int32).reshape(-1)
+    if source_frame_indices_np.shape != (int(frame_count),):
+        raise ValueError(
+            f"Expected source_frame_indices shape {(int(frame_count),)}, got {source_frame_indices_np.shape}"
+        )
+
+    prepare_bundles_start = time.perf_counter()
+    prepared_bundles = _prepare_query_frame_sample_bundles(
+        query_frame_results=query_frame_results,
+        grid_size=grid_size,
+        filter_args=filter_args,
+        filter_config=filter_config,
+        full_depths=full_depths_np,
+        profile_stats=save_profile_stats,
+        include_query_frame_image=False,
+    )
+    _accumulate_profile_stat(
+        save_profile_stats,
+        "prepare_bundles_seconds",
+        time.perf_counter() - prepare_bundles_start,
+    )
+
+    high_volatility_mask = None
+    if use_depth_volatility_guidance:
+        high_volatility_mask_start = time.perf_counter()
+        accessed_pixel_mask_start = time.perf_counter()
+        accessed_pixel_mask = _build_accessed_pixel_mask(
+            prepared_bundles,
+            image_height=int(full_depths_np.shape[1]),
+            image_width=int(full_depths_np.shape[2]),
+        )
+        _accumulate_profile_stat(
+            save_profile_stats,
+            "accessed_pixel_mask_seconds",
+            time.perf_counter() - accessed_pixel_mask_start,
+        )
+        (
+            high_volatility_mask,
+            _,
+            high_volatility_mask_stats,
+        ) = compute_accessed_high_volatility_mask(
+            full_depths_np,
+            accessed_pixel_mask=accessed_pixel_mask,
+            min_depth=float(filter_config["min_depth"]),
+            max_depth=float(filter_config["max_depth"]),
+            low_percentile=float(filter_config["volatility_low_percentile"]),
+            high_percentile=float(filter_config["volatility_high_percentile"]),
+            mask_percentile=float(filter_config["volatility_mask_percentile"]),
+            return_stats=True,
+        )
+        _record_high_volatility_mask_profile_stats(
+            profile_stats=save_profile_stats,
+            stats=high_volatility_mask_stats,
+        )
+        _accumulate_profile_stat(
+            save_profile_stats,
+            "high_volatility_mask_seconds",
+            time.perf_counter() - high_volatility_mask_start,
+        )
+
+    query_frame_metadata = dict(query_frame_metadata or {})
+    scene_meta_write_start = time.perf_counter()
+    write_scene_meta(
+        video_output_dir / "scene_meta.json",
+        {
+            "layout_version": 2,
+            "video_name": video_name,
+            "frame_count": int(frame_count),
+            "height": int(frame_height),
+            "width": int(frame_width),
+            "extrinsics_mode": "w2c",
+            "frame_drop_rate": None
+            if query_frame_metadata.get("query_frame_sampling_mode") != "uniform_grid"
+            else int(getattr(filter_args, "frame_drop_rate", 1)),
+            "future_len": int(future_len),
+            "original_filenames": list(map(str, original_filenames)),
+            "scene_storage_mode": SCENE_STORAGE_SOURCE_REF,
+            "scene_h5_path": None,
+            "rgb_cache_path": None,
+            "source_rgb_path": video_source_path,
+            "source_rgb_kind": path_kind(video_source_path),
+            "source_depth_path": depth_source_path,
+            "source_depth_kind": path_kind(depth_source_path),
+            "source_geom_path": getattr(filter_args, "external_geom_npz", None),
+            "source_geom_kind": path_kind(getattr(filter_args, "external_geom_npz", None)),
+            "source_camera_name": getattr(filter_args, "camera_name", None),
+            "source_extrinsics_mode": getattr(filter_args, "external_extr_mode", None),
+            "depth_pose_method": getattr(filter_args, "depth_pose_method", None),
+            "source_frame_indices": source_frame_indices_np.tolist(),
+            "query_frame_sampling_mode": query_frame_metadata.get("query_frame_sampling_mode"),
+            "query_frame_schedule_path": query_frame_metadata.get("query_frame_schedule_path"),
+            "query_frame_schedule_version": query_frame_metadata.get("query_frame_schedule_version"),
+            "keyframes_per_sec_min": query_frame_metadata.get("keyframes_per_sec_min"),
+            "keyframes_per_sec_max": query_frame_metadata.get("keyframes_per_sec_max"),
+            "query_frame_indices_local": query_frame_metadata.get("query_frame_indices_local"),
+            "query_frame_source_indices": query_frame_metadata.get("query_frame_source_indices"),
+            "query_frame_missing_source_indices": query_frame_metadata.get(
+                "query_frame_missing_source_indices"
+            ),
+            "query_frame_schedule_episode_fps": query_frame_metadata.get("query_frame_schedule_episode_fps"),
+        },
+    )
+    _accumulate_profile_stat(
+        save_profile_stats,
+        "scene_meta_write_seconds",
+        time.perf_counter() - scene_meta_write_start,
+    )
+
+    per_query_save_seconds: dict[int, float] = {}
+    for query_frame_idx, prepared_bundle in prepared_bundles.items():
+        query_frame_save_loop_start = time.perf_counter()
+        save_single_query_frame_v2(
+            video_name=video_name,
+            output_dir=output_dir,
+            query_frame_idx=query_frame_idx,
+            prepared_bundle=prepared_bundle,
+            filter_args=filter_args,
+            high_volatility_mask=high_volatility_mask,
+            save_profile_stats=save_profile_stats,
+            sample_debug_records=sample_debug_records,
+        )
+        elapsed = time.perf_counter() - query_frame_save_loop_start
+        per_query_save_seconds[int(query_frame_idx)] = float(elapsed)
+        _accumulate_profile_stat(
+            save_profile_stats,
+            "query_frame_save_loop_seconds",
+            elapsed,
+        )
+
+    total_save_seconds = time.perf_counter() - save_start
+    per_query_total_save_seconds = float(sum(per_query_save_seconds.values()))
+    _finalize_save_profile_stats(profile_stats=save_profile_stats, save_start=save_start)
+    return {
+        "save_profile_stats": save_profile_stats or {},
+        "sample_debug_records": sample_debug_records or [],
+        "per_query_save_seconds": per_query_save_seconds,
+        "scene_finalize_overhead_seconds": float(
+            max(0.0, total_save_seconds - per_query_total_save_seconds)
+        ),
+        "total_save_seconds": float(total_save_seconds),
+    }
+
+
+def process_single_video(video_path, depth_path, args, model_3dtracker, model_depth_pose, video_name=None, output_dir=None):
+    """Process a single video and return the processed data"""
+    scene_ctx = load_scene_context(video_path, depth_path, args, model_depth_pose)
+    profile_stats = scene_ctx["profile_stats"]
     query_frame_results = {}
-
+    tracking_segments = [
+        (int(frame_idx), min(int(frame_idx) + int(args.future_len), int(scene_ctx["video_length"])))
+        for frame_idx in scene_ctx["query_frames"]
+    ]
+    logger.info(f"Tracking up to {args.future_len} frames from each query frame")
     logger.info(f"Processing {len(tracking_segments)} independent tracking segments")
 
     with _DepthFilterRuntime(
-        depth_npy,
-        intrs_npy,
+        np.asarray(scene_ctx["depth_npy"], dtype=np.float32),
+        np.asarray(scene_ctx["intrs_npy"], dtype=np.float32),
         tracking_segments,
         profile_stats=profile_stats,
     ) as depth_filter_runtime:
-        for seg_idx, (start_frame, end_frame) in enumerate(tracking_segments):
-            logger.info(
-                f"Processing query frame {start_frame}: tracking {end_frame - start_frame} frames"
+        for start_frame, _end_frame in tracking_segments:
+            query_frame_results[int(start_frame)] = _run_query_frame_core(
+                scene_ctx=scene_ctx,
+                start_frame=int(start_frame),
+                args=args,
+                model_3dtracker=model_3dtracker,
+                depth_filter_runtime=depth_filter_runtime,
+                profile_stats=profile_stats,
             )
 
-            try:
-                # Clear CUDA cache before each segment to avoid fragmentation
-                _timed_cuda_empty_cache(
-                    profile_stats=profile_stats,
-                    key="segment_empty_cache_seconds",
-                )
-
-                # Extract video segment (16 frames starting from query frame)
-                segment_slice_start = time.perf_counter()
-                video_segment = video_ten[start_frame:end_frame]
-                intrs_segment = intrs_npy[start_frame:end_frame]
-                extrs_segment = extrs_npy[start_frame:end_frame]
-                _accumulate_profile_stat(
-                    profile_stats,
-                    "segment_slice_extract_seconds",
-                    time.perf_counter() - segment_slice_start,
-                )
-
-                # Get query points for this segment (only from the starting frame)
-                # Need to adjust the frame index to be relative to segment start (0)
-                dense_segment_query_point = query_point[seg_idx].copy()
-                dense_segment_query_point[:, 0] = 0  # Set frame index to 0 for segment start
-                tracked_query_indices = np.arange(dense_segment_query_point.shape[0], dtype=np.int32)
-                prefilter_result = None
-
-                prepare_inputs_start = time.perf_counter()
-                filtered_depth_segment = depth_filter_runtime.get_filtered_depth_segment(
-                    start_frame,
-                    end_frame,
-                )
-                if query_prefilter_enabled:
-                    candidate_prefilter_result = build_query_prefilter_result(
-                        dense_query_keypoints,
-                        filtered_depth_segment[0],
-                        filter_args=args,
-                        filter_config=query_prefilter_filter_config,
-                        query_prefilter_mode=query_prefilter_mode,
-                        wrist_rank_keep_ratio=query_prefilter_rank_keep_ratio,
-                    )
-                    kept_query_indices = np.flatnonzero(candidate_prefilter_result["prefilter_mask"]).astype(np.int32)
-                    if kept_query_indices.size == 0:
-                        logger.warning(
-                            f"Query frame {start_frame}: query prefilter removed all dense points; falling back to full grid"
-                        )
-                    else:
-                        tracked_query_indices = kept_query_indices
-                        if tracked_query_indices.shape[0] != dense_segment_query_point.shape[0]:
-                            prefilter_result = candidate_prefilter_result
-                segment_query_point = [dense_segment_query_point[tracked_query_indices].copy()]
-
-                video, depths, intrinsics, extrinsics, query_point_tensor, support_grid_size = (
-                    prepare_inputs(
-                        video_segment,
-                        filtered_depth_segment,
-                        intrs_segment,
-                        extrs_segment,
-                        segment_query_point,
-                        inference_res=(frame_H, frame_W),
-                        support_grid_size=support_grid_size,
-                        device=args.device,
-                        profile_stats=profile_stats,
-                    )
-                )
-                _sync_device_if_needed(getattr(args, "device", None))
-                _accumulate_profile_stat(
-                    profile_stats,
-                    "prepare_inputs_seconds",
-                    time.perf_counter() - prepare_inputs_start,
-                )
-
-                model_3dtracker.set_image_size((frame_H, frame_W))
-
-                with torch.no_grad():
-                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                        coords_seg, visibs_seg, inference_metadata = inference(
-                            model=model_3dtracker,
-                            video=video,
-                            depths=depths,
-                            intrinsics=intrinsics,
-                            extrinsics=extrinsics,
-                            query_point=query_point_tensor,
-                            num_iters=args.num_iters,
-                            grid_size=support_grid_size,
-                            bidrectional=False,  # Disable backward tracking
-                            profile_stats=profile_stats,
-                            return_metadata=True,
-                        )
-
-                # Validate inference results before storing
-                logger.debug(
-                    f"Query frame {start_frame}: coords_seg shape = {coords_seg.shape}, visibs_seg shape = {visibs_seg.shape}"
-                )
-
-                # Check if results have expected dimensions
-                if len(coords_seg.shape) != 3 or len(visibs_seg.shape) != 2:
-                    logger.error(
-                        f"Query frame {start_frame}: Invalid result shapes - coords: {coords_seg.shape}, visibs: {visibs_seg.shape}"
-                    )
-                    continue
-
-                # Check if we have the expected number of trajectories
-                expected_trajectories = int(tracked_query_indices.shape[0])
-                if coords_seg.shape[1] != expected_trajectories:
-                    logger.warning(
-                        f"Query frame {start_frame}: Expected {expected_trajectories} trajectories, got {coords_seg.shape[1]}"
-                    )
-
-                # Store results for this query frame (move to CPU to avoid GPU memory accumulation)
-                cpu_offload_start = time.perf_counter()
-                coords_cpu = coords_seg.cpu()
-                visibs_cpu = visibs_seg.cpu()
-                video_cpu = video.cpu()
-                depths_cpu = depths.cpu()
-                intrinsics_cpu = intrinsics.cpu()
-                extrinsics_cpu = extrinsics.cpu()
-                _accumulate_profile_stat(
-                    profile_stats,
-                    "segment_result_cpu_offload_seconds",
-                    time.perf_counter() - cpu_offload_start,
-                )
-                query_frame_results[start_frame] = {
-                    "coords": coords_cpu,  # Shape: (T, grid_size*grid_size, 3)
-                    "visibs": visibs_cpu,  # Shape: (T, grid_size*grid_size)
-                    "video_segment": video_cpu,
-                    "depths_segment": depths_cpu,
-                    "intrinsics_segment": intrinsics_cpu,
-                    "extrinsics_segment": extrinsics_cpu,
-                    "dense_keypoints": dense_query_keypoints.astype(np.float32, copy=False),
-                    "tracked_query_indices": tracked_query_indices.astype(np.int32, copy=False),
-                    "prefilter_result": prefilter_result,
-                    "dense_query_count": int(dense_query_keypoints.shape[0]),
-                    "tracked_query_count": int(tracked_query_indices.shape[0]),
-                    "support_grid_size": int(support_grid_size),
-                    "effective_support_query_count": int(
-                        inference_metadata.get("effective_support_query_count", 0)
-                    ),
-                }
-
-                logger.info(
-                    f"Query frame {start_frame}: tracked {coords_seg.shape[1]}/{dense_query_keypoints.shape[0]} queries "
-                    f"for {coords_seg.shape[0]} frames (support_grid_size={support_grid_size})"
-                )
-
-                # Clear cache after inference to free memory
-                _timed_cuda_empty_cache(
-                    profile_stats=profile_stats,
-                    key="segment_empty_cache_seconds",
-                )
-            finally:
-                depth_filter_runtime.release_segment_frames(start_frame, end_frame)
-
-    # For compatibility with the rest of the pipeline, use the first segment as the main result
-    # But we'll save each segment independently in save_structured_data
     if query_frame_results:
         first_frame = min(query_frame_results.keys())
         coords = query_frame_results[first_frame]["coords"]
@@ -2418,42 +2695,33 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
         intrinsics = query_frame_results[first_frame]["intrinsics_segment"]
         extrinsics = query_frame_results[first_frame]["extrinsics_segment"]
     else:
-        flen = min(args.future_len, len(video_ten))
+        flen = min(args.future_len, int(scene_ctx["video_length"]))
         coords = torch.empty((0, 0, 3))
         visibs = torch.empty((0, 0))
-        video = video_ten[:flen]
-        depths = torch.from_numpy(depth_npy[:flen]).float().to(args.device)
-        intrinsics = torch.from_numpy(intrs_npy[:flen]).float().to(args.device)
-        extrinsics = torch.from_numpy(extrs_npy[:flen]).float().to(args.device)
+        video = scene_ctx["video_ten"][:flen]
+        depths = torch.from_numpy(scene_ctx["depth_npy"][:flen]).float().to(args.device)
+        intrinsics = torch.from_numpy(scene_ctx["intrs_npy"][:flen]).float().to(args.device)
+        extrinsics = torch.from_numpy(scene_ctx["extrs_npy"][:flen]).float().to(args.device)
 
-    # Validate tensor shapes after inference
     logger.debug(
         f"After inference - coords shape: {coords.shape}, visibs shape: {visibs.shape}"
     )
-
-    # Ensure visibs has the expected dimensions
     if visibs.dim() == 3 and visibs.shape[-1] == 1:
-        visibs = visibs.squeeze(-1)  # Remove last dimension if it's 1
+        visibs = visibs.squeeze(-1)
         logger.debug(f"Squeezed visibs shape: {visibs.shape}")
 
-    # Validate final shapes
     expected_frames = video.shape[0]
-    expected_points = coords.shape[1] if coords.dim() >= 2 else 0
     if coords.dim() != 3 or visibs.dim() != 2:
-        logger.error(
-            f"Unexpected tensor dimensions - coords: {coords.shape}, visibs: {visibs.shape}"
-        )
-        raise ValueError(f"Invalid tensor shapes after inference")
-
+        raise ValueError(f"Invalid tensor shapes after inference coords={coords.shape} visibs={visibs.shape}")
     if coords.shape[0] != expected_frames or visibs.shape[0] != expected_frames:
-        logger.error(
-            f"Frame count mismatch - expected {expected_frames}, got coords: {coords.shape[0]}, visibs: {visibs.shape[0]}"
+        raise ValueError(
+            f"Frame count mismatch in inference results expected={expected_frames} "
+            f"coords={coords.shape[0]} visibs={visibs.shape[0]}"
         )
-        raise ValueError(f"Frame count mismatch in inference results")
 
     if profile_stats is not None:
         _sync_device_if_needed(getattr(args, "device", None))
-        process_total_seconds = time.perf_counter() - process_start
+        process_total_seconds = time.perf_counter() - float(scene_ctx["process_start"])
         explicit_profile_keys = (
             "load_rgb_seconds",
             "load_depth_seconds",
@@ -2468,21 +2736,21 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
 
     return {
         "video_tensor": video,
-        "full_video_tensor": video_ten,
+        "full_video_tensor": scene_ctx["video_ten"],
         "depths": depths,
-        "full_depths": depth_npy.astype(np.float32),
+        "full_depths": np.asarray(scene_ctx["depth_npy"], dtype=np.float32),
         "coords": coords,
         "visibs": visibs,
         "intrinsics": intrinsics,
         "extrinsics": extrinsics,
-        "query_points_per_frame": query_points_per_frame,
-        "original_filenames": original_filenames,
-        "source_frame_indices": source_frame_indices,
-        "query_frame_metadata": query_frame_metadata,
-        "depth_conf": depth_conf_npy,
-        "query_frame_results": query_frame_results,  # Add individual frame results
-        "full_intrinsics": intrs_npy.astype(np.float32),  # Keep save-time metadata on CPU.
-        "full_extrinsics": extrs_npy.astype(np.float32),
+        "query_points_per_frame": dict(scene_ctx["query_points_per_frame"]),
+        "original_filenames": list(scene_ctx["original_filenames"]),
+        "source_frame_indices": np.asarray(scene_ctx["source_frame_indices"], dtype=np.int32),
+        "query_frame_metadata": dict(scene_ctx["query_frame_metadata"]),
+        "depth_conf": scene_ctx["depth_conf"],
+        "query_frame_results": query_frame_results,
+        "full_intrinsics": np.asarray(scene_ctx["intrs_npy"], dtype=np.float32),
+        "full_extrinsics": np.asarray(scene_ctx["extrs_npy"], dtype=np.float32),
         "profile_stats": profile_stats,
     }
 

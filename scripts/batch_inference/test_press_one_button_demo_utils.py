@@ -16,6 +16,41 @@ resolve_traj_filter_profile = _RESOLVE_NAMESPACE["resolve_traj_filter_profile"]
 _PARSE_ARGS_FUNC_AST = next(
     node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "parse_args"
 )
+_CAMERA_TASK_AST = next(
+    node for node in _SOURCE_AST.body if isinstance(node, ast.ClassDef) and node.name == "CameraTask"
+)
+_SAFE_PER_QUERY_AST = next(
+    node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "_safe_per_query_seconds"
+)
+_BUILD_TASK_RECORD_AST = next(
+    node
+    for node in _SOURCE_AST.body
+    if isinstance(node, ast.FunctionDef) and node.name == "build_camera_task_metric_record"
+)
+_BUILD_BATCH_SUMMARY_AST = next(
+    node
+    for node in _SOURCE_AST.body
+    if isinstance(node, ast.FunctionDef) and node.name == "build_batch_run_summary"
+)
+_TELEMETRY_MODULE = ast.Module(
+    body=[
+        _CAMERA_TASK_AST,
+        _SAFE_PER_QUERY_AST,
+        _BUILD_TASK_RECORD_AST,
+        _BUILD_BATCH_SUMMARY_AST,
+    ],
+    type_ignores=[],
+)
+_TELEMETRY_GLOBALS = {
+    "dataclass": __import__("dataclasses").dataclass,
+    "Path": Path,
+    "argparse": __import__("argparse"),
+    "Any": object,
+}
+exec(compile(_TELEMETRY_MODULE, str(_SOURCE_PATH), "exec"), _TELEMETRY_GLOBALS)
+CameraTask = _TELEMETRY_GLOBALS["CameraTask"]
+build_camera_task_metric_record = _TELEMETRY_GLOBALS["build_camera_task_metric_record"]
+build_batch_run_summary = _TELEMETRY_GLOBALS["build_batch_run_summary"]
 
 
 def _collect_cli_flags(func_ast: ast.FunctionDef) -> set[str]:
@@ -95,6 +130,10 @@ class PressOneButtonCliSurfaceTests(unittest.TestCase):
         self.assertNotIn("--max_frames_per_video", _CLI_FLAGS)
         self.assertNotIn("--depth_volatility_mode", _CLI_FLAGS)
 
+    def test_exposes_episode_names_file_filter_flag(self):
+        self.assertIn("--episode_names_file", _CLI_FLAGS)
+        self.assertIsNone(_CLI_DEFAULTS.get("--episode_names_file"))
+
     def test_exposes_query_prefilter_and_support_ratio_flags(self):
         self.assertIn("--query_prefilter_mode", _CLI_FLAGS)
         self.assertIn("--query_prefilter_wrist_rank_keep_ratio", _CLI_FLAGS)
@@ -103,6 +142,93 @@ class PressOneButtonCliSurfaceTests(unittest.TestCase):
 
     def test_num_iters_default_is_five(self):
         self.assertEqual(_CLI_DEFAULTS.get("--num_iters"), 5)
+
+
+class BatchTelemetryRecordTests(unittest.TestCase):
+    def test_build_camera_task_metric_record_computes_per_query_fields(self):
+        task = CameraTask(
+            task_index=1,
+            total_tasks=60,
+            episode_dir=Path("/tmp/episode_00001_green"),
+            out_episode_dir=Path("/tmp/output/episode_00001_green"),
+            camera_name="varied_camera_1",
+            query_frame_schedule_path=Path("/tmp/output/episode_00001_green/_shared/schedule.json"),
+        )
+        args = type(
+            "Args",
+            (),
+            {
+                "device": "cuda:0",
+                "num_iters": 5,
+                "traj_filter_profile": "external",
+            },
+        )()
+
+        record = build_camera_task_metric_record(
+            task=task,
+            gpu_id=0,
+            args=args,
+            query_frame_count=10,
+            process_seconds=50.0,
+            save_seconds=2.0,
+            started_at_unix=1000.0,
+            finished_at_unix=1052.0,
+            status="success",
+            retryable_cuda_error=False,
+            error_message=None,
+        )
+
+        self.assertEqual(record["episode_name"], "episode_00001_green")
+        self.assertEqual(record["camera_name"], "varied_camera_1")
+        self.assertEqual(record["num_iters"], 5)
+        self.assertEqual(record["query_frame_count"], 10)
+        self.assertAlmostEqual(record["process_seconds_per_query"], 5.0)
+        self.assertAlmostEqual(record["save_seconds_per_query"], 0.2)
+        self.assertAlmostEqual(record["total_seconds_per_query"], 5.2)
+        self.assertEqual(record["status"], "success")
+
+    def test_build_batch_run_summary_preserves_fixed_keyframe_config(self):
+        args = type(
+            "Args",
+            (),
+            {
+                "camera_names": ["varied_camera_1", "varied_camera_3"],
+                "num_iters": 6,
+                "keyframe_seed": 0,
+                "keyframes_per_sec_min": 5,
+                "keyframes_per_sec_max": 5,
+                "fps": 1,
+                "max_num_frames": 512,
+                "future_len": 32,
+                "grid_size": 80,
+                "support_grid_ratio": 0.8,
+                "filter_level": "standard",
+                "traj_filter_profile": "auto",
+                "external_geom_name": "trajectory_valid.h5",
+                "external_extr_mode": "w2c",
+            },
+        )()
+
+        summary = build_batch_run_summary(
+            args=args,
+            base_path=Path("/data2/test"),
+            out_dir=Path("/data2/out"),
+            gpu_ids=[0, 1, 2, 3],
+            episode_count=30,
+            camera_task_count=60,
+            total_camera_success=60,
+            total_camera_fail=0,
+            wall_clock_seconds=1234.5,
+        )
+
+        self.assertEqual(summary["camera_names"], ["varied_camera_1", "varied_camera_3"])
+        self.assertEqual(summary["gpu_ids"], [0, 1, 2, 3])
+        self.assertEqual(summary["episode_count"], 30)
+        self.assertEqual(summary["camera_task_count"], 60)
+        self.assertEqual(summary["keyframes_per_sec_min"], 5)
+        self.assertEqual(summary["keyframes_per_sec_max"], 5)
+        self.assertAlmostEqual(summary["support_grid_ratio"], 0.8)
+        self.assertAlmostEqual(summary["wall_clock_seconds"], 1234.5)
 
 
 if __name__ == "__main__":
