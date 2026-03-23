@@ -65,6 +65,24 @@ python scripts/visualization/visualize_single_image.py \
     --port 8080
 ```
 
+### Two-Hop Server Transfer
+```bash
+bash scripts/data_transfer/rsync_via_jump.sh \
+    --src /data1/local_dataset/ \
+    --dst /data/remote_dataset/ \
+    --target-host <target_alias_or_host> \
+    --ssh-config-file ~/.ssh/config \
+    --tmux-session traceforge-transfer
+```
+
+This helper uses `rsync -aH --info=progress2 --partial --append-verify` over
+SSH for resumable large-directory transfers. If your `target_host` alias already
+contains `ProxyJump`, you can omit `--jump-host`; otherwise pass `--jump-host`
+explicitly. Add `--print-only` when only checking the generated command,
+`--dry-run` when doing remote file-list validation without copying data, and
+`--bwlimit` if the link needs throttling. It defaults to `ssh -F /dev/null`;
+pass `--ssh-config-file` if you need a custom SSH config.
+
 ### Output Verification
 ```bash
 # 3D trajectory checker
