@@ -11,6 +11,9 @@
 - `visualize_3d_keypoint_animation.py`
   - 逐时间步播放 keypoint 轨迹
   - 支持 `v2` 和 `legacy`
+- `visualize_3d_keypoint_comparison.py`
+  - 同时读取 baseline / variant 两个 episode output
+  - 把 `baseline-only / overlap / variant-only` 三类轨迹叠在一个 3D 视图里
 - `verify_episode_trajectory_outputs.py`
   - 对单个 episode 导出 PLY、验证图和可选 GIF
 - `export_pointcloud_ply.py`

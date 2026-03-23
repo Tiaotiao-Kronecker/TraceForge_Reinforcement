@@ -143,6 +143,9 @@ class PressOneButtonCliSurfaceTests(unittest.TestCase):
     def test_num_iters_default_is_five(self):
         self.assertEqual(_CLI_DEFAULTS.get("--num_iters"), 5)
 
+    def test_support_grid_ratio_default_is_point_eight(self):
+        self.assertEqual(_CLI_DEFAULTS.get("--support_grid_ratio"), 0.8)
+
 
 class BatchTelemetryRecordTests(unittest.TestCase):
     def test_build_camera_task_metric_record_computes_per_query_fields(self):

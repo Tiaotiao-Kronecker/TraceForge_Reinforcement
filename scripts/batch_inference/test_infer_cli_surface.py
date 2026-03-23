@@ -81,6 +81,9 @@ class InferCliSurfaceTests(unittest.TestCase):
     def test_num_iters_default_is_five(self):
         self.assertEqual(_CLI_DEFAULTS.get("--num_iters"), 5)
 
+    def test_support_grid_ratio_default_is_point_eight(self):
+        self.assertEqual(_CLI_DEFAULTS.get("--support_grid_ratio"), 0.8)
+
     def test_support_grid_ratio_uses_rounded_nonnegative_size(self):
         self.assertEqual(resolve_support_grid_size(80, 0.8), 64)
         self.assertEqual(resolve_support_grid_size(80, 0.4), 32)

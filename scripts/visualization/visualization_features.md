@@ -56,3 +56,29 @@ python scripts/visualization/verify_episode_trajectory_outputs.py \
   --query_frames 0,15,30 \
   --output_dir <verification_dir>
 ```
+
+## `visualize_3d_keypoint_comparison.py`
+
+适合直接对比两套 output root 下同一个 `episode/camera/query_frame` 的轨迹集合差异。
+
+示例：
+
+```bash
+python scripts/visualization/visualize_3d_keypoint_comparison.py \
+  --baseline_episode_dir <baseline_episode_dir> \
+  --variant_episode_dir <variant_episode_dir> \
+  --query_frame 37 \
+  --baseline_label i6s08 \
+  --variant_label i5s0 \
+  --dense_pointcloud \
+  --normalize_camera \
+  --port 8080
+```
+
+当前行为：
+
+- 自动按同一 `query_frame` 加载 baseline / variant sample
+- 以 track index 对齐后分成 `baseline-only / overlap / variant-only`
+- 在一个 3D 播放器里叠加显示三组轨迹
+- `overlap` 支持切换 `baseline / mean / variant` 显示源
+- 可选显示 overlap 当前帧的 baseline↔variant 差异连线
