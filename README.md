@@ -91,6 +91,10 @@ in multi-GPU mode and no longer exposes `--frame_drop_rate`, `--horizon`, or
 `--max_frames_per_video`; for a fixed per-second keyframe count, set
 `--keyframes_per_sec_min` and `--keyframes_per_sec_max` to the same value.
 For example, set both to `5` to request 5 random keyframes per second.
+If a query frame would have `<= 8` remaining frames to the end of the loaded
+video segment, it is dropped before sampling because the tail is too short for
+stable trajectory tracking. `infer.py` applies the same short-tail filter again
+when consuming shared schedules or the uniform-grid fallback.
 Its maintained defaults already cover `camera_names=varied_camera_1,2,3`,
 `depth_pose_method=external`, `external_geom_name=trajectory_valid.h5`,
 `fps=1`, `max_num_frames=512`, `future_len=32`, `grid_size=80`,
@@ -221,7 +225,7 @@ contains a shared keyframe manifest:
 ```text
 <episode_dir>/trajectory/
 ├── _shared/
-│   └── query_frame_schedule_v1_<hash>.json
+│   └── query_frame_schedule_v3_<hash>.json
 ├── varied_camera_1/
 ├── varied_camera_2/
 └── varied_camera_3/

@@ -19,7 +19,9 @@
   - button / sim / press-one-button episode 数据集批处理入口
   - 默认 `--fps=1`、`--max_num_frames=512`
   - 默认每秒共享采样 `2~3` 个关键帧，按 episode 的 `trajectory_valid.h5` root attr `fps` 计算
-  - 生成共享 schedule 到 `<episode_output>/_shared/query_frame_schedule_v1_<hash>.json`
+  - 若某个 query frame 到加载后视频末尾的剩余帧数（含自身）`<= 8`，会在采样前直接丢弃
+  - `infer.py` 在消费 shared schedule 或 `frame_drop_rate` fallback 时会再次执行同样的尾部过滤
+  - 生成共享 schedule 到 `<episode_output>/_shared/query_frame_schedule_v3_<hash>.json`
   - 多 GPU 维护路径为 dynamic-only
   - 关键帧数量只由 `--keyframes_per_sec_min/max` 控制；固定数量时把两者设成相同值
   - 不再暴露 `--frame_drop_rate` / `--horizon` / `--max_frames_per_video`

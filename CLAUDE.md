@@ -141,7 +141,9 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 - `--max_num_frames` is the post-stride frame cap; default `512`
 - Source frame `0` is always forced into the shared query-frame schedule when it survives stride/cap filtering
 - This means the first second may contain one extra query frame beyond the nominal `keyframes_per_sec_min~max` sample count
-- Shared schedule manifests are written to `<episode_output>/_shared/query_frame_schedule_v2_<hash>.json`
+- Query frames with `<= 8` remaining frames to the end of the loaded video segment (inclusive of the query frame itself) are discarded before sampling because the tracking horizon is too short near the tail
+- `infer.py` applies the same short-tail filter again when consuming either a shared schedule or the uniform-grid fallback, so stale manifests cannot reintroduce these frames
+- Shared schedule manifests are written to `<episode_output>/_shared/query_frame_schedule_v3_<hash>.json`
 - `infer.py` consumes raw source-frame indices from the manifest, then maps them to the current local frame indices after stride/cap filtering
 
 **Multi-GPU Processing**:
@@ -242,7 +244,7 @@ For button/sim episode outputs written in-place:
 ```
 <episode_dir>/trajectory/
 ├── _shared/
-│   └── query_frame_schedule_v2_<hash>.json
+│   └── query_frame_schedule_v3_<hash>.json
 ├── varied_camera_1/
 ├── varied_camera_2/
 └── varied_camera_3/

@@ -4,6 +4,7 @@ import numpy as np
 
 from utils.keyframe_schedule_utils import (
     build_candidate_source_frame_indices,
+    filter_query_local_indices_by_remaining_frames,
     map_query_source_indices_to_local,
     sample_query_source_indices_per_second,
 )
@@ -94,6 +95,26 @@ class SampleQuerySourceIndicesPerSecondTests(unittest.TestCase):
 
         self.assertEqual(int(sampled[0]), 0)
         self.assertIn(0, sampled.tolist())
+
+
+class FilterQueryLocalIndicesByRemainingFramesTests(unittest.TestCase):
+    def test_drops_query_frames_with_eight_or_fewer_remaining_frames_inclusive(self):
+        kept, dropped = filter_query_local_indices_by_remaining_frames(
+            np.arange(10, dtype=np.int32),
+            video_length=10,
+        )
+
+        np.testing.assert_array_equal(kept, np.array([0, 1], dtype=np.int32))
+        np.testing.assert_array_equal(dropped, np.array([2, 3, 4, 5, 6, 7, 8, 9], dtype=np.int32))
+
+    def test_keeps_empty_input_empty(self):
+        kept, dropped = filter_query_local_indices_by_remaining_frames(
+            np.zeros((0,), dtype=np.int32),
+            video_length=4,
+        )
+
+        np.testing.assert_array_equal(kept, np.zeros((0,), dtype=np.int32))
+        np.testing.assert_array_equal(dropped, np.zeros((0,), dtype=np.int32))
 
 
 class MapQuerySourceIndicesToLocalTests(unittest.TestCase):

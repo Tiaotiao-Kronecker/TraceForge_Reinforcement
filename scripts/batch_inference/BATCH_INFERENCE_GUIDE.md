@@ -60,7 +60,7 @@ python scripts/batch_inference/infer.py \
   --external_geom_npz <trajectory_valid.h5> \
   --depth_pose_method external \
   --camera_name varied_camera_1 \
-  --query_frame_schedule_path <episode_output>/_shared/query_frame_schedule_v1_<hash>.json \
+  --query_frame_schedule_path <episode_output>/_shared/query_frame_schedule_v3_<hash>.json \
   --fps 1 \
   --max_num_frames 512
 ```
@@ -100,7 +100,7 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
 补充说明：
 
 - `batch_infer_press_one_button_demo.py` 会为每个 episode 生成一份共享 schedule：
-  `<episode_output>/_shared/query_frame_schedule_v1_<hash>.json`
+  `<episode_output>/_shared/query_frame_schedule_v3_<hash>.json`
 - 三个相机都会消费同一份 schedule，因此 query frame 的 raw 帧序号天然对齐
 - schedule 里存的是 raw source frame index，`infer.py` 运行时再映射到当前
   `--fps` / `--max_num_frames` 对应的 local query frame
@@ -109,6 +109,8 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
 - 真实的时间语义来自 `trajectory_valid.h5` 根属性 `fps`
 - `--fps` 只是加载 stride，不是 episode 的真实帧率
 - `--max_num_frames` 是 stride 之后的总帧数上限
+- 如果某个 query frame 到加载后视频末尾的剩余帧数（含自身）`<= 8`，会在共享 schedule 采样前丢弃
+- `infer.py` 在读取 shared schedule 和走 `--frame_drop_rate` fallback 时都会再次执行同样的尾部过滤
 - 维护态 batch CLI 不再暴露 `--frame_drop_rate`、`--horizon`、`--max_frames_per_video`
 - `--keyframe_seed` 用于可复现的 deterministic schedule；默认 `0`
 - 如果某些 `trajectory_valid.h5` 缺少根属性 `fps`，可以显式提供 `--fallback_episode_fps`
@@ -145,7 +147,7 @@ button/sim episode 默认就地写回：
 <episode_dir>/
 └── trajectory/
     ├── _shared/
-    │   └── query_frame_schedule_v1_<hash>.json
+    │   └── query_frame_schedule_v3_<hash>.json
     ├── varied_camera_1/
     │   ├── scene_meta.json
     │   └── samples/

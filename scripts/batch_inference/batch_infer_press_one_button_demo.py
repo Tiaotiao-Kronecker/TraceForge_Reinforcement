@@ -65,6 +65,7 @@ if _SCRIPT_DIR not in sys.path:
 import infer
 from utils.keyframe_schedule_utils import (
     build_candidate_source_frame_indices,
+    filter_query_local_indices_by_remaining_frames,
     sample_query_source_indices_per_second,
 )
 from utils.traceforge_artifact_utils import is_traceforge_output_complete
@@ -78,7 +79,7 @@ DEFAULT_CAMERAS = [
 
 _CUDA_LINALG_WARMUP_LOCK = threading.Lock()
 _CUDA_LINALG_WARMED_DEVICES: set[str] = set()
-_QUERY_FRAME_SCHEDULE_VERSION = 2
+_QUERY_FRAME_SCHEDULE_VERSION = 3
 _QUERY_FRAME_SHARED_DIRNAME = "_shared"
 
 
@@ -798,6 +799,25 @@ def ensure_episode_query_frame_schedule(
         raise ValueError(
             f"{episode_dir.name}: no candidate frames remain after stride/max_num_frames filtering"
         )
+    candidate_local_indices = np.arange(candidate_source_frame_indices.size, dtype=np.int32)
+    candidate_local_indices, short_tail_local_indices = (
+        filter_query_local_indices_by_remaining_frames(
+            candidate_local_indices,
+            video_length=int(candidate_source_frame_indices.size),
+        )
+    )
+    short_tail_source_indices = candidate_source_frame_indices[short_tail_local_indices]
+    candidate_source_frame_indices = candidate_source_frame_indices[candidate_local_indices]
+    if short_tail_source_indices.size > 0:
+        logger.info(
+            f"{episode_dir.name}: dropped {short_tail_source_indices.size} candidate query frames "
+            "because <= 8 frames remain to the end (inclusive)"
+        )
+    if candidate_source_frame_indices.size == 0:
+        raise ValueError(
+            f"{episode_dir.name}: no candidate frames remain after "
+            "stride/max_num_frames/tail filtering"
+        )
 
     schedule_spec = {
         "version": _QUERY_FRAME_SCHEDULE_VERSION,
@@ -839,6 +859,7 @@ def ensure_episode_query_frame_schedule(
             "derived_seed": int(derived_seed),
             "camera_raw_frame_counts": camera_raw_frame_counts,
             "candidate_source_frame_indices": candidate_source_frame_indices.tolist(),
+            "dropped_short_tail_source_indices": short_tail_source_indices.tolist(),
             "query_frame_source_indices": query_frame_source_indices.tolist(),
         },
     )

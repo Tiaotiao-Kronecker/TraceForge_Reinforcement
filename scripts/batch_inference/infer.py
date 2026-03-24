@@ -43,7 +43,10 @@ from utils.traj_filter_utils import (
     prepare_temporal_depth_consistency_context,
     resolve_traj_filter_config,
 )
-from utils.keyframe_schedule_utils import map_query_source_indices_to_local
+from utils.keyframe_schedule_utils import (
+    filter_query_local_indices_by_remaining_frames,
+    map_query_source_indices_to_local,
+)
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -1066,6 +1069,13 @@ def _resolve_query_frames(
             source_frame_indices,
             requested_query_source_indices,
         )
+        local_query_frames, short_tail_local_query_frames = (
+            filter_query_local_indices_by_remaining_frames(
+                local_query_frames,
+                video_length=video_length,
+            )
+        )
+        short_tail_query_source_indices = source_frame_indices[short_tail_local_query_frames]
         if missing_query_source_indices.size > 0:
             missing_preview = missing_query_source_indices[:10].tolist()
             suffix = "..." if missing_query_source_indices.size > 10 else ""
@@ -1073,10 +1083,18 @@ def _resolve_query_frames(
                 "Shared query-frame schedule references frames dropped by stride/max_num_frames: "
                 f"{missing_preview}{suffix} (missing={missing_query_source_indices.size})"
             )
+        if short_tail_query_source_indices.size > 0:
+            dropped_preview = short_tail_query_source_indices[:10].tolist()
+            suffix = "..." if short_tail_query_source_indices.size > 10 else ""
+            logger.warning(
+                "Dropping shared query-frame schedule entries too close to the video end "
+                f"(<=8 remaining incl. query): {dropped_preview}{suffix} "
+                f"(dropped={short_tail_query_source_indices.size})"
+            )
         if local_query_frames.size == 0:
             raise ValueError(
                 "Shared query-frame schedule resolved to zero query frames after "
-                "stride/max_num_frames filtering."
+                "stride/max_num_frames/tail filtering."
             )
 
         resolved_query_source_indices = source_frame_indices[local_query_frames]
@@ -1095,6 +1113,7 @@ def _resolve_query_frames(
             "query_frame_indices_local": query_frames,
             "query_frame_source_indices": resolved_query_source_indices.astype(np.int32).tolist(),
             "query_frame_missing_source_indices": missing_query_source_indices.astype(np.int32).tolist(),
+            "query_frame_short_tail_filtered_source_indices": short_tail_query_source_indices.astype(np.int32).tolist(),
             "query_frame_schedule_episode_fps": schedule_payload.get("episode_fps"),
         }
 
@@ -1102,7 +1121,23 @@ def _resolve_query_frames(
     if frame_drop_rate <= 0:
         raise ValueError(f"frame_drop_rate must be >= 1, got {frame_drop_rate}")
 
-    query_frames = list(range(0, video_length, frame_drop_rate))
+    query_frames_np = np.asarray(list(range(0, video_length, frame_drop_rate)), dtype=np.int32)
+    query_frames_np, short_tail_local_query_frames = filter_query_local_indices_by_remaining_frames(
+        query_frames_np,
+        video_length=video_length,
+    )
+    short_tail_query_source_indices = source_frame_indices[short_tail_local_query_frames]
+    if short_tail_query_source_indices.size > 0:
+        logger.info(
+            "Dropping uniform-grid query frames too close to the video end "
+            f"(<=8 remaining incl. query): {short_tail_query_source_indices.tolist()}"
+        )
+    if query_frames_np.size == 0:
+        raise ValueError(
+            "Uniform-grid query-frame sampling resolved to zero query frames after "
+            "tail filtering."
+        )
+    query_frames = query_frames_np.tolist()
     logger.info(
         f"Using uniform grid sampling on frames: {query_frames} (frame_drop_rate={frame_drop_rate})"
     )
@@ -1115,6 +1150,7 @@ def _resolve_query_frames(
         "query_frame_indices_local": query_frames,
         "query_frame_source_indices": source_frame_indices[query_frames].astype(np.int32).tolist(),
         "query_frame_missing_source_indices": [],
+        "query_frame_short_tail_filtered_source_indices": short_tail_query_source_indices.astype(np.int32).tolist(),
         "query_frame_schedule_episode_fps": None,
     }
 

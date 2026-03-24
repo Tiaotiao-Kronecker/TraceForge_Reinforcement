@@ -4,6 +4,8 @@ import math
 
 import numpy as np
 
+MIN_QUERY_REMAINING_FRAMES_INCLUSIVE = 9
+
 
 def build_candidate_source_frame_indices(
     num_frames: int,
@@ -44,6 +46,37 @@ def _sample_stratified_without_replacement(
     if not selected:
         return np.zeros((0,), dtype=np.int32)
     return np.sort(np.asarray(selected, dtype=np.int32))
+
+
+def filter_query_local_indices_by_remaining_frames(
+    query_local_indices: np.ndarray,
+    *,
+    video_length: int,
+    min_remaining_frames_inclusive: int = MIN_QUERY_REMAINING_FRAMES_INCLUSIVE,
+) -> tuple[np.ndarray, np.ndarray]:
+    query_local_indices = np.asarray(query_local_indices, dtype=np.int32).reshape(-1)
+    if video_length < 0:
+        raise ValueError(f"video_length must be non-negative, got {video_length}")
+    if min_remaining_frames_inclusive <= 0:
+        raise ValueError(
+            "min_remaining_frames_inclusive must be positive, "
+            f"got {min_remaining_frames_inclusive}"
+        )
+    if query_local_indices.size == 0:
+        empty = np.zeros((0,), dtype=np.int32)
+        return empty, empty
+    if np.any(query_local_indices < 0) or np.any(query_local_indices >= video_length):
+        raise ValueError(
+            "query_local_indices must be within [0, video_length), got "
+            f"{query_local_indices.tolist()} for video_length={video_length}"
+        )
+
+    remaining_frames_inclusive = video_length - query_local_indices
+    keep_mask = remaining_frames_inclusive >= int(min_remaining_frames_inclusive)
+    return (
+        query_local_indices[keep_mask].astype(np.int32, copy=False),
+        query_local_indices[~keep_mask].astype(np.int32, copy=False),
+    )
 
 
 def sample_query_source_indices_per_second(
