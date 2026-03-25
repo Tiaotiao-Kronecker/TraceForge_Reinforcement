@@ -51,6 +51,7 @@ from utils.traj_filter_utils import (
     build_traj_filter_result,
     build_query_prefilter_result,
     compute_accessed_high_volatility_mask,
+    is_tail_truncated_sample,
     prepare_temporal_depth_consistency_context,
     resolve_traj_filter_config,
 )
@@ -98,6 +99,154 @@ def _count_true(mask: np.ndarray | None) -> int:
     if mask is None:
         return 0
     return int(np.count_nonzero(np.asarray(mask, dtype=bool)))
+
+
+SHORT_TAIL_SKIP_MAX_SEGMENT_LEN = 8
+
+
+def _resolve_segment_end_frame(
+    start_frame: int,
+    *,
+    video_length: int,
+    future_len: int,
+) -> int:
+    return min(int(start_frame) + int(future_len), int(video_length))
+
+
+def _resolve_segment_length(
+    start_frame: int,
+    *,
+    video_length: int,
+    future_len: int,
+) -> int:
+    return max(
+        0,
+        _resolve_segment_end_frame(
+            start_frame,
+            video_length=video_length,
+            future_len=future_len,
+        )
+        - int(start_frame),
+    )
+
+
+def _apply_short_tail_skip_to_query_frames(
+    *,
+    query_frames: list[int],
+    query_frame_metadata: dict[str, object],
+    source_frame_indices: np.ndarray,
+    video_length: int,
+    future_len: int,
+    max_segment_len: int = SHORT_TAIL_SKIP_MAX_SEGMENT_LEN,
+) -> tuple[list[int], dict[str, object]]:
+    normalized_query_frames = [int(frame_idx) for frame_idx in query_frames]
+    normalized_source_indices = np.asarray(source_frame_indices, dtype=np.int32).reshape(-1)
+
+    requested_query_source_indices = [
+        int(normalized_source_indices[frame_idx])
+        for frame_idx in normalized_query_frames
+    ]
+
+    kept_query_frames: list[int] = []
+    kept_query_source_indices: list[int] = []
+    skipped_query_frames: list[int] = []
+    skipped_query_source_indices: list[int] = []
+    skipped_segment_lengths: list[int] = []
+
+    for frame_idx, source_idx in zip(normalized_query_frames, requested_query_source_indices):
+        segment_len = _resolve_segment_length(
+            frame_idx,
+            video_length=video_length,
+            future_len=future_len,
+        )
+        if segment_len <= int(max_segment_len):
+            skipped_query_frames.append(int(frame_idx))
+            skipped_query_source_indices.append(int(source_idx))
+            skipped_segment_lengths.append(int(segment_len))
+            continue
+
+        kept_query_frames.append(int(frame_idx))
+        kept_query_source_indices.append(int(source_idx))
+
+    updated_metadata = dict(query_frame_metadata)
+    updated_metadata["requested_query_frame_indices_local"] = normalized_query_frames
+    updated_metadata["requested_query_frame_source_indices"] = requested_query_source_indices
+    updated_metadata["query_frame_indices_local"] = kept_query_frames
+    updated_metadata["query_frame_source_indices"] = kept_query_source_indices
+    updated_metadata["skipped_short_tail_query_frame_indices_local"] = skipped_query_frames
+    updated_metadata["skipped_short_tail_query_frame_source_indices"] = skipped_query_source_indices
+    updated_metadata["skipped_short_tail_segment_lengths"] = skipped_segment_lengths
+    updated_metadata["short_tail_skip_max_segment_len"] = int(max_segment_len)
+    return kept_query_frames, updated_metadata
+
+
+def _remove_query_frame_output_artifacts(
+    *,
+    video_name: str,
+    output_dir: str | Path,
+    query_frame_idx: int,
+    layout: str,
+) -> list[str]:
+    video_output_dir = Path(output_dir) / video_name
+    query_frame_idx = int(query_frame_idx)
+    artifact_paths: list[Path]
+    if layout == V2_LAYOUT:
+        artifact_paths = [
+            video_output_dir / "samples" / f"{video_name}_{query_frame_idx}.npz",
+        ]
+    elif layout == LEGACY_LAYOUT:
+        artifact_paths = [
+            video_output_dir / "samples" / f"{video_name}_{query_frame_idx}.npz",
+            video_output_dir / "images" / f"{video_name}_{query_frame_idx}.png",
+            video_output_dir / "depth" / f"{video_name}_{query_frame_idx}.png",
+            video_output_dir / "depth" / f"{video_name}_{query_frame_idx}_raw.npz",
+        ]
+    else:
+        raise ValueError(f"Unsupported layout for artifact removal: {layout}")
+
+    removed_paths: list[str] = []
+    for artifact_path in artifact_paths:
+        if artifact_path.exists():
+            artifact_path.unlink()
+            removed_paths.append(str(artifact_path))
+    return removed_paths
+
+
+def _cleanup_skipped_short_tail_artifacts(
+    *,
+    video_name: str,
+    output_dir: str | Path,
+    layout: str,
+    query_frame_metadata: dict[str, object] | None,
+    profile_stats: dict[str, float] | None,
+) -> list[int]:
+    metadata = dict(query_frame_metadata or {})
+    skipped_query_frames = [
+        int(frame_idx)
+        for frame_idx in metadata.get("skipped_short_tail_query_frame_indices_local", []) or []
+    ]
+    if not skipped_query_frames:
+        return []
+
+    cleanup_start = time.perf_counter()
+    for query_frame_idx in skipped_query_frames:
+        removed_paths = _remove_query_frame_output_artifacts(
+            video_name=video_name,
+            output_dir=output_dir,
+            query_frame_idx=query_frame_idx,
+            layout=layout,
+        )
+        if removed_paths:
+            logger.info(
+                f"Removed {len(removed_paths)} stale artifact(s) for short-tail skipped query frame "
+                f"{query_frame_idx}: {removed_paths}"
+            )
+    _accumulate_profile_stat(
+        profile_stats,
+        "short_tail_artifact_cleanup_seconds",
+        time.perf_counter() - cleanup_start,
+    )
+    return skipped_query_frames
 
 
 def _build_sample_filter_debug_record(
@@ -934,6 +1083,8 @@ def _build_dense_sample_payload_from_tracked_subset(
         "traj_query_depth_edge_risk_mask": np.zeros(dense_track_count, dtype=bool),
         "traj_motion_extent": np.full(dense_track_count, np.nan, dtype=np.float16),
         "traj_motion_step_median": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_motion_extent_all_valid": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_motion_step_median_all_valid": np.full(dense_track_count, np.nan, dtype=np.float16),
         "traj_manipulator_candidate_mask": np.zeros(dense_track_count, dtype=bool),
         "traj_manipulator_cluster_id": np.full(dense_track_count, -1, dtype=np.int16),
         "traj_manipulator_component_size": np.zeros(dense_track_count, dtype=np.uint16),
@@ -993,6 +1144,8 @@ def _build_dense_sample_payload_from_tracked_subset(
         "traj_query_depth_edge_risk_mask",
         "traj_motion_extent",
         "traj_motion_step_median",
+        "traj_motion_extent_all_valid",
+        "traj_motion_step_median_all_valid",
         "traj_manipulator_candidate_mask",
         "traj_manipulator_cluster_id",
         "traj_manipulator_component_size",
@@ -1098,13 +1251,17 @@ def prepare_query_frame_sample_bundle(
     )
     if filter_config is None:
         filter_config = resolve_traj_filter_config(filter_args)
+    tail_truncated_sample = is_tail_truncated_sample(
+        num_frames=int(traj_uvz.shape[1]),
+        filter_args=filter_args,
+    )
 
     temporal_compare_context = None
     if prepare_temporal_context:
         temporal_context_start = time.perf_counter()
         temporal_compare_context = prepare_temporal_depth_consistency_context(
             traj_uvz,
-            visibs=visibs_np,
+            visibs=None if tail_truncated_sample else visibs_np,
             raw_depths_segment=raw_depths_segment_np,
             intrinsics_segment=intrinsics_np,
             extrinsics_segment=extrinsics_np,
@@ -1218,6 +1375,10 @@ def build_query_frame_sample_data(
         "traj_query_depth_edge_risk_mask": traj_filter_result["traj_query_depth_edge_risk_mask"].astype(bool),
         "traj_motion_extent": traj_filter_result["traj_motion_extent"].astype(np.float16),
         "traj_motion_step_median": traj_filter_result["traj_motion_step_median"].astype(np.float16),
+        "traj_motion_extent_all_valid": traj_filter_result["traj_motion_extent_all_valid"].astype(np.float16),
+        "traj_motion_step_median_all_valid": traj_filter_result["traj_motion_step_median_all_valid"].astype(
+            np.float16
+        ),
         "traj_manipulator_candidate_mask": traj_filter_result["traj_manipulator_candidate_mask"].astype(bool),
         "traj_manipulator_cluster_id": traj_filter_result["traj_manipulator_cluster_id"].astype(np.int16),
         "traj_manipulator_component_size": traj_filter_result["traj_manipulator_component_size"].astype(
@@ -1281,6 +1442,80 @@ def build_query_frame_sample_data(
         ),
         "query_frame_depth": query_frame_depth,
         "traj_filter_result": traj_filter_result,
+    }
+
+
+def build_v2_sample_data(
+    *,
+    prepared_bundle,
+    filter_args=None,
+    high_volatility_mask: np.ndarray | None = None,
+    save_profile_stats: dict[str, float] | None = None,
+):
+    bundle = build_query_frame_sample_data(
+        prepared_bundle=prepared_bundle,
+        filter_args=filter_args,
+        save_visibility=getattr(filter_args, "save_visibility", False),
+        high_volatility_mask=high_volatility_mask,
+        profile_stats=save_profile_stats,
+    )
+    sample_payload = bundle["sample_payload"]
+    sample_data = {
+        "traj_uvz": sample_payload["traj_uvz"],
+        "keypoints": sample_payload["keypoints"],
+        "query_frame_index": sample_payload["query_frame_index"],
+        "segment_frame_indices": sample_payload["segment_frame_indices"],
+        "dense_query_count": np.array(
+            [int(np.asarray(prepared_bundle.get("dense_keypoints", sample_payload["keypoints"])).shape[0])],
+            dtype=np.int32,
+        ),
+        "tracked_query_count": np.array(
+            [
+                int(
+                    np.asarray(
+                        prepared_bundle.get(
+                            "tracked_query_indices",
+                            np.arange(sample_payload["keypoints"].shape[0], dtype=np.int32),
+                        )
+                    ).reshape(-1).shape[0]
+                )
+            ],
+            dtype=np.int32,
+        ),
+        "traj_valid_mask": sample_payload["traj_valid_mask"],
+        "traj_depth_consistency_ratio": sample_payload["traj_depth_consistency_ratio"],
+        "traj_stable_depth_consistency_ratio": sample_payload["traj_stable_depth_consistency_ratio"],
+        "traj_high_volatility_hit": sample_payload["traj_high_volatility_hit"],
+        "traj_volatility_exposure_ratio": sample_payload["traj_volatility_exposure_ratio"],
+        "traj_compare_frame_count": sample_payload["traj_compare_frame_count"],
+        "traj_stable_compare_frame_count": sample_payload["traj_stable_compare_frame_count"],
+        "traj_mask_reason_bits": sample_payload["traj_mask_reason_bits"],
+        "traj_supervision_mask": sample_payload["traj_supervision_mask"],
+        "traj_supervision_prefix_len": sample_payload["traj_supervision_prefix_len"],
+        "traj_supervision_count": sample_payload["traj_supervision_count"],
+        "traj_wrist_seed_mask": sample_payload["traj_wrist_seed_mask"],
+        "traj_query_depth_rank": sample_payload["traj_query_depth_rank"],
+        "traj_query_depth_edge_mask": sample_payload["traj_query_depth_edge_mask"],
+        "traj_query_depth_patch_valid_ratio": sample_payload["traj_query_depth_patch_valid_ratio"],
+        "traj_query_depth_patch_std": sample_payload["traj_query_depth_patch_std"],
+        "traj_query_depth_edge_risk_mask": sample_payload["traj_query_depth_edge_risk_mask"],
+        "traj_motion_extent": sample_payload["traj_motion_extent"],
+        "traj_motion_step_median": sample_payload["traj_motion_step_median"],
+        "traj_motion_extent_all_valid": sample_payload["traj_motion_extent_all_valid"],
+        "traj_motion_step_median_all_valid": sample_payload["traj_motion_step_median_all_valid"],
+        "traj_manipulator_candidate_mask": sample_payload["traj_manipulator_candidate_mask"],
+        "traj_manipulator_cluster_id": sample_payload["traj_manipulator_cluster_id"],
+        "traj_manipulator_component_size": sample_payload["traj_manipulator_component_size"],
+        "traj_manipulator_cluster_fallback_used": sample_payload["traj_manipulator_cluster_fallback_used"],
+    }
+    if prepared_bundle.get("support_grid_size") is not None:
+        sample_data["support_grid_size"] = np.array([int(prepared_bundle["support_grid_size"])], dtype=np.int32)
+    if "visibility" in sample_payload:
+        sample_data["visibility"] = sample_payload["visibility"]
+
+    return {
+        "sample_data": sample_data,
+        "traj_filter_result": bundle["traj_filter_result"],
     }
 
 
@@ -1429,6 +1664,8 @@ def save_single_query_frame_legacy(
         "traj_query_depth_edge_risk_mask": sample_payload["traj_query_depth_edge_risk_mask"],
         "traj_motion_extent": sample_payload["traj_motion_extent"],
         "traj_motion_step_median": sample_payload["traj_motion_step_median"],
+        "traj_motion_extent_all_valid": sample_payload["traj_motion_extent_all_valid"],
+        "traj_motion_step_median_all_valid": sample_payload["traj_motion_step_median_all_valid"],
         "traj_manipulator_candidate_mask": sample_payload["traj_manipulator_candidate_mask"],
         "traj_manipulator_cluster_id": sample_payload["traj_manipulator_cluster_id"],
         "traj_manipulator_component_size": sample_payload["traj_manipulator_component_size"],
@@ -1488,65 +1725,14 @@ def save_single_query_frame_v2(
     samples_dir = os.path.join(video_output_dir, "samples")
     os.makedirs(samples_dir, exist_ok=True)
 
-    bundle = build_query_frame_sample_data(
+    built_sample = build_v2_sample_data(
         prepared_bundle=prepared_bundle,
         filter_args=filter_args,
-        save_visibility=getattr(filter_args, "save_visibility", False),
         high_volatility_mask=high_volatility_mask,
-        profile_stats=save_profile_stats,
+        save_profile_stats=save_profile_stats,
     )
-    sample_payload = bundle["sample_payload"]
-    traj_filter_result = bundle["traj_filter_result"]
-    sample_data = {
-        "traj_uvz": sample_payload["traj_uvz"],
-        "keypoints": sample_payload["keypoints"],
-        "query_frame_index": sample_payload["query_frame_index"],
-        "segment_frame_indices": sample_payload["segment_frame_indices"],
-        "dense_query_count": np.array(
-            [int(np.asarray(prepared_bundle.get("dense_keypoints", sample_payload["keypoints"])).shape[0])],
-            dtype=np.int32,
-        ),
-        "tracked_query_count": np.array(
-            [
-                int(
-                    np.asarray(
-                        prepared_bundle.get(
-                            "tracked_query_indices",
-                            np.arange(sample_payload["keypoints"].shape[0], dtype=np.int32),
-                        )
-                    ).reshape(-1).shape[0]
-                )
-            ],
-            dtype=np.int32,
-        ),
-        "traj_valid_mask": sample_payload["traj_valid_mask"],
-        "traj_depth_consistency_ratio": sample_payload["traj_depth_consistency_ratio"],
-        "traj_stable_depth_consistency_ratio": sample_payload["traj_stable_depth_consistency_ratio"],
-        "traj_high_volatility_hit": sample_payload["traj_high_volatility_hit"],
-        "traj_volatility_exposure_ratio": sample_payload["traj_volatility_exposure_ratio"],
-        "traj_compare_frame_count": sample_payload["traj_compare_frame_count"],
-        "traj_stable_compare_frame_count": sample_payload["traj_stable_compare_frame_count"],
-        "traj_mask_reason_bits": sample_payload["traj_mask_reason_bits"],
-        "traj_supervision_mask": sample_payload["traj_supervision_mask"],
-        "traj_supervision_prefix_len": sample_payload["traj_supervision_prefix_len"],
-        "traj_supervision_count": sample_payload["traj_supervision_count"],
-        "traj_wrist_seed_mask": sample_payload["traj_wrist_seed_mask"],
-        "traj_query_depth_rank": sample_payload["traj_query_depth_rank"],
-        "traj_query_depth_edge_mask": sample_payload["traj_query_depth_edge_mask"],
-        "traj_query_depth_patch_valid_ratio": sample_payload["traj_query_depth_patch_valid_ratio"],
-        "traj_query_depth_patch_std": sample_payload["traj_query_depth_patch_std"],
-        "traj_query_depth_edge_risk_mask": sample_payload["traj_query_depth_edge_risk_mask"],
-        "traj_motion_extent": sample_payload["traj_motion_extent"],
-        "traj_motion_step_median": sample_payload["traj_motion_step_median"],
-        "traj_manipulator_candidate_mask": sample_payload["traj_manipulator_candidate_mask"],
-        "traj_manipulator_cluster_id": sample_payload["traj_manipulator_cluster_id"],
-        "traj_manipulator_component_size": sample_payload["traj_manipulator_component_size"],
-        "traj_manipulator_cluster_fallback_used": sample_payload["traj_manipulator_cluster_fallback_used"],
-    }
-    if prepared_bundle.get("support_grid_size") is not None:
-        sample_data["support_grid_size"] = np.array([int(prepared_bundle["support_grid_size"])], dtype=np.int32)
-    if "visibility" in sample_payload:
-        sample_data["visibility"] = sample_payload["visibility"]
+    sample_data = built_sample["sample_data"]
+    traj_filter_result = built_sample["traj_filter_result"]
 
     sample_write_start = time.perf_counter()
     np.savez(os.path.join(samples_dir, f"{video_name}_{query_frame_idx}.npz"), **sample_data)
@@ -1800,6 +1986,24 @@ def save_structured_data(
                 "keyframes_per_sec_max": query_frame_metadata.get("keyframes_per_sec_max"),
                 "query_frame_indices_local": query_frame_metadata.get("query_frame_indices_local"),
                 "query_frame_source_indices": query_frame_metadata.get("query_frame_source_indices"),
+                "requested_query_frame_indices_local": query_frame_metadata.get(
+                    "requested_query_frame_indices_local"
+                ),
+                "requested_query_frame_source_indices": query_frame_metadata.get(
+                    "requested_query_frame_source_indices"
+                ),
+                "skipped_short_tail_query_frame_indices_local": query_frame_metadata.get(
+                    "skipped_short_tail_query_frame_indices_local"
+                ),
+                "skipped_short_tail_query_frame_source_indices": query_frame_metadata.get(
+                    "skipped_short_tail_query_frame_source_indices"
+                ),
+                "skipped_short_tail_segment_lengths": query_frame_metadata.get(
+                    "skipped_short_tail_segment_lengths"
+                ),
+                "short_tail_skip_max_segment_len": query_frame_metadata.get(
+                    "short_tail_skip_max_segment_len"
+                ),
                 "query_frame_missing_source_indices": query_frame_metadata.get(
                     "query_frame_missing_source_indices"
                 ),
@@ -1810,6 +2014,13 @@ def save_structured_data(
             save_profile_stats,
             "scene_meta_write_seconds",
             time.perf_counter() - scene_meta_write_start,
+        )
+        _cleanup_skipped_short_tail_artifacts(
+            video_name=video_name,
+            output_dir=output_dir,
+            layout=layout,
+            query_frame_metadata=query_frame_metadata,
+            profile_stats=save_profile_stats,
         )
         for query_frame_idx, prepared_bundle in prepared_bundles.items():
             query_frame_save_loop_start = time.perf_counter()
@@ -1858,6 +2069,13 @@ def save_structured_data(
         save_profile_stats,
         "prepare_bundles_seconds",
         time.perf_counter() - prepare_bundles_start,
+    )
+    _cleanup_skipped_short_tail_artifacts(
+        video_name=video_name,
+        output_dir=output_dir,
+        layout=layout,
+        query_frame_metadata=query_frame_metadata,
+        profile_stats=save_profile_stats,
     )
     high_volatility_mask = None
     if use_depth_volatility_guidance:
@@ -2204,6 +2422,25 @@ def load_scene_context(video_path, depth_path, args, model_depth_pose):
         source_frame_indices=source_frame_indices,
         video_length=video_length,
     )
+    query_frames, query_frame_metadata = _apply_short_tail_skip_to_query_frames(
+        query_frames=query_frames,
+        query_frame_metadata=query_frame_metadata,
+        source_frame_indices=source_frame_indices,
+        video_length=video_length,
+        future_len=int(args.future_len),
+    )
+    skipped_query_frames = query_frame_metadata.get("skipped_short_tail_query_frame_indices_local", []) or []
+    skipped_segment_lengths = query_frame_metadata.get("skipped_short_tail_segment_lengths", []) or []
+    if skipped_query_frames:
+        preview_items = [
+            f"{frame_idx}(len={segment_len})"
+            for frame_idx, segment_len in zip(skipped_query_frames[:5], skipped_segment_lengths[:5])
+        ]
+        suffix = " ..." if len(skipped_query_frames) > 5 else ""
+        logger.warning(
+            f"[{os.path.basename(video_path)}] skipping {len(skipped_query_frames)} short-tail query frame(s) "
+            f"with segment_len <= {SHORT_TAIL_SKIP_MAX_SEGMENT_LEN}: {preview_items}{suffix}"
+        )
     for frame_idx in query_frames:
         grid_points = _build_frame_query_points(frame_idx, dense_query_keypoints)
         if len(grid_points) > 0:
@@ -2249,7 +2486,11 @@ def _run_query_frame_core(
     video_length = int(scene_ctx["video_length"])
     frame_H = int(scene_ctx["frame_H"])
     frame_W = int(scene_ctx["frame_W"])
-    end_frame = min(int(start_frame) + int(args.future_len), video_length)
+    end_frame = _resolve_segment_end_frame(
+        int(start_frame),
+        video_length=video_length,
+        future_len=int(args.future_len),
+    )
     logger.info(
         f"Processing query frame {start_frame}: tracking {end_frame - start_frame} frames"
     )
@@ -2407,7 +2648,28 @@ def run_single_query_frame(
     _sync_device_if_needed(getattr(args, "device", None))
     process_start = time.perf_counter()
     start_frame = int(query_frame_idx)
-    end_frame = min(start_frame + int(args.future_len), int(scene_ctx["video_length"]))
+    end_frame = _resolve_segment_end_frame(
+        start_frame,
+        video_length=int(scene_ctx["video_length"]),
+        future_len=int(args.future_len),
+    )
+    segment_len = end_frame - start_frame
+    if segment_len <= SHORT_TAIL_SKIP_MAX_SEGMENT_LEN:
+        logger.warning(
+            f"Skipping query frame {start_frame}: segment_len={segment_len} "
+            f"<= {SHORT_TAIL_SKIP_MAX_SEGMENT_LEN}"
+        )
+        if profile_stats is not None:
+            process_total_seconds = time.perf_counter() - process_start
+            profile_stats["process_total_seconds"] = float(process_total_seconds)
+            profile_stats["process_other_seconds"] = float(process_total_seconds)
+        return {
+            "query_frame_idx": start_frame,
+            "query_frame_result": None,
+            "profile_stats": profile_stats or {},
+            "skipped_short_tail": True,
+            "segment_len": int(segment_len),
+        }
     with _DepthFilterRuntime(
         np.asarray(scene_ctx["depth_npy"], dtype=np.float32),
         np.asarray(scene_ctx["intrs_npy"], dtype=np.float32),
@@ -2605,6 +2867,24 @@ def save_source_ref_v2_query_results(
             "keyframes_per_sec_max": query_frame_metadata.get("keyframes_per_sec_max"),
             "query_frame_indices_local": query_frame_metadata.get("query_frame_indices_local"),
             "query_frame_source_indices": query_frame_metadata.get("query_frame_source_indices"),
+            "requested_query_frame_indices_local": query_frame_metadata.get(
+                "requested_query_frame_indices_local"
+            ),
+            "requested_query_frame_source_indices": query_frame_metadata.get(
+                "requested_query_frame_source_indices"
+            ),
+            "skipped_short_tail_query_frame_indices_local": query_frame_metadata.get(
+                "skipped_short_tail_query_frame_indices_local"
+            ),
+            "skipped_short_tail_query_frame_source_indices": query_frame_metadata.get(
+                "skipped_short_tail_query_frame_source_indices"
+            ),
+            "skipped_short_tail_segment_lengths": query_frame_metadata.get(
+                "skipped_short_tail_segment_lengths"
+            ),
+            "short_tail_skip_max_segment_len": query_frame_metadata.get(
+                "short_tail_skip_max_segment_len"
+            ),
             "query_frame_missing_source_indices": query_frame_metadata.get(
                 "query_frame_missing_source_indices"
             ),
@@ -2615,6 +2895,13 @@ def save_source_ref_v2_query_results(
         save_profile_stats,
         "scene_meta_write_seconds",
         time.perf_counter() - scene_meta_write_start,
+    )
+    _cleanup_skipped_short_tail_artifacts(
+        video_name=video_name,
+        output_dir=output_dir,
+        layout=layout,
+        query_frame_metadata=query_frame_metadata,
+        profile_stats=save_profile_stats,
     )
 
     per_query_save_seconds: dict[int, float] = {}
@@ -2658,7 +2945,14 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
     profile_stats = scene_ctx["profile_stats"]
     query_frame_results = {}
     tracking_segments = [
-        (int(frame_idx), min(int(frame_idx) + int(args.future_len), int(scene_ctx["video_length"])))
+        (
+            int(frame_idx),
+            _resolve_segment_end_frame(
+                int(frame_idx),
+                video_length=int(scene_ctx["video_length"]),
+                future_len=int(args.future_len),
+            ),
+        )
         for frame_idx in scene_ctx["query_frames"]
     ]
     logger.info(f"Tracking up to {args.future_len} frames from each query frame")
@@ -2695,13 +2989,12 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
         intrinsics = query_frame_results[first_frame]["intrinsics_segment"]
         extrinsics = query_frame_results[first_frame]["extrinsics_segment"]
     else:
-        flen = min(args.future_len, int(scene_ctx["video_length"]))
         coords = torch.empty((0, 0, 3))
         visibs = torch.empty((0, 0))
-        video = scene_ctx["video_ten"][:flen]
-        depths = torch.from_numpy(scene_ctx["depth_npy"][:flen]).float().to(args.device)
-        intrinsics = torch.from_numpy(scene_ctx["intrs_npy"][:flen]).float().to(args.device)
-        extrinsics = torch.from_numpy(scene_ctx["extrs_npy"][:flen]).float().to(args.device)
+        video = scene_ctx["video_ten"][:0]
+        depths = torch.from_numpy(scene_ctx["depth_npy"][:0]).float().to(args.device)
+        intrinsics = torch.from_numpy(scene_ctx["intrs_npy"][:0]).float().to(args.device)
+        extrinsics = torch.from_numpy(scene_ctx["extrs_npy"][:0]).float().to(args.device)
 
     logger.debug(
         f"After inference - coords shape: {coords.shape}, visibs shape: {visibs.shape}"
@@ -2747,6 +3040,12 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
         "original_filenames": list(scene_ctx["original_filenames"]),
         "source_frame_indices": np.asarray(scene_ctx["source_frame_indices"], dtype=np.int32),
         "query_frame_metadata": dict(scene_ctx["query_frame_metadata"]),
+        "skipped_query_frame_indices_local": list(
+            scene_ctx["query_frame_metadata"].get("skipped_short_tail_query_frame_indices_local", []) or []
+        ),
+        "skipped_query_frame_source_indices": list(
+            scene_ctx["query_frame_metadata"].get("skipped_short_tail_query_frame_source_indices", []) or []
+        ),
         "depth_conf": scene_ctx["depth_conf"],
         "query_frame_results": query_frame_results,
         "full_intrinsics": np.asarray(scene_ctx["intrs_npy"], dtype=np.float32),

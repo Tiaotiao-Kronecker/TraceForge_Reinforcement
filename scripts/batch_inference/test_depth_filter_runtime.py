@@ -1,5 +1,7 @@
 import unittest
 from unittest import mock
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import torch
@@ -192,6 +194,64 @@ class PrepareInputsTests(unittest.TestCase):
         )
 
         np.testing.assert_array_equal(intrinsics, intrinsics_before)
+
+
+class ShortTailSkipTests(unittest.TestCase):
+    def test_apply_short_tail_skip_to_query_frames_updates_metadata(self):
+        query_frames, metadata = infer._apply_short_tail_skip_to_query_frames(
+            query_frames=[0, 7, 8, 10],
+            query_frame_metadata={
+                "query_frame_sampling_mode": "shared_schedule",
+                "query_frame_indices_local": [0, 7, 8, 10],
+                "query_frame_source_indices": [100, 107, 108, 110],
+            },
+            source_frame_indices=np.arange(100, 116, dtype=np.int32),
+            video_length=16,
+            future_len=12,
+        )
+
+        self.assertEqual(query_frames, [0, 7])
+        self.assertEqual(metadata["requested_query_frame_indices_local"], [0, 7, 8, 10])
+        self.assertEqual(metadata["requested_query_frame_source_indices"], [100, 107, 108, 110])
+        self.assertEqual(metadata["query_frame_indices_local"], [0, 7])
+        self.assertEqual(metadata["query_frame_source_indices"], [100, 107])
+        self.assertEqual(metadata["skipped_short_tail_query_frame_indices_local"], [8, 10])
+        self.assertEqual(metadata["skipped_short_tail_query_frame_source_indices"], [108, 110])
+        self.assertEqual(metadata["skipped_short_tail_segment_lengths"], [8, 6])
+        self.assertEqual(
+            metadata["short_tail_skip_max_segment_len"],
+            infer.SHORT_TAIL_SKIP_MAX_SEGMENT_LEN,
+        )
+
+    def test_cleanup_skipped_short_tail_artifacts_removes_stale_v2_sample(self):
+        with mock.patch.object(infer, "logger"), mock.patch.object(
+            infer,
+            "_accumulate_profile_stat",
+        ) as accumulate_mock, mock.patch.object(infer, "time") as time_mock:
+            with TemporaryDirectory() as tmpdir:
+                sample_path = (
+                    Path(tmpdir)
+                    / "varied_camera_1"
+                    / "samples"
+                    / "varied_camera_1_8.npz"
+                )
+                sample_path.parent.mkdir(parents=True, exist_ok=True)
+                np.savez(sample_path, value=np.array([1], dtype=np.int32))
+
+                time_mock.perf_counter.side_effect = [1.0, 1.2]
+                removed_frames = infer._cleanup_skipped_short_tail_artifacts(
+                    video_name="varied_camera_1",
+                    output_dir=tmpdir,
+                    layout=infer.V2_LAYOUT,
+                    query_frame_metadata={
+                        "skipped_short_tail_query_frame_indices_local": [8],
+                    },
+                    profile_stats={},
+                )
+
+        self.assertEqual(removed_frames, [8])
+        self.assertFalse(sample_path.exists())
+        accumulate_mock.assert_called_once()
 
 
 if __name__ == "__main__":
