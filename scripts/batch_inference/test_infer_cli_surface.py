@@ -129,6 +129,8 @@ class InferCliSurfaceTests(unittest.TestCase):
             "traj_query_depth_edge_risk_mask": np.array([False, False]),
             "traj_motion_extent": np.array([0.5, np.nan], dtype=np.float16),
             "traj_motion_step_median": np.array([0.1, np.nan], dtype=np.float16),
+            "traj_motion_extent_all_valid": np.array([0.6, np.nan], dtype=np.float16),
+            "traj_motion_step_median_all_valid": np.array([0.2, np.nan], dtype=np.float16),
             "traj_manipulator_candidate_mask": np.array([True, False]),
             "traj_manipulator_cluster_id": np.array([0, -1], dtype=np.int16),
             "traj_manipulator_component_size": np.array([2, 0], dtype=np.uint16),

@@ -123,6 +123,28 @@ def _normalize_visibility(
     return visibility.astype(bool, copy=False)
 
 
+def is_tail_truncated_sample(
+    *,
+    num_frames: int,
+    future_len: int | None = None,
+    filter_args=None,
+) -> bool:
+    """Return whether a sample ends before the configured future window."""
+    if future_len is None and filter_args is not None:
+        future_len = getattr(filter_args, "future_len", None)
+    if future_len is None:
+        return False
+
+    try:
+        future_len = int(future_len)
+    except (TypeError, ValueError):
+        return False
+
+    if future_len <= 0:
+        return False
+    return int(num_frames) < future_len
+
+
 def _require_segment_geometry(
     *,
     raw_depths_segment: np.ndarray | None,
@@ -222,44 +244,49 @@ def _compute_query_depth_ranks(query_depth_values: np.ndarray, seed_mask: np.nda
     return ranks
 
 
-def _compute_supervised_motion_metrics(
+def _compute_motion_metrics_for_valid_masks(
     world_tracks: np.ndarray,
-    supervision_mask: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
+    valid_masks: tuple[np.ndarray, ...],
+) -> tuple[tuple[np.ndarray, np.ndarray], ...]:
     world_tracks = np.asarray(world_tracks, dtype=np.float32)
-    supervision_mask = np.asarray(supervision_mask, dtype=bool)
     if world_tracks.ndim != 3 or world_tracks.shape[-1] != 3:
         raise ValueError(f"Expected world_tracks shape (N,T,3), got {world_tracks.shape}")
-    if supervision_mask.shape != world_tracks.shape[:2]:
-        raise ValueError(
-            f"Expected supervision_mask shape {world_tracks.shape[:2]}, got {supervision_mask.shape}"
-        )
 
     num_tracks, num_frames, _ = world_tracks.shape
-    valid = np.isfinite(world_tracks).all(axis=-1) & supervision_mask
-    motion_extent = np.full(num_tracks, np.nan, dtype=np.float32)
-    motion_step_median = np.full(num_tracks, np.nan, dtype=np.float32)
+    finite_mask = np.isfinite(world_tracks).all(axis=-1)
+    normalized_masks: list[np.ndarray] = []
+    for valid_mask in valid_masks:
+        valid_mask = np.asarray(valid_mask, dtype=bool)
+        if valid_mask.shape != world_tracks.shape[:2]:
+            raise ValueError(
+                f"Expected valid_mask shape {world_tracks.shape[:2]}, got {valid_mask.shape}"
+            )
+        normalized_masks.append(finite_mask & valid_mask)
+
+    motion_extent_list = [np.full(num_tracks, np.nan, dtype=np.float32) for _ in normalized_masks]
+    motion_step_median_list = [np.full(num_tracks, np.nan, dtype=np.float32) for _ in normalized_masks]
 
     step_norm = None
-    pair_valid = None
+    pair_valid_masks: list[np.ndarray] = []
     if num_frames > 1:
         step_norm = np.linalg.norm(np.diff(world_tracks, axis=1), axis=-1)
-        pair_valid = valid[:, :-1] & valid[:, 1:]
+        pair_valid_masks = [valid_mask[:, :-1] & valid_mask[:, 1:] for valid_mask in normalized_masks]
 
     for track_idx in range(num_tracks):
-        valid_indices = np.flatnonzero(valid[track_idx])
-        if valid_indices.size >= 2:
-            pts = world_tracks[track_idx, valid_indices]
-            motion_extent[track_idx] = float(np.max(np.linalg.norm(pts - pts[0], axis=1)))
+        for mask_idx, valid_mask in enumerate(normalized_masks):
+            valid_indices = np.flatnonzero(valid_mask[track_idx])
+            if valid_indices.size >= 2:
+                pts = world_tracks[track_idx, valid_indices]
+                motion_extent_list[mask_idx][track_idx] = float(np.max(np.linalg.norm(pts - pts[0], axis=1)))
 
-        if step_norm is None or pair_valid is None:
-            continue
+            if step_norm is None:
+                continue
 
-        valid_steps = step_norm[track_idx, pair_valid[track_idx]]
-        if valid_steps.size > 0:
-            motion_step_median[track_idx] = float(np.median(valid_steps))
+            valid_steps = step_norm[track_idx, pair_valid_masks[mask_idx][track_idx]]
+            if valid_steps.size > 0:
+                motion_step_median_list[mask_idx][track_idx] = float(np.median(valid_steps))
 
-    return motion_extent, motion_step_median
+    return tuple(zip(motion_extent_list, motion_step_median_list))
 
 
 def _apply_top_motion_extent_filter(
@@ -464,11 +491,14 @@ def _apply_manipulator_aware_filter(
     min_component_size: int,
     component_keep_mode: str = "largest",
     major_component_ratio: float | None = None,
+    motion_metric_mode: str = "supervised",
     apply_near_depth_filter: bool = True,
     apply_motion_filter: bool = True,
     apply_cluster_filter: bool = True,
     profile_stats: dict[str, float] | None = None,
 ) -> tuple[
+    np.ndarray,
+    np.ndarray,
     np.ndarray,
     np.ndarray,
     np.ndarray,
@@ -517,14 +547,26 @@ def _apply_manipulator_aware_filter(
         time.perf_counter() - world_lift_start,
     )
     motion_start = time.perf_counter()
-    traj_motion_extent, traj_motion_step_median = _compute_supervised_motion_metrics(
+    (
+        (traj_motion_extent, traj_motion_step_median),
+        (traj_motion_extent_all_valid, traj_motion_step_median_all_valid),
+    ) = _compute_motion_metrics_for_valid_masks(
         world_tracks,
-        supervision_mask,
+        (
+            supervision_mask,
+            np.ones_like(supervision_mask, dtype=bool),
+        ),
     )
+    if motion_metric_mode == "supervised":
+        motion_extent_for_gate = traj_motion_extent
+    elif motion_metric_mode == "all_valid":
+        motion_extent_for_gate = traj_motion_extent_all_valid
+    else:
+        raise ValueError(f"Unsupported motion_metric_mode: {motion_metric_mode}")
     motion_mask_raw = (
         seed_mask
-        & np.isfinite(traj_motion_extent)
-        & (traj_motion_extent >= float(min_motion_extent))
+        & np.isfinite(motion_extent_for_gate)
+        & (motion_extent_for_gate >= float(min_motion_extent))
     )
     motion_mask = motion_mask_raw if apply_motion_filter else seed_mask.copy()
     _accumulate_profile_stat(
@@ -593,6 +635,8 @@ def _apply_manipulator_aware_filter(
         traj_query_depth_rank,
         traj_motion_extent,
         traj_motion_step_median,
+        traj_motion_extent_all_valid,
+        traj_motion_step_median_all_valid,
         traj_manipulator_candidate_mask,
         traj_manipulator_cluster_id,
         traj_manipulator_component_size,
@@ -1745,6 +1789,8 @@ def build_traj_filter_result(
             "traj_query_depth_rank": default_manipulator_rank.copy(),
             "traj_motion_extent": default_manipulator_rank.copy(),
             "traj_motion_step_median": default_manipulator_rank.copy(),
+            "traj_motion_extent_all_valid": default_manipulator_rank.copy(),
+            "traj_motion_step_median_all_valid": default_manipulator_rank.copy(),
             "traj_manipulator_candidate_mask": default_manipulator_mask.copy(),
             "traj_manipulator_cluster_id": default_cluster_id.copy(),
             "traj_manipulator_component_size": default_component_size.copy(),
@@ -1772,7 +1818,9 @@ def build_traj_filter_result(
 
     base_geometry_start = time.perf_counter()
     visibility = _normalize_visibility(visibs, num_tracks=num_tracks, num_frames=num_frames)
-    visibs_for_filter = visibility if config["use_visibility"] else None
+    tail_truncated_sample = is_tail_truncated_sample(num_frames=num_frames, filter_args=filter_args)
+    visibs_for_filter = visibility if (config["use_visibility"] and not tail_truncated_sample) else None
+    visibs_for_temporal = None if tail_truncated_sample else visibility
 
     base_geometry = compute_traj_base_geometry(
         traj,
@@ -1898,7 +1946,7 @@ def build_traj_filter_result(
         temporal_start = time.perf_counter()
         temporal_result = evaluate_temporal_depth_consistency(
             traj,
-            visibs=visibility,
+            visibs=visibs_for_temporal,
             raw_depths_segment=raw_depths_segment,
             intrinsics_segment=intrinsics_segment,
             extrinsics_segment=extrinsics_segment,
@@ -1935,8 +1983,8 @@ def build_traj_filter_result(
             np.asarray(temporal_result["stable_frames_sufficient"]).astype(bool, copy=False)
             & (~np.asarray(temporal_result["stable_pass"]).astype(bool, copy=False))
         )
-    elif visibility is not None:
-        supervision_mask &= visibility
+    elif visibs_for_temporal is not None:
+        supervision_mask &= visibs_for_temporal
 
     supervision_prefix_len = _compute_true_prefix_lengths(supervision_mask).astype(np.uint16)
     supervision_count = supervision_mask.sum(axis=1).astype(np.uint16)
@@ -1947,6 +1995,8 @@ def build_traj_filter_result(
     traj_query_depth_rank = default_manipulator_rank.copy()
     traj_motion_extent = default_manipulator_rank.copy()
     traj_motion_step_median = default_manipulator_rank.copy()
+    traj_motion_extent_all_valid = default_manipulator_rank.copy()
+    traj_motion_step_median_all_valid = default_manipulator_rank.copy()
     traj_manipulator_candidate_mask = default_manipulator_mask.copy()
     traj_manipulator_cluster_id = default_cluster_id.copy()
     traj_manipulator_component_size = default_component_size.copy()
@@ -1990,6 +2040,7 @@ def build_traj_filter_result(
                 "image_width": image_width,
                 "min_depth": config["min_depth"],
                 "max_depth": config["max_depth"],
+                "motion_metric_mode": "supervised",
                 "profile_stats": profile_stats,
             }
             if profile == TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR:
@@ -2034,6 +2085,8 @@ def build_traj_filter_result(
                 traj_query_depth_rank,
                 traj_motion_extent,
                 traj_motion_step_median,
+                traj_motion_extent_all_valid,
+                traj_motion_step_median_all_valid,
                 traj_manipulator_candidate_mask,
                 traj_manipulator_cluster_id,
                 traj_manipulator_component_size,
@@ -2132,6 +2185,8 @@ def build_traj_filter_result(
                 traj_query_depth_rank,
                 traj_motion_extent,
                 traj_motion_step_median,
+                traj_motion_extent_all_valid,
+                traj_motion_step_median_all_valid,
                 traj_manipulator_candidate_mask,
                 traj_manipulator_cluster_id,
                 traj_manipulator_component_size,
@@ -2156,6 +2211,7 @@ def build_traj_filter_result(
                 cluster_radius_min_px=config["wrist_manipulator_cluster_radius_min_px"],
                 min_component_ratio=config["wrist_manipulator_min_component_ratio"],
                 min_component_size=config["wrist_manipulator_min_component_size"],
+                motion_metric_mode="all_valid",
                 apply_near_depth_filter=apply_near_depth_filter,
                 apply_motion_filter=apply_motion_filter,
                 apply_cluster_filter=apply_cluster_filter,
@@ -2197,7 +2253,7 @@ def build_traj_filter_result(
                 top95_start = time.perf_counter()
                 final_mask = _apply_top_motion_extent_filter(
                     seed_mask=wrist_seed_mask,
-                    motion_extent=traj_motion_extent,
+                    motion_extent=traj_motion_extent_all_valid,
                     keep_ratio=config["wrist_manipulator_top95_keep_ratio"],
                 )
                 filter_result_top95_seconds = time.perf_counter() - top95_start
@@ -2211,7 +2267,7 @@ def build_traj_filter_result(
                 top95_start = time.perf_counter()
                 final_mask = _apply_top_motion_extent_filter(
                     seed_mask=traj_pre_top95_mask,
-                    motion_extent=traj_motion_extent,
+                    motion_extent=traj_motion_extent_all_valid,
                     keep_ratio=config["wrist_manipulator_top95_keep_ratio"],
                 )
                 filter_result_top95_seconds = time.perf_counter() - top95_start
@@ -2240,6 +2296,8 @@ def build_traj_filter_result(
         "traj_query_depth_rank": traj_query_depth_rank.astype(np.float32),
         "traj_motion_extent": traj_motion_extent.astype(np.float32),
         "traj_motion_step_median": traj_motion_step_median.astype(np.float32),
+        "traj_motion_extent_all_valid": traj_motion_extent_all_valid.astype(np.float32),
+        "traj_motion_step_median_all_valid": traj_motion_step_median_all_valid.astype(np.float32),
         "traj_manipulator_candidate_mask": traj_manipulator_candidate_mask.astype(bool),
         "traj_manipulator_cluster_id": traj_manipulator_cluster_id.astype(np.int16),
         "traj_manipulator_component_size": traj_manipulator_component_size.astype(np.uint16),

@@ -417,6 +417,16 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 if "traj_motion_step_median" in data
                 else np.full(num_tracks, np.nan, dtype=np.float16)
             )
+            traj_motion_extent_all_valid = (
+                data["traj_motion_extent_all_valid"].astype(np.float16)
+                if "traj_motion_extent_all_valid" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            )
+            traj_motion_step_median_all_valid = (
+                data["traj_motion_step_median_all_valid"].astype(np.float16)
+                if "traj_motion_step_median_all_valid" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            )
             traj_manipulator_candidate_mask = (
                 np.asarray(data["traj_manipulator_candidate_mask"]).astype(bool, copy=False)
                 if "traj_manipulator_candidate_mask" in data
@@ -467,6 +477,8 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 "traj_query_depth_edge_risk_mask": traj_query_depth_edge_risk_mask,
                 "traj_motion_extent": traj_motion_extent,
                 "traj_motion_step_median": traj_motion_step_median,
+                "traj_motion_extent_all_valid": traj_motion_extent_all_valid,
+                "traj_motion_step_median_all_valid": traj_motion_step_median_all_valid,
                 "traj_manipulator_candidate_mask": traj_manipulator_candidate_mask,
                 "traj_manipulator_cluster_id": traj_manipulator_cluster_id,
                 "traj_manipulator_component_size": traj_manipulator_component_size,
@@ -614,6 +626,16 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
             "traj_motion_step_median": (
                 data["traj_motion_step_median"].astype(np.float16)
                 if "traj_motion_step_median" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            ),
+            "traj_motion_extent_all_valid": (
+                data["traj_motion_extent_all_valid"].astype(np.float16)
+                if "traj_motion_extent_all_valid" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            ),
+            "traj_motion_step_median_all_valid": (
+                data["traj_motion_step_median_all_valid"].astype(np.float16)
+                if "traj_motion_step_median_all_valid" in data
                 else np.full(num_tracks, np.nan, dtype=np.float16)
             ),
             "traj_manipulator_candidate_mask": (
