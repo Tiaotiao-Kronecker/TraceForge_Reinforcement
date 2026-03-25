@@ -89,6 +89,13 @@ the cap applied after that stride. The maintained batch entry is dynamic-only
 in multi-GPU mode and no longer exposes `--frame_drop_rate`, `--horizon`, or
 `--max_frames_per_video`; for a fixed per-second keyframe count, set
 `--keyframes_per_sec_min` and `--keyframes_per_sec_max` to the same value.
+Source frame `0` is always forced into the shared schedule when it survives
+stride/cap filtering, so the first second may contain one extra query frame.
+If a query frame would have `<= 8` remaining frames to the end of the loaded
+video segment, it is still dropped before schedule sampling. For the retained
+tail samples that still end before `future_len`, the maintained `v2` writer
+pads the time axis to `future_len` with `inf` and marks the valid prefix via
+`valid_steps` / `segment_frame_indices`.
 Its maintained defaults already cover `camera_names=varied_camera_1,2,3`,
 `depth_pose_method=external`, `external_geom_name=trajectory_valid.h5`,
 `fps=1`, `max_num_frames=512`, `future_len=32`, `num_iters=5`, `grid_size=80`,
@@ -194,7 +201,7 @@ contains a shared keyframe manifest:
 ```text
 <episode_dir>/trajectory/
 ├── _shared/
-│   └── query_frame_schedule_v1_<hash>.json
+│   └── query_frame_schedule_v3_<hash>.json
 ├── varied_camera_1/
 ├── varied_camera_2/
 └── varied_camera_3/
@@ -214,6 +221,7 @@ Important `v2` sample fields:
 - `keypoints`: query-frame grid keypoints
 - `query_frame_index`
 - `segment_frame_indices`
+- `valid_steps`
 - `traj_valid_mask`
 - `traj_supervision_mask`
 - optional `visibility`

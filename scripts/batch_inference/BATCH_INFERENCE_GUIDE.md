@@ -60,7 +60,7 @@ python scripts/batch_inference/infer.py \
   --external_geom_npz <trajectory_valid.h5> \
   --depth_pose_method external \
   --camera_name varied_camera_1 \
-  --query_frame_schedule_path <episode_output>/_shared/query_frame_schedule_v1_<hash>.json \
+  --query_frame_schedule_path <episode_output>/_shared/query_frame_schedule_v3_<hash>.json \
   --fps 1 \
   --max_num_frames 512
 ```
@@ -100,12 +100,16 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
 补充说明：
 
 - `batch_infer_press_one_button_demo.py` 会为每个 episode 生成一份共享 schedule：
-  `<episode_output>/_shared/query_frame_schedule_v1_<hash>.json`
+  `<episode_output>/_shared/query_frame_schedule_v3_<hash>.json`
 - 三个相机都会消费同一份 schedule，因此 query frame 的 raw 帧序号天然对齐
 - schedule 里存的是 raw source frame index，`infer.py` 运行时再映射到当前
   `--fps` / `--max_num_frames` 对应的 local query frame
+- query frame 如果到加载后视频末尾的剩余帧数（含自身）`<= 8`，仍会在共享 schedule 采样前丢弃
+- 对保留下来的尾段 sample，若实际 segment 长度短于 `future_len`，`v2` sample 会在时间维用 `inf` pad 到 `future_len`
 - 每秒关键帧数量由 `--keyframes_per_sec_min/max` 控制；当两者相等时，每秒恰好采样固定数量，
   并保证同一秒内无重复
+- 如果 source frame `0` 通过了 stride/cap 过滤，它会被强制写入 shared schedule
+- 因此第一秒的 query frame 数可能比名义上的 `keyframes_per_sec_min/max` 多 `1`
 - 真实的时间语义来自 `trajectory_valid.h5` 根属性 `fps`
 - `--fps` 只是加载 stride，不是 episode 的真实帧率
 - `--max_num_frames` 是 stride 之后的总帧数上限
@@ -145,7 +149,7 @@ button/sim episode 默认就地写回：
 <episode_dir>/
 └── trajectory/
     ├── _shared/
-    │   └── query_frame_schedule_v1_<hash>.json
+    │   └── query_frame_schedule_v3_<hash>.json
     ├── varied_camera_1/
     │   ├── scene_meta.json
     │   └── samples/

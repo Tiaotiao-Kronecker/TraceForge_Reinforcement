@@ -155,7 +155,12 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 - The true episode frame rate comes from `trajectory_valid.h5` root attr `fps`
 - `--fps` is only the load stride; default `1`
 - `--max_num_frames` is the post-stride frame cap; default `512`
-- Shared schedule manifests are written to `<episode_output>/_shared/query_frame_schedule_v1_<hash>.json`
+- Source frame `0` is always forced into the shared query-frame schedule when it survives stride/cap/tail filtering
+- This means the first second may contain one extra query frame beyond the nominal `keyframes_per_sec_min~max` sample count
+- Query frames with `<= 8` remaining frames to the end of the loaded video segment (inclusive of the query frame itself) are discarded before schedule sampling
+- `infer.py` still applies the same short-tail filter again when consuming either a shared schedule or the uniform-grid fallback, so stale manifests cannot reintroduce these frames
+- For retained tail samples with `segment_len < future_len`, `v2` output pads the saved time axis to `future_len` with `inf` and marks the valid prefix via `valid_steps`
+- Shared schedule manifests are written to `<episode_output>/_shared/query_frame_schedule_v3_<hash>.json`
 - `infer.py` consumes raw source-frame indices from the manifest, then maps them to the current local frame indices after stride/cap filtering
 
 **Multi-GPU Processing**:
@@ -232,7 +237,7 @@ For button/sim episode outputs written in-place:
 ```
 <episode_dir>/trajectory/
 ├── _shared/
-│   └── query_frame_schedule_v1_<hash>.json
+│   └── query_frame_schedule_v3_<hash>.json
 ├── varied_camera_1/
 ├── varied_camera_2/
 └── varied_camera_3/
@@ -247,10 +252,11 @@ When local scene caches are needed, pass `--scene_storage_mode cache`; that adds
 ```
 
 `v2` sample NPZ contents:
-- `traj_uvz`: query-frame camera coordinates in `(u, v, depth)` format, shape `(N_tracks, T_segment, 3)`
+- `traj_uvz`: query-frame camera coordinates in `(u, v, depth)` format, shape `(N_tracks, future_len, 3)` after tail padding
 - `keypoints`: query-frame grid keypoints, shape `(N_tracks, 2)`
 - `query_frame_index`: scalar query frame index
-- `segment_frame_indices`: real video frame indices aligned to the sample time axis
+- `segment_frame_indices`: real video frame indices for the valid, non-padded prefix
+- `valid_steps`: prefix-valid step mask over the saved time axis
 - `traj_valid_mask`: per-trajectory validity mask
 - `visibility`: optional per-trajectory visibility array when `--save_visibility` is enabled
 
