@@ -2,6 +2,9 @@
 
 本文档只覆盖当前维护的 external-only TraceForge 推理流程。
 
+当前维护态的轨迹过滤逻辑说明见
+[`docs/maintained_traj_filter_logic.md`](../../docs/maintained_traj_filter_logic.md)。
+
 ## 前提
 
 - 在仓库根目录运行

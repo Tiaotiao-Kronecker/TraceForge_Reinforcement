@@ -12,6 +12,10 @@ Current maintained pipeline:
 - trajectory filtering with camera-aware profiles
 - visualization and verification on saved artifacts
 
+For the current maintained trajectory-filter behavior, including the default
+`external` path and the wrist-like default `wrist_manipulator_top95` path, see
+[docs/maintained_traj_filter_logic.md](docs/maintained_traj_filter_logic.md).
+
 The repository still contains a few compatibility paths, notably
 `--output_layout legacy`. BridgeV2/VGGT-specific inference entrypoints have been
 retired from the maintained workflow.

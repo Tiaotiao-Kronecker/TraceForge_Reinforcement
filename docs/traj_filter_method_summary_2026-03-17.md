@@ -1,5 +1,9 @@
 # 轨迹过滤方法总结（2026-03-17）
 
+> 维护态默认的轨迹过滤逻辑请优先参考
+> [maintained_traj_filter_logic.md](maintained_traj_filter_logic.md)。
+> 本文保留为 2026-03-17 的阶段性分析记录。
+
 ## 1. 背景与目标
 
 这轮修改的目标不是再新增一个独立过滤器，而是在现有 `filter_level` 之上补齐一层 `camera-aware traj_filter_profile`，让不同相机视角共享同一套基础过滤框架，同时允许 wrist 相机使用更贴近机械臂运动规律的约束。
