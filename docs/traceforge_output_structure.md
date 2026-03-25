@@ -62,25 +62,27 @@
 
 | 键 | Shape | 说明 |
 |----|-------|------|
-| `traj_uvz` | `(N, T_seg, 3)` | query 相机坐标系下的 `(u, v, depth)` 轨迹 |
+| `traj_uvz` | `(N, T_save, 3)` | query 相机坐标系下的 `(u, v, depth)` 轨迹 |
 | `keypoints` | `(N, 2)` | query frame 上的 grid keypoints |
 | `query_frame_index` | `(1,)` | query frame 索引 |
 | `segment_frame_indices` | `(T_seg,)` | sample 时间轴对应的真实帧索引 |
 | `traj_valid_mask` | `(N,)` | 最终轨迹过滤结果 |
-| `traj_supervision_mask` | `(N, T_seg)` | 时域监督掩码 |
+| `traj_supervision_mask` | `(N, T_save)` | 时域监督掩码 |
+| `valid_steps` | `(T_save,)` | 前缀有效步掩码；尾部 pad 为 `False` |
 | `traj_supervision_prefix_len` | `(N,)` | 连续前缀长度 |
 | `traj_supervision_count` | `(N,)` | 支撑帧计数 |
 | `traj_mask_reason_bits` | `(N,)` | 过滤原因 bitmask |
 | `traj_query_depth_rank` | `(N,)` | manipulator-aware 深度排序调试量 |
 | `traj_motion_extent` | `(N,)` | manipulator-aware 世界位移调试量 |
 | `traj_manipulator_candidate_mask` | `(N,)` | manipulator 候选轨迹 |
-| `visibility` | `(N, T_seg)` 可选 | 仅在 `--save_visibility` 时保存 |
+| `visibility` | `(N, T_save)` 可选 | 仅在 `--save_visibility` 时保存 |
 
 说明：
 
 - `N = grid_size × grid_size`
-- `T_seg` 是该 query frame 实际跟踪长度，不再强制 retarget 到固定步数
-- 当前 sample 主时间轴与 `segment_frame_indices` 对齐
+- `T_seg` 是该 query frame 实际跟踪长度
+- `T_save = future_len`；若 `T_seg < future_len`，尾部会用 `inf` pad 到固定长度
+- `segment_frame_indices` 只记录真实存在的帧索引，`valid_steps` 记录 pad 前缀
 
 ## 4. `legacy` 布局
 
@@ -103,6 +105,7 @@
 
 - 主轨迹字段名是 `traj`
 - 会按 `future_len` padding，并配套 `valid_steps`
+- `v2` 也会按 `future_len` padding，但 `segment_frame_indices` 只覆盖真实帧
 - 查询帧 RGB / depth 会作为独立文件保存
 
 ## 5. 坐标和时域约定

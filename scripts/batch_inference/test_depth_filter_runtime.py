@@ -2,6 +2,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -252,6 +253,159 @@ class ShortTailSkipTests(unittest.TestCase):
         self.assertEqual(removed_frames, [8])
         self.assertFalse(sample_path.exists())
         accumulate_mock.assert_called_once()
+
+
+class V2PaddingTests(unittest.TestCase):
+    def test_pad_v2_sample_data_extends_tail_to_future_len_with_inf_and_false_steps(self):
+        sample_data = {
+            "traj_uvz": np.array(
+                [
+                    [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]],
+                    [[10.0, 11.0, 12.0], [13.0, 14.0, 15.0], [16.0, 17.0, 18.0]],
+                ],
+                dtype=np.float32,
+            ),
+            "traj_supervision_mask": np.array(
+                [
+                    [True, True, False],
+                    [True, False, False],
+                ],
+                dtype=bool,
+            ),
+            "visibility": np.array(
+                [
+                    [1.0, 1.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                ],
+                dtype=np.float16,
+            ),
+        }
+
+        padded = infer._pad_v2_sample_data_to_future_len(
+            sample_data=sample_data,
+            future_len=5,
+        )
+
+        self.assertEqual(padded["traj_uvz"].shape, (2, 5, 3))
+        self.assertEqual(padded["traj_supervision_mask"].shape, (2, 5))
+        self.assertEqual(padded["visibility"].shape, (2, 5))
+        np.testing.assert_array_equal(
+            padded["valid_steps"],
+            np.array([True, True, True, False, False]),
+        )
+        self.assertTrue(np.isinf(padded["traj_uvz"][:, 3:]).all())
+        np.testing.assert_array_equal(
+            padded["traj_supervision_mask"][:, 3:],
+            np.zeros((2, 2), dtype=bool),
+        )
+        np.testing.assert_array_equal(
+            padded["visibility"][:, 3:],
+            np.zeros((2, 2), dtype=np.float16),
+        )
+
+    def test_build_v2_sample_data_pads_tail_segment_and_preserves_real_segment_indices(self):
+        prepared_bundle = {
+            "traj_uvz": np.array([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]], dtype=np.float32),
+            "traj_2d": np.array([[[1.0, 2.0], [4.0, 5.0]]], dtype=np.float32),
+            "keypoints": np.array([[10.0, 10.0]], dtype=np.float32),
+            "dense_keypoints": np.array([[10.0, 10.0]], dtype=np.float32),
+            "tracked_query_indices": np.array([0], dtype=np.int32),
+            "prefilter_result": None,
+            "visibs": np.array([[1.0], [1.0]], dtype=np.float32),
+            "query_frame_idx": 7,
+            "query_frame_depth": np.ones((2, 2), dtype=np.float32),
+            "raw_depths_segment": np.ones((2, 2, 2), dtype=np.float32),
+            "intrinsics_segment": np.repeat(np.eye(3, dtype=np.float32)[None], 2, axis=0),
+            "extrinsics_segment": np.repeat(np.eye(4, dtype=np.float32)[None], 2, axis=0),
+            "temporal_compare_context": None,
+            "support_grid_size": None,
+            "query_frame_img": None,
+        }
+        filter_result = {
+            "traj_valid_mask": np.array([True]),
+            "traj_depth_consistency_ratio": np.array([1.0], dtype=np.float32),
+            "traj_stable_depth_consistency_ratio": np.array([1.0], dtype=np.float32),
+            "traj_high_volatility_hit": np.array([False]),
+            "traj_volatility_exposure_ratio": np.array([0.0], dtype=np.float32),
+            "traj_compare_frame_count": np.array([2], dtype=np.uint16),
+            "traj_stable_compare_frame_count": np.array([2], dtype=np.uint16),
+            "traj_mask_reason_bits": np.array([0], dtype=np.uint8),
+            "traj_supervision_mask": np.array([[True, False]], dtype=bool),
+            "traj_supervision_prefix_len": np.array([1], dtype=np.uint16),
+            "traj_supervision_count": np.array([1], dtype=np.uint16),
+            "traj_wrist_seed_mask": np.array([True]),
+            "traj_query_depth_rank": np.array([0.1], dtype=np.float32),
+            "traj_query_depth_edge_mask": np.array([False]),
+            "traj_query_depth_patch_valid_ratio": np.array([1.0], dtype=np.float32),
+            "traj_query_depth_patch_std": np.array([0.0], dtype=np.float32),
+            "traj_query_depth_edge_risk_mask": np.array([False]),
+            "traj_motion_extent": np.array([0.5], dtype=np.float32),
+            "traj_motion_step_median": np.array([0.2], dtype=np.float32),
+            "traj_motion_extent_all_valid": np.array([0.5], dtype=np.float32),
+            "traj_motion_step_median_all_valid": np.array([0.2], dtype=np.float32),
+            "traj_manipulator_candidate_mask": np.array([True]),
+            "traj_manipulator_cluster_id": np.array([0], dtype=np.int16),
+            "traj_manipulator_component_size": np.array([1], dtype=np.uint16),
+            "traj_manipulator_cluster_fallback_used": np.asarray(False, dtype=bool),
+        }
+
+        with mock.patch.object(
+            infer,
+            "build_query_frame_sample_data",
+            return_value={
+                "sample_payload": {
+                    "traj_uvz": prepared_bundle["traj_uvz"],
+                    "keypoints": prepared_bundle["keypoints"],
+                    "query_frame_index": np.array([7], dtype=np.int32),
+                    "segment_frame_indices": np.array([7, 8], dtype=np.int32),
+                    "traj_valid_mask": filter_result["traj_valid_mask"],
+                    "traj_depth_consistency_ratio": filter_result["traj_depth_consistency_ratio"],
+                    "traj_stable_depth_consistency_ratio": filter_result["traj_stable_depth_consistency_ratio"],
+                    "traj_high_volatility_hit": filter_result["traj_high_volatility_hit"],
+                    "traj_volatility_exposure_ratio": filter_result["traj_volatility_exposure_ratio"],
+                    "traj_compare_frame_count": filter_result["traj_compare_frame_count"],
+                    "traj_stable_compare_frame_count": filter_result["traj_stable_compare_frame_count"],
+                    "traj_mask_reason_bits": filter_result["traj_mask_reason_bits"],
+                    "traj_supervision_mask": filter_result["traj_supervision_mask"],
+                    "traj_supervision_prefix_len": filter_result["traj_supervision_prefix_len"],
+                    "traj_supervision_count": filter_result["traj_supervision_count"],
+                    "traj_wrist_seed_mask": filter_result["traj_wrist_seed_mask"],
+                    "traj_query_depth_rank": filter_result["traj_query_depth_rank"],
+                    "traj_query_depth_edge_mask": filter_result["traj_query_depth_edge_mask"],
+                    "traj_query_depth_patch_valid_ratio": filter_result["traj_query_depth_patch_valid_ratio"],
+                    "traj_query_depth_patch_std": filter_result["traj_query_depth_patch_std"],
+                    "traj_query_depth_edge_risk_mask": filter_result["traj_query_depth_edge_risk_mask"],
+                    "traj_motion_extent": filter_result["traj_motion_extent"],
+                    "traj_motion_step_median": filter_result["traj_motion_step_median"],
+                    "traj_motion_extent_all_valid": filter_result["traj_motion_extent_all_valid"],
+                    "traj_motion_step_median_all_valid": filter_result["traj_motion_step_median_all_valid"],
+                    "traj_manipulator_candidate_mask": filter_result["traj_manipulator_candidate_mask"],
+                    "traj_manipulator_cluster_id": filter_result["traj_manipulator_cluster_id"],
+                    "traj_manipulator_component_size": filter_result["traj_manipulator_component_size"],
+                    "traj_manipulator_cluster_fallback_used": filter_result["traj_manipulator_cluster_fallback_used"],
+                },
+                "traj_filter_result": filter_result,
+            },
+        ):
+            built = infer.build_v2_sample_data(
+                prepared_bundle=prepared_bundle,
+                filter_args=SimpleNamespace(future_len=4, save_visibility=False),
+                high_volatility_mask=None,
+                save_profile_stats=None,
+            )
+
+        sample_data = built["sample_data"]
+        self.assertEqual(sample_data["traj_uvz"].shape, (1, 4, 3))
+        np.testing.assert_array_equal(sample_data["segment_frame_indices"], np.array([7, 8], dtype=np.int32))
+        np.testing.assert_array_equal(
+            sample_data["valid_steps"],
+            np.array([True, True, False, False]),
+        )
+        self.assertTrue(np.isinf(sample_data["traj_uvz"][:, 2:]).all())
+        np.testing.assert_array_equal(
+            sample_data["traj_supervision_mask"],
+            np.array([[True, False, False, False]], dtype=bool),
+        )
 
 
 if __name__ == "__main__":

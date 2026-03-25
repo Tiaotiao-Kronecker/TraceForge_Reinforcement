@@ -447,6 +447,12 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 if "traj_manipulator_cluster_fallback_used" in data
                 else False
             )
+            valid_steps = (
+                np.asarray(data["valid_steps"]).astype(bool, copy=False)
+                if "valid_steps" in data
+                else infer_sample_valid_steps_from_traj(traj_uvz)
+            )
+            frame_aligned = is_prefix_valid_steps(valid_steps)
             return {
                 "layout": V2_LAYOUT,
                 "traj_uvz": traj_uvz,
@@ -483,7 +489,8 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 "traj_manipulator_cluster_id": traj_manipulator_cluster_id,
                 "traj_manipulator_component_size": traj_manipulator_component_size,
                 "traj_manipulator_cluster_fallback_used": traj_manipulator_cluster_fallback_used,
-                "frame_aligned": True,
+                "valid_steps": valid_steps,
+                "frame_aligned": frame_aligned,
             }
 
         traj_uvz = data["traj"].astype(np.float32)

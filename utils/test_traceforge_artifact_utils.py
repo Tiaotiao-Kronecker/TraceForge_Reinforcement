@@ -201,6 +201,32 @@ class BuildSampleVisualizationViewTests(unittest.TestCase):
 
 
 class NormalizeSampleDataTests(unittest.TestCase):
+    def test_reads_valid_steps_from_padded_v2_sample(self):
+        traj_uvz = np.array(
+            [
+                [[1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [np.inf, np.inf, np.inf], [np.inf, np.inf, np.inf]],
+            ],
+            dtype=np.float32,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sample_path = Path(tmpdir) / "sample.npz"
+            np.savez(
+                sample_path,
+                traj_uvz=traj_uvz,
+                keypoints=np.array([[1.0, 1.0]], dtype=np.float32),
+                query_frame_index=np.array([7], dtype=np.int32),
+                segment_frame_indices=np.array([7, 8], dtype=np.int32),
+                valid_steps=np.array([True, True, False, False]),
+            )
+
+            sample = normalize_sample_data(sample_path)
+
+        np.testing.assert_array_equal(
+            sample["valid_steps"],
+            np.array([True, True, False, False]),
+        )
+        self.assertTrue(sample["frame_aligned"])
+
     def test_reads_all_valid_motion_debug_fields_from_v2_sample(self):
         traj_uvz = np.array([[[1.0, 1.0, 1.0]]], dtype=np.float32)
         with tempfile.TemporaryDirectory() as tmpdir:

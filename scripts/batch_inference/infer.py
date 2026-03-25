@@ -1460,6 +1460,7 @@ def build_v2_sample_data(
         profile_stats=save_profile_stats,
     )
     sample_payload = bundle["sample_payload"]
+    future_len = getattr(filter_args, "future_len", None)
     sample_data = {
         "traj_uvz": sample_payload["traj_uvz"],
         "keypoints": sample_payload["keypoints"],
@@ -1512,11 +1513,76 @@ def build_v2_sample_data(
         sample_data["support_grid_size"] = np.array([int(prepared_bundle["support_grid_size"])], dtype=np.int32)
     if "visibility" in sample_payload:
         sample_data["visibility"] = sample_payload["visibility"]
+    sample_data = _pad_v2_sample_data_to_future_len(sample_data=sample_data, future_len=future_len)
 
     return {
         "sample_data": sample_data,
         "traj_filter_result": bundle["traj_filter_result"],
     }
+
+
+def _pad_v2_sample_data_to_future_len(
+    *,
+    sample_data: dict[str, np.ndarray],
+    future_len: int | None,
+) -> dict[str, np.ndarray]:
+    padded = dict(sample_data)
+    traj_uvz = np.asarray(padded["traj_uvz"], dtype=np.float32)
+    current_len = int(traj_uvz.shape[1])
+
+    if future_len is None:
+        valid_steps = np.ones(current_len, dtype=bool)
+        padded["valid_steps"] = valid_steps
+        return padded
+
+    future_len = int(future_len)
+    if future_len <= 0:
+        valid_steps = np.ones(current_len, dtype=bool)
+        padded["valid_steps"] = valid_steps
+        return padded
+
+    if current_len > future_len:
+        raise ValueError(
+            f"Expected traj_uvz time dimension <= future_len, got {current_len} > {future_len}"
+        )
+
+    valid_steps = np.zeros(future_len, dtype=bool)
+    valid_steps[:current_len] = True
+    if current_len == future_len:
+        padded["valid_steps"] = valid_steps
+        return padded
+
+    pad_len = future_len - current_len
+    padded["traj_uvz"] = np.concatenate(
+        [
+            traj_uvz,
+            np.full((traj_uvz.shape[0], pad_len, traj_uvz.shape[2]), np.inf, dtype=np.float32),
+        ],
+        axis=1,
+    )
+
+    traj_supervision_mask = np.asarray(padded["traj_supervision_mask"], dtype=bool)
+    padded["traj_supervision_mask"] = np.concatenate(
+        [
+            traj_supervision_mask,
+            np.zeros((traj_supervision_mask.shape[0], pad_len), dtype=bool),
+        ],
+        axis=1,
+    )
+
+    visibility = padded.get("visibility")
+    if visibility is not None:
+        visibility = np.asarray(visibility)
+        padded["visibility"] = np.concatenate(
+            [
+                visibility,
+                np.zeros((visibility.shape[0], pad_len), dtype=visibility.dtype),
+            ],
+            axis=1,
+        )
+
+    padded["valid_steps"] = valid_steps
+    return padded
 
 
 def _prepare_query_frame_sample_bundles(
