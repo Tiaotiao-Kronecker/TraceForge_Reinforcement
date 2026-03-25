@@ -86,6 +86,13 @@ query 帧上的每个 keypoint 都会先做一次局部深度质量检查：
 - `traj_supervision_prefix_len`
 - `traj_supervision_count`
 
+尾段 sample 说明：
+
+- 当 sample 的 `segment_len < future_len` 时，这个 sample 会被视为尾段截断 sample
+- 对尾段 sample，`visibility` 只保留为诊断信号，不再作为 `base_mask` 或 temporal compare 的硬门槛
+- 这不是对“轨迹长度”放宽要求；真正决定保留与否的仍然是几何、query depth 和深度重投影一致性
+- 正常长度 sample 保持原有行为不变
+
 ## 4. 六个 profile 的差异
 
 ### 4.1 `external`
