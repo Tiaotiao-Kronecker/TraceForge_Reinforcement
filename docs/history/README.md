@@ -26,6 +26,8 @@
 - [process_num_iters_sweep_2026-03-21.md](process_num_iters_sweep_2026-03-21.md)
 - [processing_speed_optimization_summary_2026-03-21.md](processing_speed_optimization_summary_2026-03-21.md)
 - [press_one_button_demo_v5_camera3_tail_empty_root_cause_2026-03-24.md](press_one_button_demo_v5_camera3_tail_empty_root_cause_2026-03-24.md)
+- [pick_place_wrist_pick_place_history_2026-03-26.md](pick_place_wrist_pick_place_history_2026-03-26.md)
+- [drift_patch_classification_analysis_2026-03-28.md](drift_patch_classification_analysis_2026-03-28.md)
 
 ## 当前保留的本地对比产物
 
@@ -42,6 +44,10 @@
 - `data_tmp/history_outputs/outputs_droid_fixed_h5_w2c_case_2026-03-12`
 - `data_tmp/history_outputs/outputs_droid_subset_fullparams_2026-03-12`
 - `data_tmp/depth_volatility_benchmarks/20260319_external_wrist_keep`
+- `data_tmp/mcap_v1_wrist_pick_place_10cases_20260325`
+- `data_tmp/mcap_v1_wrist_pick_place_10cases_20260325_visualization`
+- `data_tmp/mcap_v1_wrist_pick_place_10cases_20260326_rerun_gpu`
+- `data_tmp/mcap_v1_wrist_pick_place_10cases_20260326_rerun_gpu_visualization`
 
 ## 根目录遗留项说明
 
