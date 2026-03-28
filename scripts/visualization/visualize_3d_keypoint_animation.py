@@ -32,8 +32,13 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from utils.traceforge_artifact_utils import (
     LEGACY_LAYOUT,
+    RENDER_MODE_FINITE,
+    RENDER_MODE_HYBRID,
+    RENDER_MODE_SUPERVISION,
+    RENDER_MODES,
     SceneReader,
     build_pointcloud_from_frame,
+    build_sample_visualization_view,
     ensure_uint8_video,
     list_sample_query_frames,
     normalize_sample_data,
@@ -73,6 +78,12 @@ def get_track_colors(pts: np.ndarray, colormap: str = "turbo") -> np.ndarray:
     score = np.sum(pts_norm[:, 0, :] ** 2, axis=1)
     order = np.argsort(np.argsort(score)) / max(len(score) - 1, 1)
     return np.asarray([colormaps[colormap](float(v))[:3] for v in order], dtype=np.float32)
+
+
+def fade_track_colors(colors: np.ndarray, *, blend: float = 0.72) -> np.ndarray:
+    colors = np.asarray(colors, dtype=np.float32)
+    blend = float(np.clip(blend, 0.0, 1.0))
+    return colors * (1.0 - blend) + blend
 
 
 def load_dense_sequence_from_scene(
@@ -192,44 +203,29 @@ def load_sample_world_trajectory(
     sample_path: Path,
 ) -> dict:
     sample = normalize_sample_data(sample_path)
+    render_view = build_sample_visualization_view(sample, render_mode=RENDER_MODE_SUPERVISION)
     query_frame_idx = int(sample["query_frame_index"])
     intrinsics_all, extrinsics_all = scene_reader.get_camera_arrays()
     query_intrinsics = intrinsics_all[query_frame_idx].astype(np.float32)
     query_w2c = extrinsics_all[query_frame_idx].astype(np.float32)
 
-    traj_uvz = sample["traj_uvz"].astype(np.float32)
-    traj_valid_mask = sample["traj_valid_mask"].astype(bool, copy=False)
-    keypoints = sample["keypoints"].astype(np.float32)
-    segment_frame_indices = np.asarray(sample["segment_frame_indices"], dtype=np.int32)
-    traj_supervision_mask = sample.get("traj_supervision_mask")
-    if traj_supervision_mask is not None:
-        traj_supervision_mask = np.asarray(traj_supervision_mask).astype(bool, copy=False)
-
-    if sample.get("frame_aligned", False) and len(segment_frame_indices) < traj_uvz.shape[1]:
-        traj_uvz = traj_uvz[:, : len(segment_frame_indices)]
-        if traj_supervision_mask is not None:
-            traj_supervision_mask = traj_supervision_mask[:, : len(segment_frame_indices)]
-
-    raw_num_tracks = int(traj_uvz.shape[0])
-    traj_uvz = traj_uvz[traj_valid_mask]
-    keypoints = keypoints[traj_valid_mask]
-    if traj_supervision_mask is not None and len(traj_valid_mask) == traj_supervision_mask.shape[0]:
-        traj_supervision_mask = traj_supervision_mask[traj_valid_mask]
-    traj_world = traj_uvz_to_world(traj_uvz, query_intrinsics, query_w2c)
+    traj_uvz_finite = np.asarray(render_view["traj_uvz_finite"], dtype=np.float32)
+    traj_world = traj_uvz_to_world(traj_uvz_finite, query_intrinsics, query_w2c)
 
     logger.info(
-        f"traj_valid_mask 过滤后轨迹数: {traj_world.shape[0]}/{raw_num_tracks}"
+        f"traj_valid_mask 过滤后轨迹数: {render_view['kept_num_tracks']}/{render_view['raw_num_tracks']}"
     )
 
     return {
         "traj_world": traj_world,
-        "keypoints": keypoints,
+        "keypoints": np.asarray(render_view["keypoints"], dtype=np.float32),
         "query_frame_idx": query_frame_idx,
         "query_w2c": query_w2c,
-        "segment_frame_indices": segment_frame_indices,
-        "traj_supervision_mask": traj_supervision_mask,
-        "raw_num_tracks": raw_num_tracks,
-        "filtered_num_tracks": int(traj_world.shape[0]),
+        "segment_frame_indices": np.asarray(render_view["segment_frame_indices"], dtype=np.int32),
+        "traj_supervision_mask": np.asarray(render_view["supervision_step_mask"], dtype=bool),
+        "traj_finite_mask": np.asarray(render_view["finite_step_mask"], dtype=bool),
+        "raw_num_tracks": int(render_view["raw_num_tracks"]),
+        "filtered_num_tracks": int(render_view["kept_num_tracks"]),
     }
 
 
@@ -269,6 +265,13 @@ def main() -> None:
         action="store_true",
         help="将轨迹和 dense pointcloud 变换到查询帧相机坐标系",
     )
+    parser.add_argument(
+        "--render_mode",
+        type=str,
+        default=RENDER_MODE_SUPERVISION,
+        choices=RENDER_MODES,
+        help="显示模式：supervision / finite / hybrid",
+    )
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
 
@@ -292,6 +295,7 @@ def main() -> None:
         query_w2c = sample_bundle["query_w2c"]
         segment_frame_indices = sample_bundle["segment_frame_indices"]
         supervision_full = sample_bundle["traj_supervision_mask"]
+        finite_full = sample_bundle["traj_finite_mask"]
 
         if (
             args.dense_pointcloud
@@ -304,15 +308,14 @@ def main() -> None:
                 main_npz, downsample=args.dense_downsample
             )
             sample = normalize_sample_data(sample_path)
+            render_view = build_sample_visualization_view(sample, render_mode=RENDER_MODE_SUPERVISION)
             traj_valid_mask = sample["traj_valid_mask"].astype(bool, copy=False)
             if len(traj_valid_mask) == keypoint_traj.shape[0]:
                 keypoint_traj = keypoint_traj[traj_valid_mask]
-            supervision_full = sample.get("traj_supervision_mask")
-            if supervision_full is not None:
-                supervision_full = np.asarray(supervision_full).astype(bool, copy=False)
-                if len(traj_valid_mask) == supervision_full.shape[0]:
-                    supervision_full = supervision_full[traj_valid_mask]
+            supervision_full = np.asarray(render_view["supervision_step_mask"], dtype=bool)
+            if supervision_full.shape[1] > keypoint_traj.shape[1]:
                 supervision_full = supervision_full[:, : keypoint_traj.shape[1]]
+            finite_full = np.isfinite(keypoint_traj).all(axis=-1)
             traj_full = keypoint_traj.astype(np.float32)
             segment_frame_indices = np.arange(traj_full.shape[1], dtype=np.int32)
             use_legacy_main_dense = True
@@ -334,7 +337,9 @@ def main() -> None:
     n_total = int(traj_full.shape[0])
     n_valid = int(traj_full.shape[1])
     if supervision_full is None or supervision_full.shape != traj_full.shape[:2]:
-        supervision_full = np.isfinite(traj_full).all(axis=-1)
+        supervision_full = finite_full.copy()
+    else:
+        supervision_full = np.asarray(supervision_full, dtype=bool) & finite_full
     stride = max(1, args.keypoint_stride)
     if n_total > 500 and stride > 1:
         stride = 1
@@ -350,16 +355,32 @@ def main() -> None:
                 pts_h = np.hstack([pts.astype(np.float32), ones])
                 dense_per_frame[idx] = (query_w2c @ pts_h.T).T[:, :3].astype(np.float32)
 
+    def resolve_render_masks(render_mode: str) -> tuple[np.ndarray, np.ndarray]:
+        if render_mode == RENDER_MODE_SUPERVISION:
+            return supervision_full.copy(), np.zeros_like(supervision_full, dtype=bool)
+        if render_mode == RENDER_MODE_FINITE:
+            return finite_full.copy(), np.zeros_like(finite_full, dtype=bool)
+        if render_mode == RENDER_MODE_HYBRID:
+            primary_full = supervision_full.copy()
+            secondary_full = finite_full & (~primary_full)
+            return primary_full, secondary_full
+        raise ValueError(f"Unsupported render_mode: {render_mode}")
+
     indices = np.arange(0, n_total, stride)
     traj_sub = traj_full[indices]
-    supervision_sub = supervision_full[indices]
+    render_primary_full, render_secondary_full = resolve_render_masks(str(args.render_mode))
+    render_primary_sub = render_primary_full[indices]
+    render_secondary_sub = render_secondary_full[indices]
     n_show = len(indices)
-    colors = get_track_colors(traj_sub[:, :1, :] if traj_sub.shape[1] > 0 else np.zeros((n_show, 1, 3), dtype=np.float32))
+    colors = get_track_colors(
+        traj_sub[:, :1, :] if traj_sub.shape[1] > 0 else np.zeros((n_show, 1, 3), dtype=np.float32)
+    )
+    ghost_colors = fade_track_colors(colors)
     motion_order, _motion_scores = compute_motion_rank(traj_sub)
 
     logger.info(
         f"加载 {sample_path.name}: query_frame={query_frame_idx}, "
-        f"layout={layout}, keypoints={n_total}->{n_show}, segment_len={n_valid}"
+        f"layout={layout}, keypoints={n_total}->{n_show}, segment_len={n_valid}, render_mode={args.render_mode}"
     )
     if dense_per_frame is not None:
         mode = "dynamic" if len(dense_per_frame) > 1 else "static"
@@ -373,20 +394,36 @@ def main() -> None:
     server = viser.ViserServer(port=args.port)
     server.scene.set_up_direction("-y")
 
-    def get_points_at_time(t: int) -> tuple[np.ndarray, np.ndarray]:
+    def get_points_at_time(t: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if n_valid <= 0:
-            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
+            empty = np.zeros((0, 3), dtype=np.float32)
+            return empty, empty, empty, empty
         t = min(max(int(t), 0), n_valid - 1)
         pts = traj_sub[:, t, :].copy()
-        frame_mask = np.isfinite(pts).all(axis=1) & supervision_sub[:, t]
-        return pts[frame_mask], colors[frame_mask]
+        finite_mask = np.isfinite(pts).all(axis=1)
+        primary_mask = finite_mask & render_primary_sub[:, t]
+        secondary_mask = finite_mask & render_secondary_sub[:, t]
+        return (
+            pts[primary_mask],
+            colors[primary_mask],
+            pts[secondary_mask],
+            ghost_colors[secondary_mask],
+        )
 
-    points_0, colors_0 = get_points_at_time(0)
-    point_cloud_handle = server.scene.add_point_cloud(
-        name="keypoints",
+    points_0, colors_0, ghost_points_0, ghost_colors_0 = get_points_at_time(0)
+    primary_point_cloud_handle = server.scene.add_point_cloud(
+        name="keypoints_primary",
         points=points_0,
         colors=(np.clip(colors_0 * 255.0, 0, 255)).astype(np.uint8),
         point_size=0.03,
+        point_shape="rounded",
+        precision="float32",
+    )
+    secondary_point_cloud_handle = server.scene.add_point_cloud(
+        name="keypoints_secondary",
+        points=ghost_points_0,
+        colors=(np.clip(ghost_colors_0 * 255.0, 0, 255)).astype(np.uint8),
+        point_size=0.024,
         point_shape="rounded",
         precision="float32",
     )
@@ -411,6 +448,11 @@ def main() -> None:
         )
         gui_playing = server.gui.add_checkbox("播放", True)
         gui_fps = server.gui.add_slider("帧率", min=1, max=60, step=1, initial_value=10)
+        gui_render_mode = server.gui.add_dropdown(
+            "显示模式",
+            RENDER_MODES,
+            initial_value=str(args.render_mode),
+        )
         gui_keypoint_stride = server.gui.add_slider(
             "Keypoint 采样步长（1=全部）",
             min=1,
@@ -446,31 +488,46 @@ def main() -> None:
     trail_name_counter = [0]
 
     def rebuild_keypoint_pointcloud() -> None:
-        nonlocal point_cloud_handle
+        nonlocal primary_point_cloud_handle, secondary_point_cloud_handle
         try:
-            point_cloud_handle.remove()
+            primary_point_cloud_handle.remove()
         except KeyError:
             pass
-        points_t, colors_t = get_points_at_time(int(gui_time.value))
-        point_cloud_handle = server.scene.add_point_cloud(
-            name="keypoints",
+        try:
+            secondary_point_cloud_handle.remove()
+        except KeyError:
+            pass
+        points_t, colors_t, ghost_points_t, ghost_colors_t = get_points_at_time(int(gui_time.value))
+        primary_point_cloud_handle = server.scene.add_point_cloud(
+            name="keypoints_primary",
             points=points_t,
             colors=(np.clip(colors_t * 255.0, 0, 255)).astype(np.uint8),
             point_size=gui_point_size.value,
             point_shape="rounded",
             precision="float32",
         )
+        secondary_point_cloud_handle = server.scene.add_point_cloud(
+            name="keypoints_secondary",
+            points=ghost_points_t,
+            colors=(np.clip(ghost_colors_t * 255.0, 0, 255)).astype(np.uint8),
+            point_size=max(0.001, gui_point_size.value * 0.8),
+            point_shape="rounded",
+            precision="float32",
+        )
 
     def apply_keypoint_stride() -> None:
-        nonlocal traj_sub, supervision_sub, n_show, colors, motion_order
+        nonlocal traj_sub, render_primary_sub, render_secondary_sub, n_show, colors, ghost_colors, motion_order
         current_stride = max(1, int(gui_keypoint_stride.value))
         current_indices = np.arange(0, n_total, current_stride)
         traj_sub = traj_full[current_indices]
-        supervision_sub = supervision_full[current_indices]
+        current_primary_full, current_secondary_full = resolve_render_masks(str(gui_render_mode.value))
+        render_primary_sub = current_primary_full[current_indices]
+        render_secondary_sub = current_secondary_full[current_indices]
         n_show = len(current_indices)
         gui_keypoint_count.value = n_show
         color_seed = traj_sub[:, :1, :] if traj_sub.shape[1] > 0 else np.zeros((n_show, 1, 3), dtype=np.float32)
         colors = get_track_colors(color_seed)
+        ghost_colors = fade_track_colors(colors)
         motion_order, _ = compute_motion_rank(traj_sub)
         rebuild_keypoint_pointcloud()
         update_display()
@@ -478,11 +535,19 @@ def main() -> None:
 
     def update_display() -> None:
         t = min(int(gui_time.value), max(n_valid - 1, 0))
-        points_t, colors_t = get_points_at_time(t)
-        point_cloud_handle.points = points_t
-        point_cloud_handle.colors = (np.clip(colors_t * 255.0, 0, 255)).astype(np.uint8)
-        point_cloud_handle.point_size = gui_point_size.value
-        point_cloud_handle.visible = gui_show_keypoints.value
+        points_t, colors_t, ghost_points_t, ghost_colors_t = get_points_at_time(t)
+        primary_point_cloud_handle.points = points_t
+        primary_point_cloud_handle.colors = (np.clip(colors_t * 255.0, 0, 255)).astype(np.uint8)
+        primary_point_cloud_handle.point_size = gui_point_size.value
+        primary_point_cloud_handle.visible = gui_show_keypoints.value
+        secondary_point_cloud_handle.points = ghost_points_t
+        secondary_point_cloud_handle.colors = (np.clip(ghost_colors_t * 255.0, 0, 255)).astype(np.uint8)
+        secondary_point_cloud_handle.point_size = max(0.001, gui_point_size.value * 0.8)
+        secondary_point_cloud_handle.visible = (
+            gui_show_keypoints.value
+            and str(gui_render_mode.value) == RENDER_MODE_HYBRID
+            and len(ghost_points_t) > 0
+        )
         if dense_point_cloud_handle is None or dense_per_frame is None:
             return
 
@@ -515,8 +580,10 @@ def main() -> None:
         else:
             draw_indices = np.arange(n_show)
 
-        all_segs = []
-        all_cols = []
+        primary_segs = []
+        primary_cols = []
+        secondary_segs = []
+        secondary_cols = []
         for i in draw_indices:
             if i >= traj_sub.shape[0]:
                 continue
@@ -524,25 +591,43 @@ def main() -> None:
                 p0 = traj_sub[i, j, :]
                 p1 = traj_sub[i, j + 1, :]
                 if (
-                    supervision_sub[i, j]
-                    and supervision_sub[i, j + 1]
+                    render_primary_sub[i, j]
+                    and render_primary_sub[i, j + 1]
                     and np.isfinite(p0).all()
                     and np.isfinite(p1).all()
                 ):
-                    all_segs.append([p0, p1])
-                    all_cols.append([colors[i], colors[i]])
+                    primary_segs.append([p0, p1])
+                    primary_cols.append([colors[i], colors[i]])
+                elif (
+                    str(gui_render_mode.value) == RENDER_MODE_HYBRID
+                    and render_secondary_sub[i, j]
+                    and render_secondary_sub[i, j + 1]
+                    and np.isfinite(p0).all()
+                    and np.isfinite(p1).all()
+                ):
+                    secondary_segs.append([p0, p1])
+                    secondary_cols.append([ghost_colors[i], ghost_colors[i]])
 
-        if not all_segs:
+        if not primary_segs and not secondary_segs:
             return
 
         trail_name_counter[0] += 1
-        trail_handle = server.scene.add_line_segments(
-            name=f"trails_batched_{trail_name_counter[0]}",
-            points=np.asarray(all_segs, dtype=np.float32),
-            colors=np.asarray(all_cols, dtype=np.float32),
-            line_width=gui_trail_line_width.value,
-        )
-        trail_handles.append(trail_handle)
+        if secondary_segs:
+            ghost_trail_handle = server.scene.add_line_segments(
+                name=f"trails_secondary_{trail_name_counter[0]}",
+                points=np.asarray(secondary_segs, dtype=np.float32),
+                colors=np.asarray(secondary_cols, dtype=np.float32),
+                line_width=max(0.5, gui_trail_line_width.value * 0.8),
+            )
+            trail_handles.append(ghost_trail_handle)
+        if primary_segs:
+            trail_handle = server.scene.add_line_segments(
+                name=f"trails_primary_{trail_name_counter[0]}",
+                points=np.asarray(primary_segs, dtype=np.float32),
+                colors=np.asarray(primary_cols, dtype=np.float32),
+                line_width=gui_trail_line_width.value,
+            )
+            trail_handles.append(trail_handle)
 
     @gui_time.on_update
     def _(_) -> None:
@@ -553,13 +638,23 @@ def main() -> None:
     def _(_) -> None:
         apply_keypoint_stride()
 
+    @gui_render_mode.on_update
+    def _(_) -> None:
+        apply_keypoint_stride()
+
     @gui_point_size.on_update
     def _(_) -> None:
-        point_cloud_handle.point_size = gui_point_size.value
+        primary_point_cloud_handle.point_size = gui_point_size.value
+        secondary_point_cloud_handle.point_size = max(0.001, gui_point_size.value * 0.8)
 
     @gui_show_keypoints.on_update
     def _(_) -> None:
-        point_cloud_handle.visible = gui_show_keypoints.value
+        primary_point_cloud_handle.visible = gui_show_keypoints.value
+        secondary_point_cloud_handle.visible = (
+            gui_show_keypoints.value
+            and str(gui_render_mode.value) == RENDER_MODE_HYBRID
+            and len(secondary_point_cloud_handle.points) > 0
+        )
 
     @gui_show_trails.on_update
     def _(_) -> None:

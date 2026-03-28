@@ -46,6 +46,36 @@ def _collect_cli_defaults(func_ast: ast.FunctionDef) -> dict[str, object]:
     return defaults
 
 
+def _collect_cli_choices(func_ast: ast.FunctionDef) -> dict[str, tuple[str, ...]]:
+    choices: dict[str, tuple[str, ...]] = {}
+    for node in ast.walk(func_ast):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != "add_argument":
+            continue
+        flag = None
+        for arg in node.args:
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str) and arg.value.startswith("--"):
+                flag = arg.value
+                break
+        if flag is None:
+            continue
+        for keyword in node.keywords:
+            if keyword.arg != "choices":
+                continue
+            if not isinstance(keyword.value, (ast.List, ast.Tuple)):
+                continue
+            values: list[str] = []
+            for element in keyword.value.elts:
+                if isinstance(element, ast.Constant) and isinstance(element.value, str):
+                    values.append(element.value)
+            if values:
+                choices[flag] = tuple(values)
+    return choices
+
+
 _PARSE_ARGS_FUNC_AST = next(
     node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "parse_args"
 )
@@ -69,6 +99,7 @@ build_dense_sample_payload_from_tracked_subset = _HELPER_NAMESPACE["_build_dense
 
 _CLI_FLAGS = _collect_cli_flags(_PARSE_ARGS_FUNC_AST)
 _CLI_DEFAULTS = _collect_cli_defaults(_PARSE_ARGS_FUNC_AST)
+_CLI_CHOICES = _collect_cli_choices(_PARSE_ARGS_FUNC_AST)
 
 
 class InferCliSurfaceTests(unittest.TestCase):
@@ -83,6 +114,9 @@ class InferCliSurfaceTests(unittest.TestCase):
 
     def test_support_grid_ratio_default_is_point_eight(self):
         self.assertEqual(_CLI_DEFAULTS.get("--support_grid_ratio"), 0.8)
+
+    def test_exposes_wrist_pick_place_no_heatmap_profile(self):
+        self.assertIn("wrist_pick_place_no_heatmap", _CLI_CHOICES.get("--traj_filter_profile", ()))
 
     def test_support_grid_ratio_uses_rounded_nonnegative_size(self):
         self.assertEqual(resolve_support_grid_size(80, 0.8), 64)
@@ -135,6 +169,12 @@ class InferCliSurfaceTests(unittest.TestCase):
             "traj_manipulator_cluster_id": np.array([0, -1], dtype=np.int16),
             "traj_manipulator_component_size": np.array([2, 0], dtype=np.uint16),
             "traj_manipulator_cluster_fallback_used": np.asarray(False, dtype=bool),
+            "traj_pick_place_heatmap_hit_count": np.array([3, 0], dtype=np.uint16),
+            "traj_pick_place_heatmap_support_mask": np.array([True, False]),
+            "traj_pick_place_min_manipulator_distance": np.array([0.1, np.nan], dtype=np.float16),
+            "traj_pick_place_contact_mask": np.array([True, False]),
+            "traj_pick_place_depth_guard_mask": np.array([True, False]),
+            "traj_pick_place_object_mask": np.array([True, False]),
             "visibility": np.array([[1.0, 1.0], [0.0, 0.0]], dtype=np.float16),
         }
         dense_keypoints = np.array(
@@ -168,6 +208,10 @@ class InferCliSurfaceTests(unittest.TestCase):
         self.assertTrue(np.isnan(dense_payload["traj_uvz"][0]).all())
         self.assertTrue(np.isnan(dense_payload["traj_uvz"][2]).all())
         np.testing.assert_array_equal(dense_payload["traj_valid_mask"], np.array([False, True, False, False]))
+        np.testing.assert_array_equal(
+            dense_payload["traj_pick_place_object_mask"],
+            np.array([False, True, False, False]),
+        )
         np.testing.assert_array_equal(dense_payload["traj_mask_reason_bits"], np.array([2, 0, 128, 4], dtype=np.uint8))
         np.testing.assert_array_equal(dense_payload["traj_supervision_mask"][0], np.array([False, False]))
         np.testing.assert_array_equal(dense_payload["traj_query_depth_edge_risk_mask"], np.array([False, False, True, False]))

@@ -8,6 +8,8 @@ import numpy as np
 from PIL import Image
 
 from utils.traceforge_artifact_utils import (
+    RENDER_MODE_FINITE,
+    RENDER_MODE_HYBRID,
     SCENE_STORAGE_SOURCE_REF,
     SceneReader,
     build_pointcloud_from_frame,
@@ -198,6 +200,63 @@ class BuildSampleVisualizationViewTests(unittest.TestCase):
         )
         self.assertTrue(np.isnan(view["traj_uvz"][0, 1]).all())
         np.testing.assert_array_equal(view["rendered_frame_count"], np.array([2], dtype=np.uint16))
+
+    def test_render_mode_finite_keeps_finite_steps_when_supervision_is_sparse(self):
+        traj_uvz = np.array(
+            [[[1.0, 1.0, 1.0], [2.0, 2.0, 1.0], [3.0, 3.0, 1.0]]],
+            dtype=np.float32,
+        )
+        sample = {
+            "layout": "v2",
+            "traj_uvz": traj_uvz,
+            "traj_2d": traj_uvz[..., :2].copy(),
+            "keypoints": np.array([[1.0, 1.0]], dtype=np.float32),
+            "segment_frame_indices": np.array([0, 1, 2], dtype=np.int32),
+            "traj_valid_mask": np.array([True]),
+            "traj_supervision_mask": np.array([[True, False, True]], dtype=bool),
+            "frame_aligned": True,
+        }
+
+        view = build_sample_visualization_view(sample, render_mode=RENDER_MODE_FINITE)
+
+        np.testing.assert_array_equal(
+            view["render_step_mask"],
+            np.array([[True, True, True]], dtype=bool),
+        )
+        np.testing.assert_array_equal(
+            view["secondary_step_mask"],
+            np.array([[False, False, False]], dtype=bool),
+        )
+        self.assertTrue(np.isfinite(view["traj_uvz"][0]).all())
+
+    def test_render_mode_hybrid_splits_supervision_and_finite_only_steps(self):
+        traj_uvz = np.array(
+            [[[1.0, 1.0, 1.0], [2.0, 2.0, 1.0], [3.0, 3.0, 1.0]]],
+            dtype=np.float32,
+        )
+        sample = {
+            "layout": "v2",
+            "traj_uvz": traj_uvz,
+            "traj_2d": traj_uvz[..., :2].copy(),
+            "keypoints": np.array([[1.0, 1.0]], dtype=np.float32),
+            "segment_frame_indices": np.array([0, 1, 2], dtype=np.int32),
+            "traj_valid_mask": np.array([True]),
+            "traj_supervision_mask": np.array([[True, False, True]], dtype=bool),
+            "frame_aligned": True,
+        }
+
+        view = build_sample_visualization_view(sample, render_mode=RENDER_MODE_HYBRID)
+
+        np.testing.assert_array_equal(
+            view["render_step_mask"],
+            np.array([[True, False, True]], dtype=bool),
+        )
+        np.testing.assert_array_equal(
+            view["secondary_step_mask"],
+            np.array([[False, True, False]], dtype=bool),
+        )
+        self.assertTrue(np.isnan(view["traj_uvz"][0, 1]).all())
+        self.assertTrue(np.isfinite(view["traj_uvz_secondary"][0, 1]).all())
 
 
 class NormalizeSampleDataTests(unittest.TestCase):

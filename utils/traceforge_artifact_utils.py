@@ -25,6 +25,15 @@ _VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpg", ".mpeg")
 _RGB_FRAME_EXTS = (".jpg", ".jpeg", ".png")
 _DEPTH_FRAME_EXTS = (".npy", ".png", ".jpg", ".jpeg")
 
+RENDER_MODE_SUPERVISION = "supervision"
+RENDER_MODE_FINITE = "finite"
+RENDER_MODE_HYBRID = "hybrid"
+RENDER_MODES = (
+    RENDER_MODE_SUPERVISION,
+    RENDER_MODE_FINITE,
+    RENDER_MODE_HYBRID,
+)
+
 
 def _to_path(path: str | Path) -> Path:
     return path if isinstance(path, Path) else Path(path)
@@ -447,6 +456,41 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 if "traj_manipulator_cluster_fallback_used" in data
                 else False
             )
+            traj_pick_place_heatmap_hit_count = (
+                data["traj_pick_place_heatmap_hit_count"].astype(np.uint16)
+                if "traj_pick_place_heatmap_hit_count" in data
+                else np.zeros(num_tracks, dtype=np.uint16)
+            )
+            traj_pick_place_heatmap_support_mask = (
+                np.asarray(data["traj_pick_place_heatmap_support_mask"]).astype(bool, copy=False)
+                if "traj_pick_place_heatmap_support_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            )
+            traj_pick_place_min_manipulator_distance = (
+                data["traj_pick_place_min_manipulator_distance"].astype(np.float16)
+                if "traj_pick_place_min_manipulator_distance" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            )
+            traj_pick_place_contact_mask = (
+                np.asarray(data["traj_pick_place_contact_mask"]).astype(bool, copy=False)
+                if "traj_pick_place_contact_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            )
+            traj_pick_place_depth_guard_mask = (
+                np.asarray(data["traj_pick_place_depth_guard_mask"]).astype(bool, copy=False)
+                if "traj_pick_place_depth_guard_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            )
+            traj_pick_place_delayed_contact_rescue_mask = (
+                np.asarray(data["traj_pick_place_delayed_contact_rescue_mask"]).astype(bool, copy=False)
+                if "traj_pick_place_delayed_contact_rescue_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            )
+            traj_pick_place_object_mask = (
+                np.asarray(data["traj_pick_place_object_mask"]).astype(bool, copy=False)
+                if "traj_pick_place_object_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            )
             valid_steps = (
                 np.asarray(data["valid_steps"]).astype(bool, copy=False)
                 if "valid_steps" in data
@@ -489,6 +533,13 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 "traj_manipulator_cluster_id": traj_manipulator_cluster_id,
                 "traj_manipulator_component_size": traj_manipulator_component_size,
                 "traj_manipulator_cluster_fallback_used": traj_manipulator_cluster_fallback_used,
+                "traj_pick_place_heatmap_hit_count": traj_pick_place_heatmap_hit_count,
+                "traj_pick_place_heatmap_support_mask": traj_pick_place_heatmap_support_mask,
+                "traj_pick_place_min_manipulator_distance": traj_pick_place_min_manipulator_distance,
+                "traj_pick_place_contact_mask": traj_pick_place_contact_mask,
+                "traj_pick_place_depth_guard_mask": traj_pick_place_depth_guard_mask,
+                "traj_pick_place_delayed_contact_rescue_mask": traj_pick_place_delayed_contact_rescue_mask,
+                "traj_pick_place_object_mask": traj_pick_place_object_mask,
                 "valid_steps": valid_steps,
                 "frame_aligned": frame_aligned,
             }
@@ -665,6 +716,41 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 if "traj_manipulator_cluster_fallback_used" in data
                 else False
             ),
+            "traj_pick_place_heatmap_hit_count": (
+                data["traj_pick_place_heatmap_hit_count"].astype(np.uint16)
+                if "traj_pick_place_heatmap_hit_count" in data
+                else np.zeros(num_tracks, dtype=np.uint16)
+            ),
+            "traj_pick_place_heatmap_support_mask": (
+                np.asarray(data["traj_pick_place_heatmap_support_mask"]).astype(bool, copy=False)
+                if "traj_pick_place_heatmap_support_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            ),
+            "traj_pick_place_min_manipulator_distance": (
+                data["traj_pick_place_min_manipulator_distance"].astype(np.float16)
+                if "traj_pick_place_min_manipulator_distance" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            ),
+            "traj_pick_place_contact_mask": (
+                np.asarray(data["traj_pick_place_contact_mask"]).astype(bool, copy=False)
+                if "traj_pick_place_contact_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            ),
+            "traj_pick_place_depth_guard_mask": (
+                np.asarray(data["traj_pick_place_depth_guard_mask"]).astype(bool, copy=False)
+                if "traj_pick_place_depth_guard_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            ),
+            "traj_pick_place_delayed_contact_rescue_mask": (
+                np.asarray(data["traj_pick_place_delayed_contact_rescue_mask"]).astype(bool, copy=False)
+                if "traj_pick_place_delayed_contact_rescue_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            ),
+            "traj_pick_place_object_mask": (
+                np.asarray(data["traj_pick_place_object_mask"]).astype(bool, copy=False)
+                if "traj_pick_place_object_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            ),
             "valid_steps": valid_steps,
             "frame_aligned": frame_aligned,
         }
@@ -683,16 +769,83 @@ def _apply_render_step_mask(traj: np.ndarray, render_step_mask: np.ndarray) -> n
     return traj
 
 
-def build_sample_visualization_view(sample: dict[str, Any]) -> dict[str, Any]:
+def _resolve_sample_render_step_masks(
+    *,
+    sample: dict[str, Any],
+    traj_uvz: np.ndarray,
+    traj_valid_mask: np.ndarray,
+    raw_num_tracks: int,
+    num_frames: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    finite_step_mask = np.isfinite(traj_uvz).all(axis=-1)
+    supervision_step_mask: np.ndarray | None = None
+
+    traj_supervision_mask = sample.get("traj_supervision_mask")
+    if traj_supervision_mask is not None:
+        traj_supervision_mask = np.asarray(traj_supervision_mask).astype(bool, copy=False)
+        if (
+            sample.get("frame_aligned", False)
+            and traj_supervision_mask.ndim == 2
+            and traj_supervision_mask.shape[1] > num_frames
+        ):
+            traj_supervision_mask = traj_supervision_mask[:, :num_frames]
+        if traj_supervision_mask.shape == (raw_num_tracks, num_frames):
+            supervision_step_mask = np.asarray(traj_supervision_mask[traj_valid_mask], dtype=bool)
+        elif traj_supervision_mask.shape == traj_uvz.shape[:2]:
+            supervision_step_mask = np.asarray(traj_supervision_mask, dtype=bool)
+
+    if supervision_step_mask is None:
+        valid_steps = sample.get("valid_steps")
+        if valid_steps is not None:
+            valid_steps = np.asarray(valid_steps).astype(bool, copy=False).reshape(-1)[:num_frames]
+            if valid_steps.shape == (num_frames,):
+                supervision_step_mask = np.broadcast_to(valid_steps[None, :], traj_uvz.shape[:2]).copy()
+
+    if supervision_step_mask is None:
+        supervision_step_mask = finite_step_mask.copy()
+    else:
+        supervision_step_mask &= finite_step_mask
+
+    return finite_step_mask.astype(bool, copy=False), supervision_step_mask.astype(bool, copy=False)
+
+
+def _resolve_render_mode_step_masks(
+    *,
+    finite_step_mask: np.ndarray,
+    supervision_step_mask: np.ndarray,
+    render_mode: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    finite_step_mask = np.asarray(finite_step_mask, dtype=bool)
+    supervision_step_mask = np.asarray(supervision_step_mask, dtype=bool)
+    if finite_step_mask.shape != supervision_step_mask.shape:
+        raise ValueError(
+            f"Expected finite_step_mask and supervision_step_mask to share shape, got "
+            f"{finite_step_mask.shape} and {supervision_step_mask.shape}"
+        )
+    if render_mode == RENDER_MODE_SUPERVISION:
+        return supervision_step_mask.copy(), np.zeros_like(supervision_step_mask)
+    if render_mode == RENDER_MODE_FINITE:
+        return finite_step_mask.copy(), np.zeros_like(finite_step_mask)
+    if render_mode == RENDER_MODE_HYBRID:
+        primary_step_mask = supervision_step_mask.copy()
+        secondary_step_mask = finite_step_mask & (~primary_step_mask)
+        return primary_step_mask, secondary_step_mask
+    raise ValueError(f"Unsupported render_mode: {render_mode}")
+
+
+def build_sample_visualization_view(
+    sample: dict[str, Any],
+    *,
+    render_mode: str = RENDER_MODE_SUPERVISION,
+) -> dict[str, Any]:
     """Return a wrist-aware visualization view over a normalized sample payload."""
     traj_uvz = np.asarray(sample["traj_uvz"], dtype=np.float32)
     traj_2d = np.asarray(sample["traj_2d"], dtype=np.float32)
     keypoints = np.asarray(sample["keypoints"], dtype=np.float32)
     segment_frame_indices = np.asarray(sample["segment_frame_indices"], dtype=np.int32)
     traj_valid_mask = np.asarray(sample["traj_valid_mask"]).astype(bool, copy=False)
-    traj_supervision_mask = sample.get("traj_supervision_mask")
-    if traj_supervision_mask is not None:
-        traj_supervision_mask = np.asarray(traj_supervision_mask).astype(bool, copy=False)
+    if render_mode not in RENDER_MODES:
+        raise ValueError(f"Unsupported render_mode: {render_mode}")
 
     if traj_uvz.ndim != 3 or traj_uvz.shape[-1] != 3:
         raise ValueError(f"Expected traj_uvz shape (N,T,3), got {traj_uvz.shape}")
@@ -707,8 +860,6 @@ def build_sample_visualization_view(sample: dict[str, Any]) -> dict[str, Any]:
         segment_len = int(len(segment_frame_indices))
         traj_uvz = traj_uvz[:, :segment_len]
         traj_2d = traj_2d[:, :segment_len]
-        if traj_supervision_mask is not None and traj_supervision_mask.ndim == 2:
-            traj_supervision_mask = traj_supervision_mask[:, :segment_len]
 
     raw_num_tracks = int(traj_uvz.shape[0])
     num_frames = int(traj_uvz.shape[1])
@@ -716,36 +867,64 @@ def build_sample_visualization_view(sample: dict[str, Any]) -> dict[str, Any]:
     traj_2d = traj_2d[traj_valid_mask]
     keypoints = keypoints[traj_valid_mask]
     kept_num_tracks = int(traj_uvz.shape[0])
+    traj_pick_place_object_mask = np.asarray(
+        sample.get("traj_pick_place_object_mask", np.zeros(raw_num_tracks, dtype=bool))
+    ).astype(bool, copy=False)
+    if traj_pick_place_object_mask.shape == (raw_num_tracks,):
+        traj_pick_place_object_mask = traj_pick_place_object_mask[traj_valid_mask]
+    elif traj_pick_place_object_mask.shape != (kept_num_tracks,):
+        traj_pick_place_object_mask = np.zeros(kept_num_tracks, dtype=bool)
+    traj_pick_place_delayed_contact_rescue_mask = np.asarray(
+        sample.get("traj_pick_place_delayed_contact_rescue_mask", np.zeros(raw_num_tracks, dtype=bool))
+    ).astype(bool, copy=False)
+    if traj_pick_place_delayed_contact_rescue_mask.shape == (raw_num_tracks,):
+        traj_pick_place_delayed_contact_rescue_mask = traj_pick_place_delayed_contact_rescue_mask[traj_valid_mask]
+    elif traj_pick_place_delayed_contact_rescue_mask.shape != (kept_num_tracks,):
+        traj_pick_place_delayed_contact_rescue_mask = np.zeros(kept_num_tracks, dtype=bool)
 
-    finite_step_mask = np.isfinite(traj_uvz).all(axis=-1)
-    render_step_mask: np.ndarray | None = None
-    if traj_supervision_mask is not None:
-        if traj_supervision_mask.shape == (raw_num_tracks, num_frames):
-            render_step_mask = np.asarray(traj_supervision_mask[traj_valid_mask], dtype=bool)
-        elif traj_supervision_mask.shape == (kept_num_tracks, num_frames):
-            render_step_mask = np.asarray(traj_supervision_mask, dtype=bool)
+    traj_manipulator_cluster_id = np.asarray(
+        sample.get("traj_manipulator_cluster_id", np.full(raw_num_tracks, -1, dtype=np.int16))
+    ).astype(np.int16, copy=False)
+    if traj_manipulator_cluster_id.shape == (raw_num_tracks,):
+        traj_manipulator_cluster_id = traj_manipulator_cluster_id[traj_valid_mask]
+    elif traj_manipulator_cluster_id.shape != (kept_num_tracks,):
+        traj_manipulator_cluster_id = np.full(kept_num_tracks, -1, dtype=np.int16)
 
-    if render_step_mask is None:
-        valid_steps = sample.get("valid_steps")
-        if valid_steps is not None:
-            valid_steps = np.asarray(valid_steps).astype(bool, copy=False).reshape(-1)[:num_frames]
-            if valid_steps.shape == (num_frames,):
-                render_step_mask = np.broadcast_to(valid_steps[None, :], traj_uvz.shape[:2]).copy()
-
-    if render_step_mask is None:
-        render_step_mask = finite_step_mask.copy()
-    else:
-        render_step_mask &= finite_step_mask
+    finite_step_mask, supervision_step_mask = _resolve_sample_render_step_masks(
+        sample=sample,
+        traj_uvz=traj_uvz,
+        traj_valid_mask=traj_valid_mask,
+        raw_num_tracks=raw_num_tracks,
+        num_frames=num_frames,
+    )
+    render_step_mask, secondary_step_mask = _resolve_render_mode_step_masks(
+        finite_step_mask=finite_step_mask,
+        supervision_step_mask=supervision_step_mask,
+        render_mode=render_mode,
+    )
 
     return {
         "traj_uvz": _apply_render_step_mask(traj_uvz, render_step_mask),
         "traj_2d": _apply_render_step_mask(traj_2d, render_step_mask),
+        "traj_uvz_secondary": _apply_render_step_mask(traj_uvz, secondary_step_mask),
+        "traj_2d_secondary": _apply_render_step_mask(traj_2d, secondary_step_mask),
+        "traj_uvz_finite": _apply_render_step_mask(traj_uvz, finite_step_mask),
+        "traj_2d_finite": _apply_render_step_mask(traj_2d, finite_step_mask),
         "keypoints": keypoints,
         "segment_frame_indices": segment_frame_indices,
         "render_step_mask": render_step_mask.astype(bool),
+        "secondary_step_mask": secondary_step_mask.astype(bool),
+        "supervision_step_mask": supervision_step_mask.astype(bool),
+        "finite_step_mask": finite_step_mask.astype(bool),
         "rendered_frame_count": render_step_mask.sum(axis=1).astype(np.uint16),
         "raw_num_tracks": raw_num_tracks,
         "kept_num_tracks": kept_num_tracks,
+        "traj_pick_place_delayed_contact_rescue_mask": traj_pick_place_delayed_contact_rescue_mask.astype(
+            bool, copy=False
+        ),
+        "traj_pick_place_object_mask": traj_pick_place_object_mask.astype(bool, copy=False),
+        "traj_manipulator_cluster_id": traj_manipulator_cluster_id.astype(np.int16, copy=False),
+        "render_mode": render_mode,
     }
 
 

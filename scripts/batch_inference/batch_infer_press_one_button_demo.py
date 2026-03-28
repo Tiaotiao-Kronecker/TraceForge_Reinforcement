@@ -491,13 +491,17 @@ def parse_args() -> argparse.Namespace:
             "external_manipulator",
             "external_manipulator_v2",
             "wrist",
+            "wrist_pick_place",
+            "wrist_pick_place_no_heatmap",
             "wrist_manipulator_top95",
             "wrist_manipulator",
         ],
         help=(
             "Trajectory filtering profile. auto maps wrist-like camera names to wrist_manipulator_top95 "
             "and others to external; "
-            "external_manipulator, external_manipulator_v2, wrist_manipulator_top95, and wrist_manipulator "
+            "external_manipulator, external_manipulator_v2, wrist_pick_place, "
+            "wrist_pick_place_no_heatmap, wrist_manipulator_top95, "
+            "and wrist_manipulator "
             "must be requested explicitly."
         ),
     )

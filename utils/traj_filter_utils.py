@@ -23,6 +23,8 @@ TRAJ_FILTER_PROFILE_EXTERNAL = "external"
 TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR = "external_manipulator"
 TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR_V2 = "external_manipulator_v2"
 TRAJ_FILTER_PROFILE_WRIST = "wrist"
+TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE = "wrist_pick_place"
+TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE_NO_HEATMAP = "wrist_pick_place_no_heatmap"
 TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR_TOP95 = "wrist_manipulator_top95"
 TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR = "wrist_manipulator"
 
@@ -38,6 +40,18 @@ WRIST_MANIPULATOR_CLUSTER_RADIUS_RATIO = 0.06
 WRIST_MANIPULATOR_CLUSTER_RADIUS_MIN_PX = 24
 WRIST_MANIPULATOR_MIN_COMPONENT_RATIO = 0.005
 WRIST_MANIPULATOR_MIN_COMPONENT_SIZE = 2
+WRIST_PICK_PLACE_MIN_HEATMAP_HITS = 2
+WRIST_PICK_PLACE_MAX_MANIPULATOR_DISTANCE_M = 0.20
+WRIST_PICK_PLACE_QUERY_DEPTH_MARGIN_M = 0.25
+WRIST_PICK_PLACE_MAJOR_COMPONENT_RATIO = 0.15
+WRIST_PICK_PLACE_MAJOR_COMPONENT_MIN_MOTION_RATIO = 0.75
+WRIST_PICK_PLACE_MAJOR_COMPONENT_DEPTH_MARGIN_M = 0.08
+WRIST_PICK_PLACE_NO_HEATMAP_MAX_DEPTH_RANK = 0.50
+WRIST_PICK_PLACE_NO_HEATMAP_ANCHOR_MIN_MOTION_EXTENT = 0.03
+WRIST_PICK_PLACE_NO_HEATMAP_BBOX_X_PAD_PX = 80
+WRIST_PICK_PLACE_NO_HEATMAP_BBOX_Y_PAD_UP_PX = 40
+WRIST_PICK_PLACE_NO_HEATMAP_BBOX_Y_PAD_DOWN_PX = 220
+WRIST_PICK_PLACE_NO_HEATMAP_MIN_ANCHOR_COUNT = 8
 
 EXTERNAL_MANIPULATOR_V2_MAX_DEPTH_RANK = 0.70
 EXTERNAL_MANIPULATOR_V2_MIN_MOTION_EXTENT = 0.01
@@ -313,6 +327,42 @@ def _apply_top_motion_extent_filter(
     return final_mask
 
 
+def _build_anchor_query_region_mask(
+    *,
+    keypoints: np.ndarray,
+    anchor_mask: np.ndarray,
+    min_anchor_count: int,
+    bbox_x_pad_px: int,
+    bbox_y_pad_up_px: int,
+    bbox_y_pad_down_px: int,
+) -> tuple[np.ndarray, bool]:
+    keypoints = np.asarray(keypoints, dtype=np.float32)
+    anchor_mask = np.asarray(anchor_mask, dtype=bool)
+    if keypoints.ndim != 2 or keypoints.shape[1] != 2:
+        raise ValueError(f"Expected keypoints shape (N,2), got {keypoints.shape}")
+    if anchor_mask.shape != (keypoints.shape[0],):
+        raise ValueError(f"Expected anchor_mask shape {(keypoints.shape[0],)}, got {anchor_mask.shape}")
+
+    region_mask = np.ones(anchor_mask.shape, dtype=bool)
+    anchor_points = keypoints[anchor_mask]
+    finite_anchor_points = anchor_points[np.isfinite(anchor_points).all(axis=1)]
+    if finite_anchor_points.shape[0] < int(min_anchor_count):
+        return region_mask, True
+
+    x_min = float(np.min(finite_anchor_points[:, 0]) - float(bbox_x_pad_px))
+    x_max = float(np.max(finite_anchor_points[:, 0]) + float(bbox_x_pad_px))
+    y_min = float(np.min(finite_anchor_points[:, 1]) - float(bbox_y_pad_up_px))
+    y_max = float(np.max(finite_anchor_points[:, 1]) + float(bbox_y_pad_down_px))
+    region_mask = (
+        np.isfinite(keypoints).all(axis=1)
+        & (keypoints[:, 0] >= x_min)
+        & (keypoints[:, 0] <= x_max)
+        & (keypoints[:, 1] >= y_min)
+        & (keypoints[:, 1] <= y_max)
+    )
+    return region_mask.astype(bool, copy=False), False
+
+
 def _select_largest_spatial_component(
     keypoints: np.ndarray,
     candidate_mask: np.ndarray,
@@ -491,10 +541,13 @@ def _apply_manipulator_aware_filter(
     min_component_size: int,
     component_keep_mode: str = "largest",
     major_component_ratio: float | None = None,
+    major_component_min_motion_ratio: float | None = None,
+    major_component_depth_margin_m: float | None = None,
     motion_metric_mode: str = "supervised",
     apply_near_depth_filter: bool = True,
     apply_motion_filter: bool = True,
     apply_cluster_filter: bool = True,
+    reusable_geometry: dict[str, np.ndarray] | None = None,
     profile_stats: dict[str, float] | None = None,
 ) -> tuple[
     np.ndarray,
@@ -546,6 +599,8 @@ def _apply_manipulator_aware_filter(
         "filter_result_manipulator_world_lift_seconds",
         time.perf_counter() - world_lift_start,
     )
+    if reusable_geometry is not None:
+        reusable_geometry["world_tracks"] = world_tracks
     motion_start = time.perf_counter()
     (
         (traj_motion_extent, traj_motion_step_median),
@@ -621,6 +676,51 @@ def _apply_manipulator_aware_filter(
             min_component_size=min_component_size,
             major_component_ratio=major_component_ratio,
         )
+        if (
+            not fallback_used
+            and np.any(final_mask)
+            and major_component_min_motion_ratio is not None
+            and major_component_depth_margin_m is not None
+        ):
+            refined_mask = np.zeros_like(final_mask)
+            kept_component_ids = np.unique(traj_manipulator_cluster_id[final_mask])
+            kept_component_ids = kept_component_ids[kept_component_ids >= 0]
+            if kept_component_ids.size <= 1:
+                refined_mask = final_mask.copy()
+            else:
+                component_motion = np.full(kept_component_ids.shape, np.nan, dtype=np.float32)
+                component_depth = np.full(kept_component_ids.shape, np.nan, dtype=np.float32)
+                for component_offset, component_id in enumerate(kept_component_ids.tolist()):
+                    component_mask = final_mask & (traj_manipulator_cluster_id == component_id)
+                    component_motion_values = motion_extent_for_gate[component_mask]
+                    component_motion_values = component_motion_values[np.isfinite(component_motion_values)]
+                    if component_motion_values.size > 0:
+                        component_motion[component_offset] = float(np.median(component_motion_values))
+
+                    component_depth_values = query_depth_values[component_mask]
+                    component_depth_values = component_depth_values[np.isfinite(component_depth_values)]
+                    if component_depth_values.size > 0:
+                        component_depth[component_offset] = float(np.median(component_depth_values))
+
+                keep_component = np.zeros(kept_component_ids.shape, dtype=bool)
+                finite_motion = np.isfinite(component_motion)
+                if np.any(finite_motion):
+                    best_component_motion = float(np.max(component_motion[finite_motion]))
+                    keep_component |= component_motion >= (
+                        best_component_motion * float(major_component_min_motion_ratio)
+                    )
+                finite_depth = np.isfinite(component_depth)
+                if np.any(finite_depth):
+                    best_component_depth = float(np.min(component_depth[finite_depth]))
+                    keep_component |= component_depth <= (
+                        best_component_depth + float(major_component_depth_margin_m)
+                    )
+                if not np.any(keep_component):
+                    refined_mask = final_mask.copy()
+                else:
+                    for component_id in kept_component_ids[keep_component].tolist():
+                        refined_mask |= final_mask & (traj_manipulator_cluster_id == component_id)
+            final_mask = refined_mask
     else:
         raise ValueError(f"Unsupported component_keep_mode: {component_keep_mode}")
     if apply_cluster_filter:
@@ -644,6 +744,467 @@ def _apply_manipulator_aware_filter(
         motion_mask,
         cluster_mask,
         bool(fallback_used),
+    )
+
+
+def _compute_binary_mask_track_hits(
+    traj: np.ndarray,
+    binary_mask_segment: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    traj = np.asarray(traj, dtype=np.float32)
+    if traj.ndim != 3 or traj.shape[-1] != 3:
+        raise ValueError(f"Expected traj shape (N,T,3), got {traj.shape}")
+
+    num_tracks, num_frames, _ = traj.shape
+    hit_mask = np.zeros((num_tracks, num_frames), dtype=bool)
+    hit_count = np.zeros(num_tracks, dtype=np.uint16)
+    if binary_mask_segment is None:
+        return hit_mask, hit_count
+
+    binary_mask_segment = np.asarray(binary_mask_segment, dtype=bool)
+    if binary_mask_segment.shape[0] != num_frames or binary_mask_segment.ndim != 3:
+        raise ValueError(
+            f"Expected binary_mask_segment shape {(num_frames, 'H', 'W')}, got {binary_mask_segment.shape}"
+        )
+
+    height, width = binary_mask_segment.shape[1:]
+    xs = np.rint(np.nan_to_num(traj[..., 0], nan=-1.0, posinf=-1.0, neginf=-1.0)).astype(np.int32)
+    ys = np.rint(np.nan_to_num(traj[..., 1], nan=-1.0, posinf=-1.0, neginf=-1.0)).astype(np.int32)
+    in_bounds = (
+        np.isfinite(traj).all(axis=-1)
+        & (xs >= 0)
+        & (xs < width)
+        & (ys >= 0)
+        & (ys < height)
+    )
+    for frame_idx in range(num_frames):
+        frame_mask = in_bounds[:, frame_idx]
+        if not np.any(frame_mask):
+            continue
+        hit_mask[frame_mask, frame_idx] = binary_mask_segment[
+            frame_idx,
+            ys[frame_mask, frame_idx],
+            xs[frame_mask, frame_idx],
+        ]
+    hit_count = hit_mask.sum(axis=1).astype(np.uint16)
+    return hit_mask, hit_count
+
+
+def _compute_pick_place_reference_geometry(
+    *,
+    traj: np.ndarray,
+    manipulator_reference_mask: np.ndarray,
+    manipulator_reference_component_ids: np.ndarray,
+    min_depth: float,
+    max_depth: float,
+    query_depth_margin_m: float,
+    world_tracks: np.ndarray | None = None,
+    intrinsics_segment: np.ndarray | None = None,
+    extrinsics_segment: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    traj = np.asarray(traj, dtype=np.float32)
+    manipulator_reference_mask = np.asarray(manipulator_reference_mask, dtype=bool)
+    manipulator_reference_component_ids = np.asarray(manipulator_reference_component_ids, dtype=np.int32)
+
+    num_tracks, num_frames, _ = traj.shape
+    if manipulator_reference_mask.shape != (num_tracks,):
+        raise ValueError(
+            f"Expected manipulator_reference_mask shape {(num_tracks,)}, got {manipulator_reference_mask.shape}"
+        )
+    if manipulator_reference_component_ids.shape != (num_tracks,):
+        raise ValueError(
+            "Expected manipulator_reference_component_ids to match manipulator_reference_mask shape, got "
+            f"{manipulator_reference_component_ids.shape} and {manipulator_reference_mask.shape}"
+        )
+
+    if world_tracks is None:
+        if intrinsics_segment is None or extrinsics_segment is None:
+            raise ValueError(
+                "intrinsics_segment and extrinsics_segment are required when world_tracks is not provided"
+            )
+        intrinsics_segment = np.asarray(intrinsics_segment, dtype=np.float32)
+        extrinsics_segment = np.asarray(extrinsics_segment, dtype=np.float32)
+        world_tracks = traj_uvz_to_world_coordinates(
+            traj,
+            query_intrinsics=intrinsics_segment[0],
+            query_w2c=extrinsics_segment[0],
+            min_depth=min_depth,
+            max_depth=max_depth,
+        )
+    else:
+        world_tracks = np.asarray(world_tracks, dtype=np.float32)
+        if world_tracks.shape != (num_tracks, num_frames, 3):
+            raise ValueError(
+                f"Expected world_tracks shape {(num_tracks, num_frames, 3)}, got {world_tracks.shape}"
+            )
+
+    if not np.any(manipulator_reference_mask):
+        return (
+            world_tracks,
+            np.full((0, num_frames, 3), np.nan, dtype=np.float32),
+            np.full(0, np.nan, dtype=np.float32),
+        )
+
+    reference_component_ids = np.unique(manipulator_reference_component_ids[manipulator_reference_mask])
+    reference_component_ids = reference_component_ids[reference_component_ids >= 0]
+    if reference_component_ids.size == 0:
+        component_masks = [manipulator_reference_mask]
+    else:
+        component_masks = [
+            manipulator_reference_mask & (manipulator_reference_component_ids == component_id)
+            for component_id in reference_component_ids.tolist()
+        ]
+
+    num_reference_components = len(component_masks)
+    manipulator_component_centroids = np.full((num_reference_components, num_frames, 3), np.nan, dtype=np.float32)
+    component_depth_upper = np.full(num_reference_components, np.nan, dtype=np.float32)
+    query_depth_values = traj[:, 0, 2].astype(np.float32, copy=False)
+    for component_offset, component_mask in enumerate(component_masks):
+        component_query_depth = query_depth_values[component_mask]
+        component_query_depth = component_query_depth[np.isfinite(component_query_depth)]
+        if component_query_depth.size > 0:
+            component_depth_upper[component_offset] = float(
+                np.percentile(component_query_depth, 90)
+            ) + float(query_depth_margin_m)
+        for frame_idx in range(num_frames):
+            frame_points = world_tracks[component_mask, frame_idx]
+            frame_valid = np.isfinite(frame_points).all(axis=1)
+            if np.any(frame_valid):
+                manipulator_component_centroids[component_offset, frame_idx] = np.median(
+                    frame_points[frame_valid], axis=0
+                )
+
+    return world_tracks, manipulator_component_centroids, component_depth_upper
+
+
+def _compute_pick_place_contact_masks(
+    *,
+    traj: np.ndarray,
+    candidate_mask: np.ndarray,
+    manipulator_reference_mask: np.ndarray,
+    manipulator_reference_component_ids: np.ndarray,
+    intrinsics_segment: np.ndarray,
+    extrinsics_segment: np.ndarray,
+    min_depth: float,
+    max_depth: float,
+    max_manipulator_distance_m: float,
+    query_depth_margin_m: float,
+    world_tracks: np.ndarray | None = None,
+    manipulator_component_centroids: np.ndarray | None = None,
+    component_depth_upper: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    traj = np.asarray(traj, dtype=np.float32)
+    candidate_mask = np.asarray(candidate_mask, dtype=bool)
+    manipulator_reference_mask = np.asarray(manipulator_reference_mask, dtype=bool)
+    manipulator_reference_component_ids = np.asarray(manipulator_reference_component_ids, dtype=np.int32)
+
+    num_tracks, num_frames, _ = traj.shape
+    if candidate_mask.shape != (num_tracks,):
+        raise ValueError(f"Expected candidate_mask shape {(num_tracks,)}, got {candidate_mask.shape}")
+    if manipulator_reference_mask.shape != (num_tracks,):
+        raise ValueError(
+            f"Expected manipulator_reference_mask shape {(num_tracks,)}, got {manipulator_reference_mask.shape}"
+        )
+    if manipulator_reference_component_ids.shape != (num_tracks,):
+        raise ValueError(
+            "Expected manipulator_reference_component_ids to match candidate_mask shape, got "
+            f"{manipulator_reference_component_ids.shape} and {candidate_mask.shape}"
+        )
+
+    min_manipulator_distance = np.full(num_tracks, np.nan, dtype=np.float32)
+    contact_mask = np.zeros(num_tracks, dtype=bool)
+    query_contact_mask = np.zeros(num_tracks, dtype=bool)
+    delayed_contact_mask = np.zeros(num_tracks, dtype=bool)
+    depth_guard_mask = np.zeros(num_tracks, dtype=bool)
+    if not np.any(candidate_mask) or not np.any(manipulator_reference_mask):
+        return (
+            min_manipulator_distance,
+            contact_mask,
+            query_contact_mask,
+            delayed_contact_mask,
+            depth_guard_mask,
+        )
+
+    if manipulator_component_centroids is None or component_depth_upper is None:
+        (
+            world_tracks,
+            manipulator_component_centroids,
+            component_depth_upper,
+        ) = _compute_pick_place_reference_geometry(
+            traj=traj,
+            manipulator_reference_mask=manipulator_reference_mask,
+            manipulator_reference_component_ids=manipulator_reference_component_ids,
+            min_depth=min_depth,
+            max_depth=max_depth,
+            query_depth_margin_m=query_depth_margin_m,
+            world_tracks=world_tracks,
+            intrinsics_segment=intrinsics_segment,
+            extrinsics_segment=extrinsics_segment,
+        )
+    else:
+        world_tracks = np.asarray(world_tracks, dtype=np.float32)
+        manipulator_component_centroids = np.asarray(manipulator_component_centroids, dtype=np.float32)
+        component_depth_upper = np.asarray(component_depth_upper, dtype=np.float32)
+
+    candidate_indices = np.flatnonzero(candidate_mask)
+    num_reference_components = int(manipulator_component_centroids.shape[0])
+    component_min_distance_candidate = np.full(
+        (candidate_indices.size, num_reference_components), np.nan, dtype=np.float32
+    )
+    per_frame_min_distance_candidate = np.full((candidate_indices.size, num_frames), np.nan, dtype=np.float32)
+    if candidate_indices.size > 0 and num_reference_components > 0:
+        candidate_world_tracks = world_tracks[candidate_indices]
+        if num_reference_components == 1:
+            distance_matrix = np.linalg.norm(
+                candidate_world_tracks - manipulator_component_centroids[0][None, :, :],
+                axis=-1,
+            )
+            finite_distance = np.isfinite(distance_matrix)
+            if np.any(finite_distance):
+                safe_distance = np.where(finite_distance, distance_matrix, np.nan)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=RuntimeWarning)
+                    per_frame_min_distance_candidate = safe_distance.astype(np.float32, copy=False)
+                    component_min_distance_candidate[:, 0] = np.nanmin(
+                        safe_distance,
+                        axis=1,
+                    ).astype(np.float32, copy=False)
+        else:
+            distance_matrix = np.linalg.norm(
+                candidate_world_tracks[:, None, :, :] - manipulator_component_centroids[None, :, :, :],
+                axis=-1,
+            )
+            finite_distance = np.isfinite(distance_matrix)
+            if np.any(finite_distance):
+                safe_distance = np.where(finite_distance, distance_matrix, np.nan)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=RuntimeWarning)
+                    component_min_distance_candidate = np.nanmin(
+                        safe_distance,
+                        axis=2,
+                    ).astype(np.float32, copy=False)
+                    per_frame_min_distance_candidate = np.nanmin(
+                        safe_distance,
+                        axis=1,
+                    ).astype(np.float32, copy=False)
+
+    if candidate_indices.size > 0:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            min_manipulator_distance[candidate_indices] = np.nanmin(
+                component_min_distance_candidate,
+                axis=1,
+            ).astype(np.float32, copy=False)
+
+    contact_mask = (
+        candidate_mask
+        & np.isfinite(min_manipulator_distance)
+        & (min_manipulator_distance <= float(max_manipulator_distance_m))
+    )
+    if candidate_indices.size > 0:
+        candidate_query_frame_distance = per_frame_min_distance_candidate[:, 0]
+        query_contact_mask[candidate_indices] = (
+            np.isfinite(candidate_query_frame_distance)
+            & (candidate_query_frame_distance <= float(max_manipulator_distance_m))
+        )
+        if num_frames > 1:
+            delayed_contact_mask[candidate_indices] = np.any(
+                np.isfinite(per_frame_min_distance_candidate[:, 1:])
+                & (per_frame_min_distance_candidate[:, 1:] <= float(max_manipulator_distance_m)),
+                axis=1,
+            )
+            delayed_contact_mask[candidate_indices] &= ~query_contact_mask[candidate_indices]
+
+    query_depth_values = traj[:, 0, 2].astype(np.float32, copy=False)
+    if candidate_indices.size > 0 and num_reference_components > 0:
+        nearest_component_offset = np.full(candidate_indices.size, -1, dtype=np.int32)
+        valid_component_distance = np.isfinite(component_min_distance_candidate)
+        if np.any(valid_component_distance):
+            safe_component_distance = np.where(valid_component_distance, component_min_distance_candidate, np.inf)
+            track_has_component = np.any(valid_component_distance, axis=1)
+            nearest_component_offset[track_has_component] = np.argmin(
+                safe_component_distance[track_has_component],
+                axis=1,
+            ).astype(np.int32, copy=False)
+
+        per_track_depth_upper = np.full(candidate_indices.size, np.nan, dtype=np.float32)
+        valid_nearest_component = nearest_component_offset >= 0
+        if np.any(valid_nearest_component):
+            per_track_depth_upper[valid_nearest_component] = component_depth_upper[
+                nearest_component_offset[valid_nearest_component]
+            ]
+        depth_guard_mask[candidate_indices] = (
+            np.isfinite(query_depth_values[candidate_indices])
+            & np.isfinite(per_track_depth_upper)
+            & (query_depth_values[candidate_indices] <= per_track_depth_upper)
+        )
+
+    return (
+        min_manipulator_distance,
+        contact_mask,
+        query_contact_mask,
+        delayed_contact_mask,
+        depth_guard_mask,
+    )
+
+
+def _apply_pick_place_object_filter(
+    *,
+    traj: np.ndarray,
+    seed_mask: np.ndarray,
+    manipulator_reference_mask: np.ndarray,
+    manipulator_reference_component_ids: np.ndarray,
+    intrinsics_segment: np.ndarray,
+    extrinsics_segment: np.ndarray,
+    min_depth: float,
+    max_depth: float,
+    pick_place_heatmap_segment: np.ndarray | None,
+    min_heatmap_hits: int,
+    max_manipulator_distance_m: float,
+    query_depth_margin_m: float,
+    world_tracks: np.ndarray | None = None,
+    manipulator_component_centroids: np.ndarray | None = None,
+    component_depth_upper: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    traj = np.asarray(traj, dtype=np.float32)
+    seed_mask = np.asarray(seed_mask, dtype=bool)
+    manipulator_reference_mask = np.asarray(manipulator_reference_mask, dtype=bool)
+    manipulator_reference_component_ids = np.asarray(manipulator_reference_component_ids, dtype=np.int32)
+    if manipulator_reference_component_ids.shape != seed_mask.shape:
+        raise ValueError(
+            "Expected manipulator_reference_component_ids to match seed_mask shape, got "
+            f"{manipulator_reference_component_ids.shape} and {seed_mask.shape}"
+        )
+
+    num_tracks, num_frames, _ = traj.shape
+    heatmap_support_mask = np.zeros(num_tracks, dtype=bool)
+    heatmap_hit_count = np.zeros(num_tracks, dtype=np.uint16)
+    min_manipulator_distance = np.full(num_tracks, np.nan, dtype=np.float32)
+    contact_mask = np.zeros(num_tracks, dtype=bool)
+    depth_guard_mask = np.zeros(num_tracks, dtype=bool)
+    object_mask = np.zeros(num_tracks, dtype=bool)
+
+    _, heatmap_hit_count = _compute_binary_mask_track_hits(traj, pick_place_heatmap_segment)
+    if pick_place_heatmap_segment is not None:
+        heatmap_support_mask = seed_mask & (heatmap_hit_count >= int(min_heatmap_hits))
+    if not np.any(heatmap_support_mask):
+        return (
+            object_mask,
+            heatmap_hit_count,
+            heatmap_support_mask,
+            min_manipulator_distance,
+            contact_mask,
+            depth_guard_mask,
+        )
+
+    (
+        min_manipulator_distance,
+        contact_mask,
+        _query_contact_mask,
+        _delayed_contact_mask,
+        depth_guard_mask,
+    ) = _compute_pick_place_contact_masks(
+        traj=traj,
+        candidate_mask=heatmap_support_mask,
+        manipulator_reference_mask=manipulator_reference_mask,
+        manipulator_reference_component_ids=manipulator_reference_component_ids,
+        intrinsics_segment=intrinsics_segment,
+        extrinsics_segment=extrinsics_segment,
+        min_depth=min_depth,
+        max_depth=max_depth,
+        max_manipulator_distance_m=max_manipulator_distance_m,
+        query_depth_margin_m=query_depth_margin_m,
+        world_tracks=world_tracks,
+        manipulator_component_centroids=manipulator_component_centroids,
+        component_depth_upper=component_depth_upper,
+    )
+    object_mask = heatmap_support_mask & contact_mask & depth_guard_mask
+    return (
+        object_mask,
+        heatmap_hit_count,
+        heatmap_support_mask,
+        min_manipulator_distance,
+        contact_mask,
+        depth_guard_mask,
+    )
+
+
+def _apply_delayed_contact_object_rescue_filter(
+    *,
+    traj: np.ndarray,
+    visibs: np.ndarray | None,
+    seed_mask: np.ndarray,
+    local_keep_mask: np.ndarray,
+    manipulator_reference_mask: np.ndarray,
+    manipulator_reference_component_ids: np.ndarray,
+    intrinsics_segment: np.ndarray,
+    extrinsics_segment: np.ndarray,
+    min_depth: float,
+    max_depth: float,
+    max_manipulator_distance_m: float,
+    query_depth_margin_m: float,
+    world_tracks: np.ndarray | None = None,
+    manipulator_component_centroids: np.ndarray | None = None,
+    component_depth_upper: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    traj = np.asarray(traj, dtype=np.float32)
+    seed_mask = np.asarray(seed_mask, dtype=bool)
+    local_keep_mask = np.asarray(local_keep_mask, dtype=bool)
+
+    num_tracks, num_frames, _ = traj.shape
+    if seed_mask.shape != (num_tracks,):
+        raise ValueError(f"Expected seed_mask shape {(num_tracks,)}, got {seed_mask.shape}")
+    if local_keep_mask.shape != (num_tracks,):
+        raise ValueError(f"Expected local_keep_mask shape {(num_tracks,)}, got {local_keep_mask.shape}")
+
+    visibility = _normalize_visibility(visibs, num_tracks=num_tracks, num_frames=num_frames)
+    query_visible_mask = np.isfinite(traj[:, 0]).all(axis=1)
+    if visibility is not None:
+        query_visible_mask &= visibility[:, 0]
+    rescue_candidate_mask = seed_mask & query_visible_mask & (~local_keep_mask)
+
+    rescue_mask = np.zeros(num_tracks, dtype=bool)
+    min_manipulator_distance = np.full(num_tracks, np.nan, dtype=np.float32)
+    contact_mask = np.zeros(num_tracks, dtype=bool)
+    depth_guard_mask = np.zeros(num_tracks, dtype=bool)
+    delayed_contact_mask = np.zeros(num_tracks, dtype=bool)
+    if not np.any(rescue_candidate_mask):
+        return (
+            rescue_mask,
+            min_manipulator_distance,
+            contact_mask,
+            depth_guard_mask,
+            delayed_contact_mask,
+        )
+
+    (
+        min_manipulator_distance,
+        contact_mask,
+        _query_contact_mask,
+        delayed_contact_mask,
+        depth_guard_mask,
+    ) = _compute_pick_place_contact_masks(
+        traj=traj,
+        candidate_mask=rescue_candidate_mask,
+        manipulator_reference_mask=manipulator_reference_mask,
+        manipulator_reference_component_ids=manipulator_reference_component_ids,
+        intrinsics_segment=intrinsics_segment,
+        extrinsics_segment=extrinsics_segment,
+        min_depth=min_depth,
+        max_depth=max_depth,
+        max_manipulator_distance_m=max_manipulator_distance_m,
+        query_depth_margin_m=query_depth_margin_m,
+        world_tracks=world_tracks,
+        manipulator_component_centroids=manipulator_component_centroids,
+        component_depth_upper=component_depth_upper,
+    )
+    rescue_mask = rescue_candidate_mask & delayed_contact_mask & depth_guard_mask
+    return (
+        rescue_mask,
+        min_manipulator_distance,
+        contact_mask,
+        depth_guard_mask,
+        delayed_contact_mask,
     )
 
 
@@ -890,6 +1451,22 @@ def resolve_traj_filter_config(filter_args) -> dict:
             "wrist_manipulator_cluster_radius_min_px": WRIST_MANIPULATOR_CLUSTER_RADIUS_MIN_PX,
             "wrist_manipulator_min_component_ratio": WRIST_MANIPULATOR_MIN_COMPONENT_RATIO,
             "wrist_manipulator_min_component_size": WRIST_MANIPULATOR_MIN_COMPONENT_SIZE,
+            "wrist_pick_place_min_heatmap_hits": WRIST_PICK_PLACE_MIN_HEATMAP_HITS,
+            "wrist_pick_place_max_manipulator_distance_m": WRIST_PICK_PLACE_MAX_MANIPULATOR_DISTANCE_M,
+            "wrist_pick_place_query_depth_margin_m": WRIST_PICK_PLACE_QUERY_DEPTH_MARGIN_M,
+            "wrist_pick_place_major_component_ratio": WRIST_PICK_PLACE_MAJOR_COMPONENT_RATIO,
+            "wrist_pick_place_major_component_min_motion_ratio": (
+                WRIST_PICK_PLACE_MAJOR_COMPONENT_MIN_MOTION_RATIO
+            ),
+            "wrist_pick_place_major_component_depth_margin_m": WRIST_PICK_PLACE_MAJOR_COMPONENT_DEPTH_MARGIN_M,
+            "wrist_pick_place_no_heatmap_max_depth_rank": WRIST_PICK_PLACE_NO_HEATMAP_MAX_DEPTH_RANK,
+            "wrist_pick_place_no_heatmap_anchor_min_motion_extent": (
+                WRIST_PICK_PLACE_NO_HEATMAP_ANCHOR_MIN_MOTION_EXTENT
+            ),
+            "wrist_pick_place_no_heatmap_bbox_x_pad_px": WRIST_PICK_PLACE_NO_HEATMAP_BBOX_X_PAD_PX,
+            "wrist_pick_place_no_heatmap_bbox_y_pad_up_px": WRIST_PICK_PLACE_NO_HEATMAP_BBOX_Y_PAD_UP_PX,
+            "wrist_pick_place_no_heatmap_bbox_y_pad_down_px": WRIST_PICK_PLACE_NO_HEATMAP_BBOX_Y_PAD_DOWN_PX,
+            "wrist_pick_place_no_heatmap_min_anchor_count": WRIST_PICK_PLACE_NO_HEATMAP_MIN_ANCHOR_COUNT,
             "external_manipulator_v2_max_depth_rank": EXTERNAL_MANIPULATOR_V2_MAX_DEPTH_RANK,
             "external_manipulator_v2_min_motion_extent": EXTERNAL_MANIPULATOR_V2_MIN_MOTION_EXTENT,
             "external_manipulator_v2_cluster_radius_ratio": EXTERNAL_MANIPULATOR_V2_CLUSTER_RADIUS_RATIO,
@@ -1195,6 +1772,8 @@ def build_query_prefilter_result(
     prefilter_mask = query_depth_quality_mask.copy()
     if profile in {
         TRAJ_FILTER_PROFILE_WRIST,
+        TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE,
+        TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE_NO_HEATMAP,
         TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR_TOP95,
         TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR,
     }:
@@ -1692,6 +2271,7 @@ def build_traj_filter_result(
     *,
     keypoints: np.ndarray | None = None,
     query_depth: np.ndarray | None = None,
+    pick_place_heatmap_segment: np.ndarray | None = None,
     raw_depths_segment: np.ndarray | None = None,
     intrinsics_segment: np.ndarray | None = None,
     extrinsics_segment: np.ndarray | None = None,
@@ -1711,6 +2291,8 @@ def build_traj_filter_result(
         TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR,
         TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR_V2,
         TRAJ_FILTER_PROFILE_WRIST,
+        TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE,
+        TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE_NO_HEATMAP,
         TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR_TOP95,
         TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR,
     }:
@@ -1718,6 +2300,8 @@ def build_traj_filter_result(
     ablation_mode = resolve_traj_filter_ablation_mode(filter_args)
     wrist_like_profiles = {
         TRAJ_FILTER_PROFILE_WRIST,
+        TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE,
+        TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE_NO_HEATMAP,
         TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR_TOP95,
         TRAJ_FILTER_PROFILE_WRIST_MANIPULATOR,
     }
@@ -1760,6 +2344,8 @@ def build_traj_filter_result(
     default_query_depth_patch_valid_ratio = np.full(num_tracks, np.nan, dtype=np.float32)
     default_query_depth_patch_std = np.full(num_tracks, np.nan, dtype=np.float32)
     default_all_true_mask = np.ones(num_tracks, dtype=bool)
+    default_pick_place_count = np.zeros(num_tracks, dtype=np.uint16)
+    default_pick_place_distance = np.full(num_tracks, np.nan, dtype=np.float32)
     filter_result_base_geometry_seconds = 0.0
     filter_result_query_depth_patch_stats_seconds = 0.0
     filter_result_query_depth_quality_seconds = 0.0
@@ -1807,6 +2393,13 @@ def build_traj_filter_result(
             "traj_motion_mask": default_manipulator_mask.copy(),
             "traj_cluster_mask": default_manipulator_mask.copy(),
             "traj_pre_top95_mask": default_all_true_mask.copy(),
+            "traj_pick_place_heatmap_hit_count": default_pick_place_count.copy(),
+            "traj_pick_place_heatmap_support_mask": default_manipulator_mask.copy(),
+            "traj_pick_place_min_manipulator_distance": default_pick_place_distance.copy(),
+            "traj_pick_place_contact_mask": default_manipulator_mask.copy(),
+            "traj_pick_place_depth_guard_mask": default_manipulator_mask.copy(),
+            "traj_pick_place_delayed_contact_rescue_mask": default_manipulator_mask.copy(),
+            "traj_pick_place_object_mask": default_manipulator_mask.copy(),
         }
         _accumulate_profile_stat(
             profile_stats,
@@ -2007,6 +2600,13 @@ def build_traj_filter_result(
     traj_motion_mask = default_manipulator_mask.copy()
     traj_cluster_mask = default_manipulator_mask.copy()
     traj_pre_top95_mask = default_manipulator_mask.copy()
+    traj_pick_place_heatmap_hit_count = default_pick_place_count.copy()
+    traj_pick_place_heatmap_support_mask = default_manipulator_mask.copy()
+    traj_pick_place_min_manipulator_distance = default_pick_place_distance.copy()
+    traj_pick_place_contact_mask = default_manipulator_mask.copy()
+    traj_pick_place_depth_guard_mask = default_manipulator_mask.copy()
+    traj_pick_place_delayed_contact_rescue_mask = default_manipulator_mask.copy()
+    traj_pick_place_object_mask = default_manipulator_mask.copy()
     external_seed_mask = base_mask & query_depth_mask & temporal_mask
 
     if profile in {
@@ -2156,6 +2756,14 @@ def build_traj_filter_result(
                 extrinsics_segment=extrinsics_segment,
                 expected_num_frames=num_frames,
             )
+            reusable_geometry = (
+                {}
+                if profile in {
+                    TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE,
+                    TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE_NO_HEATMAP,
+                }
+                else None
+            )
             apply_near_depth_filter = (
                 ablation_mode != TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_DEPTH
                 and ablation_mode != TRAJ_FILTER_ABLATION_MODE_WRIST_SEED_TOP95
@@ -2168,6 +2776,8 @@ def build_traj_filter_result(
                 ablation_mode != TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_CLUSTER
                 and ablation_mode != TRAJ_FILTER_ABLATION_MODE_WRIST_SEED_TOP95
             )
+            if profile == TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE_NO_HEATMAP:
+                apply_cluster_filter = False
             manipulator_near_depth_before = _get_profile_stat(
                 profile_stats, "filter_result_manipulator_near_depth_seconds"
             )
@@ -2180,6 +2790,25 @@ def build_traj_filter_result(
             manipulator_cluster_before = _get_profile_stat(
                 profile_stats, "filter_result_manipulator_cluster_seconds"
             )
+            manipulator_filter_kwargs = {}
+            if profile == TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE:
+                manipulator_filter_kwargs.update(
+                    {
+                        "component_keep_mode": "major",
+                        "major_component_ratio": config["wrist_pick_place_major_component_ratio"],
+                        "major_component_min_motion_ratio": (
+                            config["wrist_pick_place_major_component_min_motion_ratio"]
+                        ),
+                        "major_component_depth_margin_m": (
+                            config["wrist_pick_place_major_component_depth_margin_m"]
+                        ),
+                    }
+                )
+            max_depth_rank = config["wrist_manipulator_max_depth_rank"]
+            min_motion_extent = config["wrist_manipulator_min_motion_extent"]
+            if profile == TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE_NO_HEATMAP:
+                max_depth_rank = config["wrist_pick_place_no_heatmap_max_depth_rank"]
+                min_motion_extent = config["wrist_pick_place_no_heatmap_anchor_min_motion_extent"]
             (
                 manipulator_final_mask,
                 traj_query_depth_rank,
@@ -2205,8 +2834,8 @@ def build_traj_filter_result(
                 image_width=image_width,
                 min_depth=config["min_depth"],
                 max_depth=config["max_depth"],
-                max_depth_rank=config["wrist_manipulator_max_depth_rank"],
-                min_motion_extent=config["wrist_manipulator_min_motion_extent"],
+                max_depth_rank=max_depth_rank,
+                min_motion_extent=min_motion_extent,
                 cluster_radius_ratio=config["wrist_manipulator_cluster_radius_ratio"],
                 cluster_radius_min_px=config["wrist_manipulator_cluster_radius_min_px"],
                 min_component_ratio=config["wrist_manipulator_min_component_ratio"],
@@ -2215,8 +2844,11 @@ def build_traj_filter_result(
                 apply_near_depth_filter=apply_near_depth_filter,
                 apply_motion_filter=apply_motion_filter,
                 apply_cluster_filter=apply_cluster_filter,
+                reusable_geometry=reusable_geometry,
                 profile_stats=profile_stats,
+                **manipulator_filter_kwargs,
             )
+            pick_place_world_tracks = None if reusable_geometry is None else reusable_geometry.get("world_tracks")
             filter_result_manipulator_near_depth_seconds += max(
                 0.0,
                 _get_profile_stat(profile_stats, "filter_result_manipulator_near_depth_seconds")
@@ -2239,16 +2871,81 @@ def build_traj_filter_result(
             )
             traj_manipulator_cluster_fallback_used = np.asarray(fallback_used, dtype=bool)
 
-            if apply_near_depth_filter:
-                reason_bits[wrist_seed_mask & (~traj_near_depth_mask)] |= MASK_REASON_MANIPULATOR_DEPTH_FAIL
-            if apply_motion_filter:
-                reason_bits[wrist_seed_mask & (~traj_motion_mask)] |= MASK_REASON_MANIPULATOR_MOTION_FAIL
-            if apply_cluster_filter:
-                reason_bits[traj_manipulator_candidate_mask & (~traj_cluster_mask)] |= (
-                    MASK_REASON_MANIPULATOR_CLUSTER_FAIL
+            if profile == TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE_NO_HEATMAP:
+                traj_cluster_mask, region_fallback_used = _build_anchor_query_region_mask(
+                    keypoints=keypoints,
+                    anchor_mask=traj_manipulator_candidate_mask,
+                    min_anchor_count=config["wrist_pick_place_no_heatmap_min_anchor_count"],
+                    bbox_x_pad_px=config["wrist_pick_place_no_heatmap_bbox_x_pad_px"],
+                    bbox_y_pad_up_px=config["wrist_pick_place_no_heatmap_bbox_y_pad_up_px"],
+                    bbox_y_pad_down_px=config["wrist_pick_place_no_heatmap_bbox_y_pad_down_px"],
                 )
+                local_keep_mask = traj_near_depth_mask & traj_cluster_mask
+                final_mask = local_keep_mask.copy()
+                traj_manipulator_cluster_fallback_used = np.asarray(region_fallback_used, dtype=bool)
+                reason_bits[wrist_seed_mask & (~traj_near_depth_mask)] |= MASK_REASON_MANIPULATOR_DEPTH_FAIL
+                reason_bits[traj_near_depth_mask & (~traj_cluster_mask)] |= MASK_REASON_MANIPULATOR_CLUSTER_FAIL
+            else:
+                if apply_near_depth_filter:
+                    reason_bits[wrist_seed_mask & (~traj_near_depth_mask)] |= MASK_REASON_MANIPULATOR_DEPTH_FAIL
+                if apply_motion_filter:
+                    reason_bits[wrist_seed_mask & (~traj_motion_mask)] |= MASK_REASON_MANIPULATOR_MOTION_FAIL
+                if apply_cluster_filter:
+                    reason_bits[traj_manipulator_candidate_mask & (~traj_cluster_mask)] |= (
+                        MASK_REASON_MANIPULATOR_CLUSTER_FAIL
+                    )
 
-            if ablation_mode == TRAJ_FILTER_ABLATION_MODE_WRIST_SEED_TOP95:
+            if profile == TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE:
+                (
+                    traj_pick_place_object_mask,
+                    traj_pick_place_heatmap_hit_count,
+                    traj_pick_place_heatmap_support_mask,
+                    traj_pick_place_min_manipulator_distance,
+                    traj_pick_place_contact_mask,
+                    traj_pick_place_depth_guard_mask,
+                ) = _apply_pick_place_object_filter(
+                    traj=traj,
+                    seed_mask=wrist_seed_mask,
+                    manipulator_reference_mask=manipulator_final_mask,
+                    manipulator_reference_component_ids=traj_manipulator_cluster_id,
+                    intrinsics_segment=intrinsics_segment,
+                    extrinsics_segment=extrinsics_segment,
+                    min_depth=config["min_depth"],
+                    max_depth=config["max_depth"],
+                    pick_place_heatmap_segment=pick_place_heatmap_segment,
+                    min_heatmap_hits=config["wrist_pick_place_min_heatmap_hits"],
+                    max_manipulator_distance_m=config["wrist_pick_place_max_manipulator_distance_m"],
+                    query_depth_margin_m=config["wrist_pick_place_query_depth_margin_m"],
+                    world_tracks=pick_place_world_tracks,
+                )
+                final_mask = manipulator_final_mask | traj_pick_place_object_mask
+                traj_pre_top95_mask = final_mask.copy()
+            elif profile == TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE_NO_HEATMAP:
+                (
+                    traj_pick_place_delayed_contact_rescue_mask,
+                    traj_pick_place_min_manipulator_distance,
+                    traj_pick_place_contact_mask,
+                    traj_pick_place_depth_guard_mask,
+                    _traj_pick_place_delayed_contact_mask,
+                ) = _apply_delayed_contact_object_rescue_filter(
+                    traj=traj,
+                    visibs=visibility,
+                    seed_mask=wrist_seed_mask,
+                    local_keep_mask=final_mask,
+                    manipulator_reference_mask=traj_manipulator_candidate_mask,
+                    manipulator_reference_component_ids=traj_manipulator_cluster_id,
+                    intrinsics_segment=intrinsics_segment,
+                    extrinsics_segment=extrinsics_segment,
+                    min_depth=config["min_depth"],
+                    max_depth=config["max_depth"],
+                    max_manipulator_distance_m=config["wrist_pick_place_max_manipulator_distance_m"],
+                    query_depth_margin_m=config["wrist_pick_place_query_depth_margin_m"],
+                    world_tracks=pick_place_world_tracks,
+                )
+                traj_pick_place_object_mask = traj_pick_place_delayed_contact_rescue_mask.copy()
+                final_mask = final_mask | traj_pick_place_delayed_contact_rescue_mask
+                traj_pre_top95_mask = final_mask.copy()
+            elif ablation_mode == TRAJ_FILTER_ABLATION_MODE_WRIST_SEED_TOP95:
                 traj_pre_top95_mask = wrist_seed_mask.copy()
                 top95_start = time.perf_counter()
                 final_mask = _apply_top_motion_extent_filter(
@@ -2279,6 +2976,8 @@ def build_traj_filter_result(
             else:
                 final_mask = manipulator_final_mask
                 traj_pre_top95_mask = final_mask.copy()
+
+    reason_bits[final_mask] = 0
 
     result = {
         "traj_valid_mask": final_mask.astype(bool),
@@ -2316,6 +3015,13 @@ def build_traj_filter_result(
         "traj_motion_mask": traj_motion_mask.astype(bool),
         "traj_cluster_mask": traj_cluster_mask.astype(bool),
         "traj_pre_top95_mask": traj_pre_top95_mask.astype(bool),
+        "traj_pick_place_heatmap_hit_count": traj_pick_place_heatmap_hit_count.astype(np.uint16),
+        "traj_pick_place_heatmap_support_mask": traj_pick_place_heatmap_support_mask.astype(bool),
+        "traj_pick_place_min_manipulator_distance": traj_pick_place_min_manipulator_distance.astype(np.float32),
+        "traj_pick_place_contact_mask": traj_pick_place_contact_mask.astype(bool),
+        "traj_pick_place_depth_guard_mask": traj_pick_place_depth_guard_mask.astype(bool),
+        "traj_pick_place_delayed_contact_rescue_mask": traj_pick_place_delayed_contact_rescue_mask.astype(bool),
+        "traj_pick_place_object_mask": traj_pick_place_object_mask.astype(bool),
     }
     filter_result_total_seconds = time.perf_counter() - filter_result_start
     _accumulate_profile_stat(profile_stats, "filter_result_total_seconds", filter_result_total_seconds)

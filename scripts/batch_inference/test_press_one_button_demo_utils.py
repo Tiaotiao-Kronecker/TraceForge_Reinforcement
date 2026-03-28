@@ -90,8 +90,39 @@ def _collect_cli_defaults(func_ast: ast.FunctionDef) -> dict[str, object]:
     return defaults
 
 
+def _collect_cli_choices(func_ast: ast.FunctionDef) -> dict[str, tuple[str, ...]]:
+    choices: dict[str, tuple[str, ...]] = {}
+    for node in ast.walk(func_ast):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != "add_argument":
+            continue
+        flag = None
+        for arg in node.args:
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str) and arg.value.startswith("--"):
+                flag = arg.value
+                break
+        if flag is None:
+            continue
+        for keyword in node.keywords:
+            if keyword.arg != "choices":
+                continue
+            if not isinstance(keyword.value, (ast.List, ast.Tuple)):
+                continue
+            values: list[str] = []
+            for element in keyword.value.elts:
+                if isinstance(element, ast.Constant) and isinstance(element.value, str):
+                    values.append(element.value)
+            if values:
+                choices[flag] = tuple(values)
+    return choices
+
+
 _CLI_FLAGS = _collect_cli_flags(_PARSE_ARGS_FUNC_AST)
 _CLI_DEFAULTS = _collect_cli_defaults(_PARSE_ARGS_FUNC_AST)
+_CLI_CHOICES = _collect_cli_choices(_PARSE_ARGS_FUNC_AST)
 
 
 class ResolveTrajFilterProfileTests(unittest.TestCase):
@@ -145,6 +176,9 @@ class PressOneButtonCliSurfaceTests(unittest.TestCase):
 
     def test_support_grid_ratio_default_is_point_eight(self):
         self.assertEqual(_CLI_DEFAULTS.get("--support_grid_ratio"), 0.8)
+
+    def test_exposes_wrist_pick_place_no_heatmap_profile(self):
+        self.assertIn("wrist_pick_place_no_heatmap", _CLI_CHOICES.get("--traj_filter_profile", ()))
 
 
 class BatchTelemetryRecordTests(unittest.TestCase):

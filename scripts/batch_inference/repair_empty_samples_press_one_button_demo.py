@@ -909,6 +909,8 @@ def parse_args() -> argparse.Namespace:
             "external_manipulator",
             "external_manipulator_v2",
             "wrist",
+            "wrist_pick_place",
+            "wrist_pick_place_no_heatmap",
             "wrist_manipulator_top95",
             "wrist_manipulator",
         ],

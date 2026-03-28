@@ -48,6 +48,7 @@ from utils.traj_filter_utils import (
     TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_MOTION,
     TRAJ_FILTER_ABLATION_MODE_WRIST_NO_QUERY_EDGE,
     TRAJ_FILTER_ABLATION_MODE_WRIST_SEED_TOP95,
+    TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE,
     build_traj_filter_result,
     build_query_prefilter_result,
     compute_accessed_high_volatility_mask,
@@ -93,6 +94,48 @@ def _get_profile_stat(
     if profile_stats is None:
         return 0.0
     return float(profile_stats.get(key, 0.0))
+
+
+def _resolve_pick_place_heatmap_dir(video_source_path: str | None) -> Path | None:
+    if not video_source_path:
+        return None
+    source_rgb_path = Path(video_source_path)
+    if not source_rgb_path.is_dir() or source_rgb_path.parent.name != "rgb":
+        return None
+    heatmap_dir = source_rgb_path.parent.parent / "heatmap" / source_rgb_path.name
+    return heatmap_dir if heatmap_dir.is_dir() else None
+
+
+def _load_pick_place_heatmap_segment(
+    *,
+    heatmap_dir: Path | None,
+    source_frame_indices: np.ndarray,
+    heatmap_cache: dict[int, np.ndarray] | None,
+) -> np.ndarray | None:
+    if heatmap_dir is None:
+        return None
+    source_frame_indices = np.asarray(source_frame_indices, dtype=np.int32).reshape(-1)
+    if source_frame_indices.size == 0:
+        return None
+
+    heatmap_frames: list[np.ndarray] = []
+    for source_frame_idx in source_frame_indices.tolist():
+        if heatmap_cache is not None and source_frame_idx in heatmap_cache:
+            heatmap_frames.append(heatmap_cache[source_frame_idx])
+            continue
+        heatmap_path = heatmap_dir / f"{int(source_frame_idx):05d}.npz"
+        if not heatmap_path.is_file():
+            logger.warning(f"Missing pick heatmap for wrist_pick_place profile: {heatmap_path}")
+            return None
+        with np.load(heatmap_path, allow_pickle=False) as heatmap_data:
+            if "pick" not in heatmap_data:
+                logger.warning(f"Missing 'pick' channel for wrist_pick_place profile: {heatmap_path}")
+                return None
+            frame_heatmap = np.asarray(heatmap_data["pick"]).astype(bool, copy=False)
+        if heatmap_cache is not None:
+            heatmap_cache[source_frame_idx] = frame_heatmap
+        heatmap_frames.append(frame_heatmap)
+    return np.stack(heatmap_frames, axis=0)
 
 
 def _count_true(mask: np.ndarray | None) -> int:
@@ -768,6 +811,8 @@ def parse_args():
             "external_manipulator",
             "external_manipulator_v2",
             "wrist",
+            "wrist_pick_place",
+            "wrist_pick_place_no_heatmap",
             "wrist_manipulator_top95",
             "wrist_manipulator",
         ],
@@ -776,6 +821,11 @@ def parse_args():
             "external_manipulator keeps external as the seed and then prunes to manipulator-like tracks; "
             "external_manipulator_v2 is a looser external manipulator profile that keeps major manipulator components; "
             "wrist keeps partial trajectories with per-frame supervision masks; "
+            "wrist_pick_place keeps the wrist seed, preserves the manipulator branch, and adds a pick-heatmap-guided "
+            "object branch for pick_place scenes; "
+            "wrist_pick_place_no_heatmap keeps wrist pick_place lightweight by using motion anchors to define a local "
+            "query-frame keep region, then adds a delayed-contact rescue for query-visible pre-grasp objects without "
+            "loading pick heatmaps; "
             "wrist_manipulator_top95 keeps wrist_manipulator as the baseline and removes the lowest-motion 5 percent "
             "from its final tracks per sample; "
             "wrist_manipulator adds near-field and motion-aware pruning on top of wrist."
@@ -1091,6 +1141,13 @@ def _build_dense_sample_payload_from_tracked_subset(
         "traj_manipulator_cluster_fallback_used": np.asarray(
             tracked_sample_payload["traj_manipulator_cluster_fallback_used"], dtype=bool
         ),
+        "traj_pick_place_heatmap_hit_count": np.zeros(dense_track_count, dtype=np.uint16),
+        "traj_pick_place_heatmap_support_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_pick_place_min_manipulator_distance": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_pick_place_contact_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_pick_place_depth_guard_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_pick_place_delayed_contact_rescue_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_pick_place_object_mask": np.zeros(dense_track_count, dtype=bool),
     }
     if "visibility" in tracked_sample_payload:
         dense_payload["visibility"] = np.zeros((dense_track_count, num_frames), dtype=np.float16)
@@ -1149,8 +1206,17 @@ def _build_dense_sample_payload_from_tracked_subset(
         "traj_manipulator_candidate_mask",
         "traj_manipulator_cluster_id",
         "traj_manipulator_component_size",
+        "traj_pick_place_heatmap_hit_count",
+        "traj_pick_place_heatmap_support_mask",
+        "traj_pick_place_min_manipulator_distance",
+        "traj_pick_place_contact_mask",
+        "traj_pick_place_depth_guard_mask",
+        "traj_pick_place_delayed_contact_rescue_mask",
+        "traj_pick_place_object_mask",
     )
     for field_name in per_track_fields:
+        if field_name not in tracked_sample_payload:
+            continue
         dense_payload[field_name][tracked_query_indices] = np.asarray(tracked_sample_payload[field_name]).astype(
             dense_payload[field_name].dtype,
             copy=False,
@@ -1338,6 +1404,7 @@ def build_query_frame_sample_data(
         filter_args=filter_args,
         keypoints=keypoints,
         query_depth=query_frame_depth,
+        pick_place_heatmap_segment=prepared_bundle.get("pick_place_heatmap_segment"),
         raw_depths_segment=raw_depths_segment,
         intrinsics_segment=intrinsics_np,
         extrinsics_segment=extrinsics_np,
@@ -1387,6 +1454,21 @@ def build_query_frame_sample_data(
         "traj_manipulator_cluster_fallback_used": np.asarray(
             traj_filter_result["traj_manipulator_cluster_fallback_used"], dtype=bool
         ),
+        "traj_pick_place_heatmap_hit_count": traj_filter_result["traj_pick_place_heatmap_hit_count"].astype(
+            np.uint16
+        ),
+        "traj_pick_place_heatmap_support_mask": traj_filter_result["traj_pick_place_heatmap_support_mask"].astype(
+            bool
+        ),
+        "traj_pick_place_min_manipulator_distance": traj_filter_result[
+            "traj_pick_place_min_manipulator_distance"
+        ].astype(np.float16),
+        "traj_pick_place_contact_mask": traj_filter_result["traj_pick_place_contact_mask"].astype(bool),
+        "traj_pick_place_depth_guard_mask": traj_filter_result["traj_pick_place_depth_guard_mask"].astype(bool),
+        "traj_pick_place_delayed_contact_rescue_mask": traj_filter_result[
+            "traj_pick_place_delayed_contact_rescue_mask"
+        ].astype(bool),
+        "traj_pick_place_object_mask": traj_filter_result["traj_pick_place_object_mask"].astype(bool),
     }
     if save_visibility:
         visibility = visibs_np
@@ -1508,6 +1590,16 @@ def build_v2_sample_data(
         "traj_manipulator_cluster_id": sample_payload["traj_manipulator_cluster_id"],
         "traj_manipulator_component_size": sample_payload["traj_manipulator_component_size"],
         "traj_manipulator_cluster_fallback_used": sample_payload["traj_manipulator_cluster_fallback_used"],
+        "traj_pick_place_heatmap_hit_count": sample_payload["traj_pick_place_heatmap_hit_count"],
+        "traj_pick_place_heatmap_support_mask": sample_payload["traj_pick_place_heatmap_support_mask"],
+        "traj_pick_place_min_manipulator_distance": sample_payload["traj_pick_place_min_manipulator_distance"],
+        "traj_pick_place_contact_mask": sample_payload["traj_pick_place_contact_mask"],
+        "traj_pick_place_depth_guard_mask": sample_payload["traj_pick_place_depth_guard_mask"],
+        "traj_pick_place_delayed_contact_rescue_mask": sample_payload.get(
+            "traj_pick_place_delayed_contact_rescue_mask",
+            np.zeros_like(sample_payload["traj_pick_place_object_mask"], dtype=bool),
+        ),
+        "traj_pick_place_object_mask": sample_payload["traj_pick_place_object_mask"],
     }
     if prepared_bundle.get("support_grid_size") is not None:
         sample_data["support_grid_size"] = np.array([int(prepared_bundle["support_grid_size"])], dtype=np.int32)
@@ -1592,11 +1684,17 @@ def _prepare_query_frame_sample_bundles(
     filter_args,
     filter_config: dict,
     full_depths: np.ndarray | None,
+    source_frame_indices: np.ndarray | None = None,
+    pick_place_heatmap_dir: Path | None = None,
     profile_stats: dict[str, float] | None = None,
     include_query_frame_image: bool = True,
 ) -> dict[int, dict[str, object]]:
     prepare_temporal_context = bool(filter_config["enabled"] and filter_config["use_temporal_depth_consistency"])
     prepared_bundles: dict[int, dict[str, object]] = {}
+    source_frame_indices = (
+        None if source_frame_indices is None else np.asarray(source_frame_indices, dtype=np.int32).reshape(-1)
+    )
+    heatmap_cache: dict[int, np.ndarray] | None = {} if pick_place_heatmap_dir is not None else None
     for query_frame_idx, frame_data in query_frame_results.items():
         segment_len = int(frame_data["coords"].shape[0])
         raw_depths_segment = (
@@ -1615,6 +1713,18 @@ def _prepare_query_frame_sample_bundles(
             profile_stats=profile_stats,
             include_query_frame_image=include_query_frame_image,
         )
+        if source_frame_indices is not None:
+            segment_source_frame_indices = source_frame_indices[query_frame_idx : query_frame_idx + segment_len]
+            prepared_bundles[query_frame_idx]["segment_source_frame_indices"] = segment_source_frame_indices.astype(
+                np.int32,
+                copy=False,
+            )
+            if filter_config["profile"] == TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE:
+                prepared_bundles[query_frame_idx]["pick_place_heatmap_segment"] = _load_pick_place_heatmap_segment(
+                    heatmap_dir=pick_place_heatmap_dir,
+                    source_frame_indices=segment_source_frame_indices,
+                    heatmap_cache=heatmap_cache,
+                )
     return prepared_bundles
 
 
@@ -1736,6 +1846,16 @@ def save_single_query_frame_legacy(
         "traj_manipulator_cluster_id": sample_payload["traj_manipulator_cluster_id"],
         "traj_manipulator_component_size": sample_payload["traj_manipulator_component_size"],
         "traj_manipulator_cluster_fallback_used": sample_payload["traj_manipulator_cluster_fallback_used"],
+        "traj_pick_place_heatmap_hit_count": sample_payload["traj_pick_place_heatmap_hit_count"],
+        "traj_pick_place_heatmap_support_mask": sample_payload["traj_pick_place_heatmap_support_mask"],
+        "traj_pick_place_min_manipulator_distance": sample_payload["traj_pick_place_min_manipulator_distance"],
+        "traj_pick_place_contact_mask": sample_payload["traj_pick_place_contact_mask"],
+        "traj_pick_place_depth_guard_mask": sample_payload["traj_pick_place_depth_guard_mask"],
+        "traj_pick_place_delayed_contact_rescue_mask": sample_payload.get(
+            "traj_pick_place_delayed_contact_rescue_mask",
+            np.zeros_like(sample_payload["traj_pick_place_object_mask"], dtype=bool),
+        ),
+        "traj_pick_place_object_mask": sample_payload["traj_pick_place_object_mask"],
         "valid_steps": valid_steps,
     }
     if prepared_bundle.get("support_grid_size") is not None:
@@ -1949,6 +2069,11 @@ def save_structured_data(
             raise ValueError(
                 f"Expected source_frame_indices shape {(frame_count,)}, got {source_frame_indices_np.shape}"
             )
+        pick_place_heatmap_dir = (
+            _resolve_pick_place_heatmap_dir(video_source_path)
+            if filter_config["profile"] == TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE
+            else None
+        )
 
         prepare_bundles_start = time.perf_counter()
         prepared_bundles = _prepare_query_frame_sample_bundles(
@@ -1957,6 +2082,8 @@ def save_structured_data(
             filter_args=filter_args,
             filter_config=filter_config,
             full_depths=full_depths_np,
+            source_frame_indices=source_frame_indices_np,
+            pick_place_heatmap_dir=pick_place_heatmap_dir,
             profile_stats=save_profile_stats,
             include_query_frame_image=False,
         )
@@ -2842,6 +2969,11 @@ def save_source_ref_v2_query_results(
         raise ValueError(
             f"Expected source_frame_indices shape {(int(frame_count),)}, got {source_frame_indices_np.shape}"
         )
+    pick_place_heatmap_dir = (
+        _resolve_pick_place_heatmap_dir(video_source_path)
+        if filter_config["profile"] == TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE
+        else None
+    )
 
     prepare_bundles_start = time.perf_counter()
     prepared_bundles = _prepare_query_frame_sample_bundles(
@@ -2850,6 +2982,8 @@ def save_source_ref_v2_query_results(
         filter_args=filter_args,
         filter_config=filter_config,
         full_depths=full_depths_np,
+        source_frame_indices=source_frame_indices_np,
+        pick_place_heatmap_dir=pick_place_heatmap_dir,
         profile_stats=save_profile_stats,
         include_query_frame_image=False,
     )

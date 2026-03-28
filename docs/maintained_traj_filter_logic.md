@@ -5,6 +5,11 @@
 - external 相机默认走 `traj_filter_profile=external`
 - wrist-like 相机在 `traj_filter_profile=auto` 下默认走 `wrist_manipulator_top95`
 
+另外，维护态还支持一个显式任务特化分支：
+
+- `traj_filter_profile=wrist_pick_place`
+- `traj_filter_profile=wrist_pick_place_no_heatmap`
+
 实现入口以 `utils/traj_filter_utils.py` 中的 `build_traj_filter_result()` 为准。本文只解释当前真实代码行为，不记录历史实验结论，也不覆盖已归档分析脚本的独立口径。
 
 ## 1. 适用范围与默认映射
@@ -30,6 +35,7 @@
 补充说明：
 
 - `wrist` 仍然存在，但不是 wrist-like 相机在维护态默认 `auto` 下的结果
+- `wrist_pick_place` 和 `wrist_pick_place_no_heatmap` 都已实现，但都需要显式指定；它们不是 wrist-like 相机在 `auto` 下的默认映射
 - `external_manipulator`、`external_manipulator_v2`、`wrist_manipulator` 都需要显式指定
 - `query_prefilter_mode` 默认是 `off`，不属于默认轨迹过滤主链
 
@@ -96,6 +102,8 @@ base_mask =
 只对 wrist-like profile 生效：
 
 - `wrist`
+- `wrist_pick_place`
+- `wrist_pick_place_no_heatmap`
 - `wrist_manipulator`
 - `wrist_manipulator_top95`
 
@@ -699,6 +707,15 @@ wrist-like `auto` 默认逻辑不是在问：
 - `traj_manipulator_component_size`
 - `traj_manipulator_cluster_fallback_used`
 
+其中 `wrist_pick_place` 还会额外写出 object 分支调试量：
+
+- `traj_pick_place_heatmap_hit_count`
+- `traj_pick_place_heatmap_support_mask`
+- `traj_pick_place_min_manipulator_distance`
+- `traj_pick_place_contact_mask`
+- `traj_pick_place_depth_guard_mask`
+- `traj_pick_place_object_mask`
+
 需要特别注意的是，下面这些中间 mask 目前只在运行时统计和 profile 计数里使用，并不会写入 sample NPZ：
 
 - `traj_base_mask`
@@ -731,7 +748,96 @@ wrist-like `auto` 默认逻辑不是在问：
 - `traj_motion_extent >= 0.01m`
 - 保留主要连通块，而不是只保留单个最大连通块
 
-### 7.3 query prefilter 和 ablation mode
+### 7.3 wrist_pick_place
+
+`wrist_pick_place` 是维护态里显式支持的 pick_place wrist 相机 profile。它不是默认 `auto` 路径，必须手动指定。
+
+它的最终目标不是“只保机械臂主体”，而是：
+
+- 保住 wrist seed 里的 manipulator / gripper 轨迹
+- 同时救回与 manipulator 接触并被 `pick` heatmap 支撑的物体轨迹
+
+代码上可概括为：
+
+```text
+wrist_seed_mask
+    -> manipulator 分支
+    -> pick_place object 分支
+
+final_mask = manipulator_final_mask | pick_place_object_mask
+```
+
+其中：
+
+- manipulator 分支沿用 `wrist_manipulator` 的 near-depth / motion 约束，但 cluster 阶段会保留多个 major components，而不是只保单个 largest component
+- 在 major-components 之后，`wrist_pick_place` 还会做一层 component refinement：
+  - component motion 中位数至少达到最佳 component 的 `75%`
+  - 或 component query depth 中位数距离最近 component 不超过 `0.08m`
+  - 其目标是继续保双臂，但压掉“整体更远且整体更静”的伪 component
+- object 分支当前要求：
+  - 轨迹在 sample 段内命中 `pick` heatmap
+  - 轨迹与 manipulator reference 在世界坐标下足够接近
+  - query 深度不能比 manipulator 分支远太多
+
+当前实现对应的维护态阈值是：
+
+- 最少 `2` 帧 `pick` heatmap 命中
+- 与 manipulator 的最小距离不超过 `0.20m`
+- query 深度相对 manipulator 的容差不超过 `0.25m`
+
+这条分支的物理语义是：
+
+“先用 wrist seed 保住前缀可信轨迹，再保留机械臂主体，并把与机械臂接触且被 pick cue 支撑的被抓物体一并保留下来。”
+
+这里的 contact reference 不是把所有 manipulator 点压成一个全局 centroid，而是对每个 major component 单独建 reference，再取最小距离。这样在双臂/双夹爪近似对称时，不会因为 reference 偏到中间而把靠近第二臂的 object 误杀。
+
+另外，`wrist_pick_place` 的 object depth guard 也不是再拿“全局 manipulator 深度分布”去比，而是：
+
+- 先为每条 object candidate 找最近的 manipulator component
+- 再只与该 component 的 query-depth upper bound 比较
+
+这样可以避免某个更远的 component 把另一个 component 附近的 object depth guard 一起放宽。
+
+### 7.4 wrist_pick_place_no_heatmap
+
+`wrist_pick_place_no_heatmap` 是为“没有 per-frame `pick` heatmap”的 pick_place wrist 数据额外提供的显式 profile。它同样不是默认 `auto` 路径，必须手动指定。
+
+它的目标不是复刻 `wrist_pick_place` 的 object branch，而是在尽量不增加时间花销的前提下，对 `wrist` 结果做一层很轻的局部去噪：
+
+- 保留 query frame 局部活动区域里的近深度轨迹
+- 压掉距离夹爪/物体较远的桌面伪轨迹和视野边缘伪轨迹
+
+代码上可概括为：
+
+```text
+wrist_seed_mask
+    -> near-depth + motion anchors
+    -> query-frame local keep region
+
+final_mask = traj_near_depth_mask & local_region_mask
+```
+
+其中：
+
+- anchor 的候选集合复用 wrist manipulator 逻辑，但只把它当作“局部活动区域估计器”，不再把 motion fail 直接当成最终拒绝条件
+- motion 统计使用 all-valid motion，而不是 supervised prefix motion
+- local region 直接在 query frame 上根据 anchor 的 2D 包围框构造，并做固定像素 padding
+- 如果 anchor 数量太少，就回退成只做 near-depth rank gate，不额外做 region 限制
+
+当前实现对应的维护态阈值是：
+
+- query-depth rank 最多保留前 `50%`
+- anchor 的 all-valid motion extent 至少 `0.03m`
+- query-frame region padding：左右各 `80px`、上 `40px`、下 `220px`
+- 至少需要 `8` 条 anchor 才启用 local region；否则走 rank-only fallback
+
+这条分支的物理语义是：
+
+“先用 wrist seed 保住前缀可信轨迹，再用会动且更近的局部 anchor 估计夹爪活动带，只保留这片局部区域里的近深度点。”
+
+它刻意不再额外区分 manipulator 和 object 两类语义，也不依赖 heatmap I/O；目标只是用一层很便宜的局部几何约束，把 `wrist` 在 pick_place 里常见的远处桌面噪声压掉。
+
+### 7.5 query prefilter 和 ablation mode
 
 这两项都不属于维护态默认轨迹过滤主链：
 
@@ -746,10 +852,12 @@ wrist-like `auto` 默认逻辑不是在问：
 
 ## 8. 新任务场景下的适配建议
 
-本节讨论的是“当前 wrist-like `auto` 默认逻辑是否适合新任务”，不是描述已经实现的新 profile。当前结论是：
+本节讨论的是“当前 wrist-like `auto` 默认逻辑是否适合新任务”，不是只讨论历史建议。当前结论是：
 
 - external 相机默认 `external` 仍然基本可沿用
 - wrist 相机不能再把 `auto -> wrist_manipulator_top95` 当成通用默认
+- 对具备 per-frame `pick` heatmap 的 pick_place wrist 数据，当前应优先使用 `wrist_pick_place`
+- 对没有 per-frame `pick` heatmap 的 pick_place wrist 数据，当前应优先使用 `wrist_pick_place_no_heatmap`
 
 ### 8.1 为什么 `press` 场景下当前 wrist 默认问题不大
 
@@ -837,46 +945,51 @@ wrist-like `auto` 默认逻辑不是在问：
 
 ### 8.4 对两类新任务的短期配置建议
 
-如果短期内不改代码，只用现有 profile 和 ablation mode，建议这样设：
+当前维护态如果只使用现有 profile 和 ablation mode，建议这样设：
 
 | 场景 | wrist 相机建议配置 | 原因 |
 | --- | --- | --- |
 | `press` | 继续可用 `auto` | 当前默认就是围绕“机械臂主体”优化的 |
-| `pick_place` | 改成 `traj_filter_profile=wrist` | 停在 `wrist_seed_mask`，避免 manipulator-only 收缩杀掉物体 |
+| `pick_place` | 优先用 `traj_filter_profile=wrist_pick_place` | 保留 manipulator 分支，并额外救回被 `pick` heatmap 支撑且与 manipulator 接触的被抓物体 |
+| `pick_place` 无可用 `pick` heatmap | 优先用 `traj_filter_profile=wrist_pick_place_no_heatmap` | 仍从 wrist seed 出发，但增加一层低成本局部区域去噪，压掉远处桌面/视野外伪轨迹 |
 | `push_pull` | 先用 `traj_filter_profile=wrist` | 先避免 near-depth / motion / cluster / top95 把把手裁掉 |
 | `push_pull` 若把手仍严重丢失 | 再试 `traj_filter_ablation_mode=wrist_no_query_edge` | 把手很容易死在 edge-risk 这一步 |
 | 所有新场景 | `query_prefilter_mode=off` | 不要在 tracking 之前就按 wrist-manipulator 偏好裁 query seed |
 
 这里要特别强调：
 
-- `pick_place` 不建议继续使用 `wrist_manipulator`
+- `pick_place` 现在不建议继续使用 `wrist_manipulator`
 - `pick_place` 更不建议继续使用 `wrist_manipulator_top95`
+- `pick_place` 在有 `pick` heatmap 时，优先使用 `wrist_pick_place`
+- `pick_place` 在没有 `pick` heatmap 时，优先使用 `wrist_pick_place_no_heatmap`
 - `push_pull` 也不应把 `wrist_manipulator_top95` 当默认起点
 
 短期内，更合理的策略是：
 
-- 先用 `wrist` 保住“前缀阶段可信”的轨迹
+- `pick_place` 有 `pick` heatmap 时先切到 `wrist_pick_place`
+- `pick_place` 没有 `pick` heatmap 时先切到 `wrist_pick_place_no_heatmap`
+- `push_pull` 先用 `wrist` 保住“前缀阶段可信”的轨迹
 - 再基于可视化结果判断缺的是被抓物体、把手，还是接触边缘
 
-### 8.5 长期建议：新增 interaction-aware wrist profile
+### 8.5 interaction-aware wrist profile 的现状与后续建议
 
 如果后续要把这两类任务作为维护态支持场景，建议不要继续共用一个“只收缩到机械臂主体”的 wrist 默认 profile，而是至少拆成两类。
 
-#### 建议一：`wrist_pick_place`
+#### 已实现：`wrist_pick_place`
 
 目标不是“只保机械臂主体”，而是：
 
 - 保机械臂主体
 - 保被抓住并与机械臂共同运动的物体
 
-建议的物理逻辑：
+当前实现的物理逻辑：
 
 1. 先从 `wrist_seed_mask` 保住所有前缀可信的 wrist 轨迹
 2. 一条分支继续做 manipulator-aware 收缩，得到 gripper body
 3. 另一条分支专门寻找“在接触后与 gripper 共动”的物体轨迹
 4. 最终保留 `gripper_mask OR grasped_object_mask`
 
-其中 object 分支不应继续强依赖：
+当前 object 分支明确不再强依赖：
 
 - 初始近深度
 - 初始大 motion
@@ -884,7 +997,25 @@ wrist-like `auto` 默认逻辑不是在问：
 
 因为对被抓物体来说，这三条都可能不成立。
 
-#### 建议二：`wrist_push_pull`
+#### 已实现：`wrist_pick_place_no_heatmap`
+
+目标不是在没有 heatmap 时重新发明一套更重的 interaction-aware object classifier，而是：
+
+- 继续从 `wrist_seed_mask` 出发
+- 尽量保住夹爪附近、与活动区域局部相关的 pick/place 轨迹
+- 用最低额外成本压掉远处桌面和视野外伪轨迹
+
+当前实现的物理逻辑：
+
+1. 先从 `wrist_seed_mask` 出发
+2. 用 near-depth + all-valid motion 选出一批局部 activity anchors
+3. 在 query frame 上用这些 anchors 构造一个带 padding 的局部 keep region
+4. 最终只保留 `near_depth_mask & local_region_mask`
+5. 如果 anchor 太少，则回退成 rank-only near-depth gate
+
+这条分支的核心不是“识别出 object 类别”，而是“把真正发生交互的局部区域框出来”。它比直接退回 `wrist` 更干净，但又明显比重新做 heatmap/object 推断更便宜。
+
+#### 仍建议新增：`wrist_push_pull`
 
 目标不是“只保最大主体团”，而是：
 
@@ -907,13 +1038,13 @@ wrist-like `auto` 默认逻辑不是在问：
 如果要务实推进，建议按下面顺序做，而不是一开始就发明一套很复杂的新 heuristic：
 
 1. 在新场景上停止使用 wrist `auto`
-2. 先把 wrist profile 切到 `wrist`
+2. `pick_place` 若有 `pick` heatmap，优先切到 `wrist_pick_place`；若没有，则优先切到 `wrist_pick_place_no_heatmap`；`push_pull` 先切到 `wrist`
 3. 对代表性 `pick_place` / `push_pull` case 导出可视化
 4. 分别确认实际缺失的是：
    - 被抓物体
    - 门把手/拉手
    - 接触边界附近轨迹
-5. 再针对任务分别新增 `wrist_pick_place` 和 `wrist_push_pull`
+5. 在 `pick_place` 已有分支基础上继续调参数；并针对 `push_pull` 新增 `wrist_push_pull`
 
 这比继续把所有 wrist 任务都塞进 `wrist_manipulator_top95` 更稳妥。因为：
 

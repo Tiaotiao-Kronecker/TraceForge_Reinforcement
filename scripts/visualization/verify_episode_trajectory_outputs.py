@@ -38,6 +38,10 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from utils.traceforge_artifact_utils import (
+    RENDER_MODE_FINITE,
+    RENDER_MODE_HYBRID,
+    RENDER_MODE_SUPERVISION,
+    RENDER_MODES,
     SceneReader,
     build_pointcloud_from_frame,
     build_sample_visualization_view,
@@ -54,6 +58,14 @@ DEFAULT_CAMERAS = [
 ]
 
 RESAMPLE_LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
+GIF_TRACK_SAMPLING_SHARED = "shared"
+GIF_TRACK_SAMPLING_BALANCED = "balanced"
+GIF_TRACK_SAMPLING_TOP_MOTION = "top_motion"
+GIF_TRACK_SAMPLING_MODES = (
+    GIF_TRACK_SAMPLING_SHARED,
+    GIF_TRACK_SAMPLING_BALANCED,
+    GIF_TRACK_SAMPLING_TOP_MOTION,
+)
 
 
 @dataclass(frozen=True)
@@ -197,6 +209,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also export per-camera 2D/3D GIFs. Disabled by default because 3D GIF generation is slow.",
     )
+    parser.add_argument(
+        "--render_mode",
+        type=str,
+        default=RENDER_MODE_SUPERVISION,
+        choices=RENDER_MODES,
+        help="Trajectory render mode: supervision, finite, or hybrid.",
+    )
+    parser.add_argument(
+        "--gif_track_sampling",
+        type=str,
+        default=GIF_TRACK_SAMPLING_BALANCED,
+        choices=GIF_TRACK_SAMPLING_MODES,
+        help="How GIF track subsets are chosen when --max_gif_tracks is smaller than the PNG selection.",
+    )
     return parser
 
 
@@ -327,6 +353,12 @@ def make_track_colors(num_tracks: int) -> np.ndarray:
     return np.asarray([cmap(float(v))[:3] for v in values], dtype=np.float32)
 
 
+def fade_track_colors(track_colors: np.ndarray, *, blend: float = 0.72) -> np.ndarray:
+    track_colors = np.asarray(track_colors, dtype=np.float32)
+    blend = float(np.clip(blend, 0.0, 1.0))
+    return track_colors * (1.0 - blend) + blend
+
+
 def set_axes_equal(ax, points: np.ndarray) -> None:
     finite = points[np.isfinite(points).all(axis=1)]
     if len(finite) == 0:
@@ -398,12 +430,227 @@ def sample_cloud_points(
     return cloud_points[cloud_sel], cloud_colors[cloud_sel]
 
 
+def build_track_group_labels(
+    *,
+    traj_pick_place_object_mask: np.ndarray,
+    traj_manipulator_cluster_id: np.ndarray,
+    track_indices: np.ndarray,
+) -> list[tuple[str, int]]:
+    traj_pick_place_object_mask = np.asarray(traj_pick_place_object_mask, dtype=bool)
+    traj_manipulator_cluster_id = np.asarray(traj_manipulator_cluster_id, dtype=np.int32)
+    track_indices = np.asarray(track_indices, dtype=np.int32).reshape(-1)
+    if traj_pick_place_object_mask.shape != traj_manipulator_cluster_id.shape:
+        raise ValueError(
+            "Expected traj_pick_place_object_mask and traj_manipulator_cluster_id to share shape, got "
+            f"{traj_pick_place_object_mask.shape} and {traj_manipulator_cluster_id.shape}"
+        )
+
+    group_labels: list[tuple[str, int]] = []
+    for track_idx in track_indices.tolist():
+        branch = "object" if bool(traj_pick_place_object_mask[track_idx]) else "manip"
+        component_id = int(traj_manipulator_cluster_id[track_idx])
+        if component_id < 0:
+            component_id = -1
+        group_labels.append((branch, component_id))
+    return group_labels
+
+
+def choose_balanced_subset(track_indices: np.ndarray, max_tracks: int, group_labels: list[tuple[str, int]]) -> np.ndarray:
+    track_indices = np.asarray(track_indices, dtype=np.int32).reshape(-1)
+    max_tracks = int(max_tracks)
+    if max_tracks <= 0 or track_indices.size <= max_tracks:
+        return track_indices.copy()
+    if len(group_labels) != track_indices.size:
+        raise ValueError(
+            f"Expected group_labels length {track_indices.size}, got {len(group_labels)}"
+        )
+
+    ordered_groups: list[tuple[str, int]] = []
+    group_positions: dict[tuple[str, int], list[int]] = {}
+    for position, group_label in enumerate(group_labels):
+        if group_label not in group_positions:
+            group_positions[group_label] = []
+            ordered_groups.append(group_label)
+        group_positions[group_label].append(position)
+
+    selected_positions: list[int] = []
+    next_offsets: dict[tuple[str, int], int] = {group_label: 0 for group_label in ordered_groups}
+
+    for group_label in ordered_groups:
+        if len(selected_positions) >= max_tracks:
+            break
+        selected_positions.append(group_positions[group_label][0])
+        next_offsets[group_label] = 1
+
+    while len(selected_positions) < max_tracks:
+        made_progress = False
+        for group_label in ordered_groups:
+            offset = next_offsets[group_label]
+            positions = group_positions[group_label]
+            if offset >= len(positions):
+                continue
+            selected_positions.append(positions[offset])
+            next_offsets[group_label] = offset + 1
+            made_progress = True
+            if len(selected_positions) >= max_tracks:
+                break
+        if not made_progress:
+            break
+
+    selected_positions = sorted(selected_positions[:max_tracks])
+    return track_indices[np.asarray(selected_positions, dtype=np.int32)]
+
+
+def choose_gif_track_indices(
+    *,
+    track_indices: np.ndarray,
+    max_gif_tracks: int,
+    gif_track_sampling: str,
+    group_labels: list[tuple[str, int]],
+) -> np.ndarray:
+    track_indices = np.asarray(track_indices, dtype=np.int32).reshape(-1)
+    if track_indices.size <= max_gif_tracks:
+        return track_indices.copy()
+    if gif_track_sampling == GIF_TRACK_SAMPLING_SHARED:
+        return track_indices.copy()
+    if gif_track_sampling == GIF_TRACK_SAMPLING_TOP_MOTION:
+        return track_indices[: max_gif_tracks].copy()
+    if gif_track_sampling == GIF_TRACK_SAMPLING_BALANCED:
+        return choose_balanced_subset(track_indices, max_gif_tracks, group_labels)
+    raise ValueError(f"Unsupported gif_track_sampling: {gif_track_sampling}")
+
+
+def _plot_2d_trajectories(
+    *,
+    ax,
+    traj_primary: np.ndarray,
+    traj_secondary: np.ndarray,
+    track_colors: np.ndarray,
+    line_alpha: float,
+    line_width: float,
+    time_limit: int | None = None,
+) -> None:
+    faded_colors = fade_track_colors(track_colors)
+    for idx, color in enumerate(track_colors):
+        secondary = traj_secondary[idx]
+        if time_limit is not None:
+            secondary = secondary[: time_limit + 1]
+        secondary_valid = np.isfinite(secondary).all(axis=1)
+        if np.count_nonzero(secondary_valid) >= 2:
+            pts = secondary[secondary_valid]
+            ax.plot(
+                pts[:, 0],
+                pts[:, 1],
+                color=faded_colors[idx],
+                linewidth=max(0.8, line_width * 0.8),
+                alpha=max(0.2, line_alpha * 0.45),
+            )
+            ax.scatter(
+                pts[-1, 0],
+                pts[-1, 1],
+                s=10,
+                color=faded_colors[idx],
+                edgecolors="none",
+                linewidths=0.0,
+            )
+
+        primary = traj_primary[idx]
+        if time_limit is not None:
+            primary = primary[: time_limit + 1]
+        primary_valid = np.isfinite(primary).all(axis=1)
+        if np.count_nonzero(primary_valid) == 0:
+            continue
+        pts = primary[primary_valid]
+        if len(pts) >= 2:
+            ax.plot(
+                pts[:, 0],
+                pts[:, 1],
+                color=color,
+                linewidth=line_width,
+                alpha=line_alpha,
+            )
+        ax.scatter(
+            pts[-1, 0],
+            pts[-1, 1],
+            s=14,
+            color=color,
+            edgecolors="white",
+            linewidths=0.3,
+        )
+
+
+def _plot_3d_trajectories(
+    *,
+    ax,
+    traj_primary: np.ndarray,
+    traj_secondary: np.ndarray,
+    track_colors: np.ndarray,
+    line_alpha: float,
+    line_width: float,
+    time_limit: int | None = None,
+) -> list[np.ndarray]:
+    faded_colors = fade_track_colors(track_colors)
+    line_points: list[np.ndarray] = []
+    for idx, color in enumerate(track_colors):
+        secondary = traj_secondary[idx]
+        if time_limit is not None:
+            secondary = secondary[: time_limit + 1]
+        secondary_valid = np.isfinite(secondary).all(axis=1)
+        if np.count_nonzero(secondary_valid) >= 2:
+            pts = secondary[secondary_valid]
+            ax.plot(
+                pts[:, 0],
+                pts[:, 1],
+                pts[:, 2],
+                color=faded_colors[idx],
+                linewidth=max(0.8, line_width * 0.8),
+                alpha=max(0.2, line_alpha * 0.45),
+            )
+            ax.scatter(
+                pts[-1, 0],
+                pts[-1, 1],
+                pts[-1, 2],
+                color=faded_colors[idx],
+                s=8,
+                depthshade=False,
+            )
+            line_points.append(pts)
+
+        primary = traj_primary[idx]
+        if time_limit is not None:
+            primary = primary[: time_limit + 1]
+        primary_valid = np.isfinite(primary).all(axis=1)
+        if np.count_nonzero(primary_valid) == 0:
+            continue
+        pts = primary[primary_valid]
+        if len(pts) >= 2:
+            ax.plot(
+                pts[:, 0],
+                pts[:, 1],
+                pts[:, 2],
+                color=color,
+                linewidth=line_width,
+                alpha=line_alpha,
+            )
+        ax.scatter(
+            pts[-1, 0],
+            pts[-1, 1],
+            pts[-1, 2],
+            color=color,
+            s=10,
+            depthshade=False,
+        )
+        line_points.append(pts)
+    return line_points
+
+
 def create_2d_gif(
     *,
     camera_name: str,
     query_frame: int,
     rgb: np.ndarray,
-    traj_2d: np.ndarray,
+    traj_2d_primary: np.ndarray,
+    traj_2d_secondary: np.ndarray,
     track_indices: np.ndarray,
     gif_path: Path,
     line_alpha: float,
@@ -411,7 +658,8 @@ def create_2d_gif(
     gif_fps: int,
     gif_dpi: int,
 ) -> int:
-    selected_traj_2d = traj_2d[track_indices]
+    selected_traj_2d = traj_2d_primary[track_indices]
+    selected_traj_2d_secondary = traj_2d_secondary[track_indices]
     track_colors = make_track_colors(len(track_indices))
     num_frames = selected_traj_2d.shape[1]
     frames: list[Image.Image] = []
@@ -419,29 +667,15 @@ def create_2d_gif(
     for t in range(num_frames):
         fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
         ax.imshow(rgb)
-        for idx, color in enumerate(track_colors):
-            traj = selected_traj_2d[idx]
-            prefix = traj[: t + 1]
-            valid = np.isfinite(prefix).all(axis=1)
-            if np.count_nonzero(valid) == 0:
-                continue
-            pts = prefix[valid]
-            if len(pts) >= 2:
-                ax.plot(
-                    pts[:, 0],
-                    pts[:, 1],
-                    color=color,
-                    linewidth=line_width,
-                    alpha=line_alpha,
-                )
-            ax.scatter(
-                pts[-1, 0],
-                pts[-1, 1],
-                s=14,
-                color=color,
-                edgecolors="white",
-                linewidths=0.3,
-            )
+        _plot_2d_trajectories(
+            ax=ax,
+            traj_primary=selected_traj_2d,
+            traj_secondary=selected_traj_2d_secondary,
+            track_colors=track_colors,
+            line_alpha=line_alpha,
+            line_width=line_width,
+            time_limit=t,
+        )
         ax.set_title(f"{camera_name} | query frame {query_frame} | t={t} | 2D trajectories")
         ax.set_axis_off()
         frames.append(figure_to_image(fig, dpi=gif_dpi))
@@ -456,7 +690,8 @@ def create_3d_gif(
     query_frame: int,
     cloud_points: np.ndarray,
     cloud_colors: np.ndarray,
-    traj_world: np.ndarray,
+    traj_world_primary: np.ndarray,
+    traj_world_secondary: np.ndarray,
     track_indices: np.ndarray,
     gif_path: Path,
     max_cloud_points: int,
@@ -465,7 +700,8 @@ def create_3d_gif(
     gif_fps: int,
     gif_dpi: int,
 ) -> int:
-    selected_traj_world = traj_world[track_indices]
+    selected_traj_world = traj_world_primary[track_indices]
+    selected_traj_world_secondary = traj_world_secondary[track_indices]
     track_colors = make_track_colors(len(track_indices))
     num_frames = selected_traj_world.shape[1]
     cloud_points_plot, cloud_colors_plot = sample_cloud_points(
@@ -474,7 +710,10 @@ def create_3d_gif(
         max_cloud_points,
     )
 
-    traj_points = selected_traj_world.reshape(-1, 3)
+    traj_points = np.concatenate(
+        [selected_traj_world.reshape(-1, 3), selected_traj_world_secondary.reshape(-1, 3)],
+        axis=0,
+    )
     center, radius = build_axis_limits(
         np.concatenate([cloud_points_plot, traj_points], axis=0)
     )
@@ -492,30 +731,15 @@ def create_3d_gif(
             alpha=0.7,
             linewidths=0.0,
         )
-        for idx, color in enumerate(track_colors):
-            traj = selected_traj_world[idx]
-            prefix = traj[: t + 1]
-            valid = np.isfinite(prefix).all(axis=1)
-            if np.count_nonzero(valid) == 0:
-                continue
-            pts = prefix[valid]
-            if len(pts) >= 2:
-                ax.plot(
-                    pts[:, 0],
-                    pts[:, 1],
-                    pts[:, 2],
-                    color=color,
-                    linewidth=line_width,
-                    alpha=line_alpha,
-                )
-            ax.scatter(
-                pts[-1, 0],
-                pts[-1, 1],
-                pts[-1, 2],
-                color=color,
-                s=10,
-                depthshade=False,
-            )
+        _plot_3d_trajectories(
+            ax=ax,
+            traj_primary=selected_traj_world,
+            traj_secondary=selected_traj_world_secondary,
+            track_colors=track_colors,
+            line_alpha=line_alpha,
+            line_width=line_width,
+            time_limit=t,
+        )
         apply_axis_limits(ax, center, radius)
         ax.set_title(f"{camera_name} | query frame {query_frame} | t={t} | world trajectories")
         ax.set_xlabel("x")
@@ -535,8 +759,10 @@ def create_verification_figure(
     rgb: np.ndarray,
     cloud_points: np.ndarray,
     cloud_colors: np.ndarray,
-    traj_2d: np.ndarray,
-    traj_world: np.ndarray,
+    traj_2d_primary: np.ndarray,
+    traj_2d_secondary: np.ndarray,
+    traj_world_primary: np.ndarray,
+    traj_world_secondary: np.ndarray,
     track_indices: np.ndarray,
     figure_path: Path,
     max_cloud_points: int,
@@ -545,8 +771,10 @@ def create_verification_figure(
 ) -> None:
     figure_path.parent.mkdir(parents=True, exist_ok=True)
 
-    selected_traj_2d = traj_2d[track_indices]
-    selected_traj_world = traj_world[track_indices]
+    selected_traj_2d = traj_2d_primary[track_indices]
+    selected_traj_2d_secondary = traj_2d_secondary[track_indices]
+    selected_traj_world = traj_world_primary[track_indices]
+    selected_traj_world_secondary = traj_world_secondary[track_indices]
     track_colors = make_track_colors(len(track_indices))
 
     cloud_points_plot, cloud_colors_plot = sample_cloud_points(
@@ -560,21 +788,14 @@ def create_verification_figure(
     ax_3d = fig.add_subplot(1, 2, 2, projection="3d")
 
     ax_img.imshow(rgb)
-    for idx, color in enumerate(track_colors):
-        traj = selected_traj_2d[idx]
-        valid = np.isfinite(traj).all(axis=1)
-        if np.count_nonzero(valid) < 2:
-            continue
-        pts = traj[valid]
-        ax_img.plot(pts[:, 0], pts[:, 1], color=color, linewidth=line_width, alpha=line_alpha)
-        ax_img.scatter(
-            pts[0, 0],
-            pts[0, 1],
-            s=10,
-            color=color,
-            edgecolors="white",
-            linewidths=0.3,
-        )
+    _plot_2d_trajectories(
+        ax=ax_img,
+        traj_primary=selected_traj_2d,
+        traj_secondary=selected_traj_2d_secondary,
+        track_colors=track_colors,
+        line_alpha=line_alpha,
+        line_width=line_width,
+    )
     ax_img.set_title(f"{camera_name} | query frame {query_frame} | 2D trajectories")
     ax_img.set_axis_off()
 
@@ -587,30 +808,14 @@ def create_verification_figure(
         alpha=0.8,
         linewidths=0.0,
     )
-    line_points: list[np.ndarray] = []
-    for idx, color in enumerate(track_colors):
-        traj = selected_traj_world[idx]
-        valid = np.isfinite(traj).all(axis=1)
-        if np.count_nonzero(valid) < 2:
-            continue
-        pts = traj[valid]
-        ax_3d.plot(
-            pts[:, 0],
-            pts[:, 1],
-            pts[:, 2],
-            color=color,
-            linewidth=line_width,
-            alpha=line_alpha,
-        )
-        ax_3d.scatter(
-            pts[0, 0],
-            pts[0, 1],
-            pts[0, 2],
-            color=color,
-            s=8,
-            depthshade=False,
-        )
-        line_points.append(pts)
+    line_points = _plot_3d_trajectories(
+        ax=ax_3d,
+        traj_primary=selected_traj_world,
+        traj_secondary=selected_traj_world_secondary,
+        track_colors=track_colors,
+        line_alpha=line_alpha,
+        line_width=line_width,
+    )
     ax_3d.set_title(f"{camera_name} | query frame {query_frame} | world trajectories")
     ax_3d.set_xlabel("x")
     ax_3d.set_ylabel("y")
@@ -659,6 +864,8 @@ def verify_camera(
     max_gif_tracks: int,
     max_gif_cloud_points: int,
     export_gifs: bool,
+    render_mode: str,
+    gif_track_sampling: str,
 ) -> CameraArtifact:
     camera_dir = episode_dir / trajectory_dirname / camera_name
     if not camera_dir.is_dir():
@@ -673,9 +880,12 @@ def verify_camera(
 
     sample_path = camera_dir / "samples" / f"{camera_name}_{query_frame}.npz"
     sample = load_sample_npz(sample_path)
-    render_view = build_sample_visualization_view(sample)
+    render_view = build_sample_visualization_view(sample, render_mode=render_mode)
     traj = render_view["traj_uvz"]
     traj_2d = render_view["traj_2d"]
+    traj_secondary = render_view["traj_uvz_secondary"]
+    traj_2d_secondary = render_view["traj_2d_secondary"]
+    traj_selection = render_view["traj_uvz_finite"] if render_mode == RENDER_MODE_HYBRID else traj
     raw_num_tracks = int(render_view["raw_num_tracks"])
     kept_num_tracks = int(render_view["kept_num_tracks"])
     with SceneReader(camera_dir) as scene_reader:
@@ -686,6 +896,16 @@ def verify_camera(
             )
         traj_world = traj_uvz_to_world(
             traj,
+            intrinsics[query_frame].astype(np.float32),
+            extrinsics[query_frame].astype(np.float32),
+        )
+        traj_world_secondary = traj_uvz_to_world(
+            traj_secondary,
+            intrinsics[query_frame].astype(np.float32),
+            extrinsics[query_frame].astype(np.float32),
+        )
+        traj_world_selection = traj_uvz_to_world(
+            traj_selection,
             intrinsics[query_frame].astype(np.float32),
             extrinsics[query_frame].astype(np.float32),
         )
@@ -702,8 +922,18 @@ def verify_camera(
         depth_min=depth_min,
         depth_max=depth_max,
     )
-    track_indices = choose_track_indices(traj_world, max_tracks)
-    gif_track_indices = track_indices[: min(max_gif_tracks, len(track_indices))]
+    track_indices = choose_track_indices(traj_world_selection, max_tracks)
+    group_labels = build_track_group_labels(
+        traj_pick_place_object_mask=render_view["traj_pick_place_object_mask"],
+        traj_manipulator_cluster_id=render_view["traj_manipulator_cluster_id"],
+        track_indices=track_indices,
+    )
+    gif_track_indices = choose_gif_track_indices(
+        track_indices=track_indices,
+        max_gif_tracks=min(max_gif_tracks, len(track_indices)),
+        gif_track_sampling=gif_track_sampling,
+        group_labels=group_labels,
+    )
     gif_cloud_point_count_value = int(min(len(cloud_points), max_gif_cloud_points))
 
     camera_output_dir = output_root / camera_name
@@ -719,8 +949,10 @@ def verify_camera(
         rgb=rgb,
         cloud_points=cloud_points,
         cloud_colors=cloud_colors,
-        traj_2d=traj_2d,
-        traj_world=traj_world,
+        traj_2d_primary=traj_2d,
+        traj_2d_secondary=traj_2d_secondary,
+        traj_world_primary=traj_world,
+        traj_world_secondary=traj_world_secondary,
         track_indices=track_indices,
         figure_path=figure_path,
         max_cloud_points=max_cloud_points,
@@ -738,7 +970,8 @@ def verify_camera(
             camera_name=camera_name,
             query_frame=query_frame,
             rgb=rgb,
-            traj_2d=traj_2d,
+            traj_2d_primary=traj_2d,
+            traj_2d_secondary=traj_2d_secondary,
             track_indices=gif_track_indices,
             gif_path=gif_2d_path,
             line_alpha=line_alpha,
@@ -751,7 +984,8 @@ def verify_camera(
             query_frame=query_frame,
             cloud_points=cloud_points,
             cloud_colors=cloud_colors,
-            traj_world=traj_world,
+            traj_world_primary=traj_world,
+            traj_world_secondary=traj_world_secondary,
             track_indices=gif_track_indices,
             gif_path=gif_3d_path,
             max_cloud_points=max_gif_cloud_points,
@@ -818,6 +1052,8 @@ def main() -> None:
             max_gif_tracks=max(1, args.max_gif_tracks),
             max_gif_cloud_points=max(1, args.max_gif_cloud_points),
             export_gifs=bool(args.export_gifs),
+            render_mode=str(args.render_mode),
+            gif_track_sampling=str(args.gif_track_sampling),
         )
         artifacts.append(artifact)
         message = (
@@ -836,6 +1072,8 @@ def main() -> None:
         "trajectory_dirname": args.trajectory_dirname,
         "output_dir": str(output_root),
         "export_gifs": bool(args.export_gifs),
+        "render_mode": str(args.render_mode),
+        "gif_track_sampling": str(args.gif_track_sampling),
         "overview_path": str(overview_path),
         "artifacts": [asdict(item) for item in artifacts],
     }
