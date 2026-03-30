@@ -31,6 +31,7 @@
   - wrist-oriented profile 仍可显式指定，但不再属于维护态默认路径
 - `batch_droid_external.py`
   - DROID external-only 批处理入口
+  - 固定输出 `v2 + source_ref`
 
 ## 辅助脚本
 

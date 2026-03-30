@@ -2,6 +2,7 @@
 """
 DROID 数据集批量推理（外部几何直通版）：
 使用外部深度 + 外部内外参，跳过 VGGT，并支持多 GPU 均匀负载。
+输出固定为当前维护态 `v2 + source_ref`。
 
 用法:
     python scripts/batch_inference/batch_droid_external.py \
@@ -30,6 +31,8 @@ from utils.traceforge_artifact_utils import is_traceforge_output_complete
 CAMERAS = ["hand_camera", "varied_camera_1", "varied_camera_2"]
 RGB_EXTS = ("*.jpg", "*.jpeg", "*.png")
 DEPTH_EXTS = ("*.npy", "*.png", "*.jpg", "*.jpeg")
+MAINTAINED_OUTPUT_LAYOUT = "v2"
+MAINTAINED_SCENE_STORAGE_MODE = "source_ref"
 
 
 def has_files(dir_path: Path, patterns) -> bool:
@@ -106,6 +109,51 @@ def is_camera_output_complete(dataset_path: Path, camera_name: str) -> bool:
     return is_traceforge_output_complete(camera_dir)
 
 
+def build_infer_command(
+    *,
+    python_bin: str,
+    infer_script: str,
+    geom_path: Path,
+    depth_path: Path,
+    video_path: Path,
+    trajectory_root: Path,
+    camera_name: str,
+    gpu_id: int | str,
+    args,
+) -> list[str]:
+    cmd = [
+        python_bin,
+        infer_script,
+        "--depth_pose_method",
+        "external",
+        "--external_geom_npz",
+        str(geom_path),
+        "--camera_name",
+        camera_name,
+        "--depth_path",
+        str(depth_path),
+        "--video_path",
+        str(video_path),
+        "--video_name",
+        camera_name,
+        "--out_dir",
+        str(trajectory_root),
+        "--device",
+        f"cuda:{gpu_id}",
+        "--frame_drop_rate",
+        str(args.frame_drop_rate),
+        "--grid_size",
+        str(args.grid_size),
+        "--output_layout",
+        MAINTAINED_OUTPUT_LAYOUT,
+        "--scene_storage_mode",
+        MAINTAINED_SCENE_STORAGE_MODE,
+    ]
+    if args.save_visibility:
+        cmd.append("--save_visibility")
+    return cmd
+
+
 def process_single_camera(dataset_path, camera_name, args, gpu_id, task_index, total_tasks, print_lock):
     """处理单个数据集的单个相机。"""
     dataset_name = dataset_path.name
@@ -139,23 +187,17 @@ def process_single_camera(dataset_path, camera_name, args, gpu_id, task_index, t
         python_bin = sys.executable
 
     infer_script = os.path.join(_project_root, "scripts/batch_inference/infer.py")
-    cmd = [
-        python_bin, infer_script,
-        "--depth_pose_method", "external",
-        "--external_geom_npz", str(geom_path),
-        "--camera_name", camera_name,
-        "--depth_path", str(depth_path),
-        "--video_path", str(video_path),
-        "--video_name", camera_name,
-        "--out_dir", str(trajectory_root),
-        "--device", f"cuda:{gpu_id}",
-        "--frame_drop_rate", str(args.frame_drop_rate),
-        "--grid_size", str(args.grid_size),
-        "--output_layout", args.output_layout,
-        "--scene_storage_mode", args.scene_storage_mode,
-    ]
-    if args.save_visibility:
-        cmd.append("--save_visibility")
+    cmd = build_infer_command(
+        python_bin=python_bin,
+        infer_script=infer_script,
+        geom_path=geom_path,
+        depth_path=depth_path,
+        video_path=video_path,
+        trajectory_root=trajectory_root,
+        camera_name=camera_name,
+        gpu_id=gpu_id,
+        args=args,
+    )
 
     env = os.environ.copy()
     env["PYTHONPATH"] = _project_root
@@ -218,8 +260,10 @@ def process_tasks_on_gpu(gpu_id, gpu_tasks, args, total_tasks, print_lock):
     return results
 
 
-def main():
-    parser = argparse.ArgumentParser(description="DROID 批量推理（external 几何直通）")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="DROID 批量推理（external 几何直通，固定输出 v2 + source_ref）"
+    )
     parser.add_argument("--base_path", type=str, required=True, help="DROID 数据集根目录")
     parser.add_argument("--gpu_id", type=str, default="0,1,2,3,4,5,6,7", help="GPU IDs，如 0,1,2,3")
     parser.add_argument("--frame_drop_rate", type=int, default=5, help="帧间隔")
@@ -228,20 +272,6 @@ def main():
     parser.add_argument("--max_workers", type=int, default=None, help="并行 worker 数，默认等于 GPU 数")
     parser.add_argument("--task_timeout", type=int, default=0, help="单任务超时秒数；<=0 表示不设超时")
     parser.add_argument("--only_incomplete", action="store_true", default=False, help="仅处理输出不完整的相机任务")
-    parser.add_argument(
-        "--output_layout",
-        type=str,
-        default="v2",
-        choices=["v2", "legacy"],
-        help="Artifact layout passed through to infer.py.",
-    )
-    parser.add_argument(
-        "--scene_storage_mode",
-        type=str,
-        default="source_ref",
-        choices=["source_ref", "cache"],
-        help="Storage backend passed through to infer.py.",
-    )
     parser.add_argument(
         "--save_visibility",
         action="store_true",
@@ -255,6 +285,11 @@ def main():
         choices=["auto", "npz", "h5"],
         help="外部几何来源：auto(优先 external_geom_*.npz, 回退 trajectory_valid.h5)",
     )
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     base_path = Path(args.base_path).resolve()

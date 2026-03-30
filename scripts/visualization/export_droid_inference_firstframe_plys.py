@@ -15,6 +15,10 @@ TraceForge DROID extrinsics sanity check:
   - outputs_droid_varied2_c2w
   - outputs_droid_varied2_w2c
 
+The input folders are expected to be current TraceForge `v2` camera output
+directories with `scene_meta.json` source references, not legacy main-NPZ
+artifacts.
+
 Outputs:
   <output_root>/individual/<group>/<camera>_frame00000.ply
   <output_root>/combined/<group>_frame00000_combined.ply
@@ -26,12 +30,18 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
 import h5py
 import numpy as np
-from PIL import Image
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from utils.traceforge_artifact_utils import SceneReader, load_scene_meta
 
 
 DEFAULT_INPUTS = {
@@ -111,35 +121,103 @@ def load_step06_module(script_path: Path):
     return module
 
 
+def _resolve_meta_path(episode_dir: Path, raw_path: str | None) -> Path | None:
+    if not raw_path:
+        return None
+    path = Path(raw_path)
+    if path.is_absolute():
+        return path
+    return episode_dir / path
+
+
+def _stringify_path(path: Path | None) -> str | None:
+    return None if path is None else str(path)
+
+
+def _load_raw_camera_arrays(*, geom_path: Path, camera_name: str) -> tuple[np.ndarray, np.ndarray]:
+    if geom_path.suffix.lower() == ".h5":
+        intr_key_with_suffix = f"observation/camera/intrinsics/{camera_name}_left"
+        extr_key_with_suffix = f"observation/camera/extrinsics/{camera_name}_left"
+        intr_key_no_suffix = f"observation/camera/intrinsics/{camera_name}"
+        extr_key_no_suffix = f"observation/camera/extrinsics/{camera_name}"
+        with h5py.File(geom_path, "r") as f:
+            if intr_key_with_suffix in f and extr_key_with_suffix in f:
+                intrinsics = f[intr_key_with_suffix][:].astype(np.float32)
+                extrinsics = f[extr_key_with_suffix][:].astype(np.float32)
+            elif intr_key_no_suffix in f and extr_key_no_suffix in f:
+                intrinsics = f[intr_key_no_suffix][:].astype(np.float32)
+                extrinsics = f[extr_key_no_suffix][:].astype(np.float32)
+            else:
+                available = list(f["observation/camera/intrinsics"].keys()) if "observation/camera/intrinsics" in f else []
+                raise KeyError(
+                    f"H5 geometry must contain either '{intr_key_with_suffix}' or '{intr_key_no_suffix}'. "
+                    f"Available cameras: {available}"
+                )
+        return intrinsics, extrinsics
+
+    data = np.load(geom_path)
+    try:
+        if "intrinsics" not in data or "extrinsics" not in data:
+            raise KeyError(f"NPZ geometry must contain 'intrinsics' and 'extrinsics': {geom_path}")
+        intrinsics = data["intrinsics"].astype(np.float32)
+        extrinsics = data["extrinsics"].astype(np.float32)
+    finally:
+        data.close()
+    return intrinsics, extrinsics
+
+
 def load_camera_bundle(camera_dir: Path, frame_index: int) -> dict[str, Any]:
+    camera_dir = camera_dir.resolve()
+    if not camera_dir.is_dir():
+        raise FileNotFoundError(f"Episode directory not found: {camera_dir}")
     camera_name = camera_dir.name
-    main_npz = camera_dir / f"{camera_name}.npz"
-    rgb_path = camera_dir / "images" / f"{camera_name}_{frame_index}.png"
-    depth_path = camera_dir / "depth" / f"{camera_name}_{frame_index}_raw.npz"
+    scene_meta = load_scene_meta(camera_dir)
+    if scene_meta is None:
+        raise FileNotFoundError(f"Missing scene_meta.json under {camera_dir}")
 
-    if not main_npz.is_file():
-        raise FileNotFoundError(main_npz)
-    if not rgb_path.is_file():
-        raise FileNotFoundError(rgb_path)
-    if not depth_path.is_file():
-        raise FileNotFoundError(depth_path)
+    source_geom_path = _resolve_meta_path(camera_dir, scene_meta.get("source_geom_path"))
+    if source_geom_path is None or not source_geom_path.is_file():
+        raise FileNotFoundError(f"Missing source geometry file for {camera_dir}: {source_geom_path}")
 
-    with np.load(main_npz) as data:
-        intrinsics = data["intrinsics"][frame_index].astype(np.float32)
-        extrinsics = data["extrinsics"][frame_index].astype(np.float32)
+    stored_extrinsics_mode = str(
+        scene_meta.get("source_extrinsics_mode") or scene_meta.get("extrinsics_mode") or ""
+    ).strip().lower()
+    if stored_extrinsics_mode not in {"w2c", "c2w"}:
+        raise ValueError(
+            f"Unsupported stored extrinsics mode for {camera_dir}: {stored_extrinsics_mode!r}"
+        )
 
-    with np.load(depth_path) as data:
-        depth = data["depth"].astype(np.float32)
+    source_frame_indices = np.asarray(
+        scene_meta.get("source_frame_indices", []),
+        dtype=np.int32,
+    ).reshape(-1)
+    source_frame_index = int(frame_index) if len(source_frame_indices) == 0 else int(source_frame_indices[frame_index])
 
-    rgb = np.array(Image.open(rgb_path).convert("RGB"))
+    intrinsics_all, extrinsics_all = _load_raw_camera_arrays(
+        geom_path=source_geom_path,
+        camera_name=str(scene_meta.get("source_camera_name") or camera_name),
+    )
+    if source_frame_index < 0 or source_frame_index >= len(intrinsics_all) or source_frame_index >= len(extrinsics_all):
+        raise IndexError(
+            f"source frame {source_frame_index} exceeds geometry length for {camera_dir}: "
+            f"intrinsics={len(intrinsics_all)}, extrinsics={len(extrinsics_all)}"
+        )
+
+    with SceneReader(camera_dir) as scene_reader:
+        rgb = scene_reader.get_rgb_frame(frame_index)
+        depth = scene_reader.get_depth_frame(frame_index)
 
     return {
+        "episode_dir": camera_dir,
         "camera_name": camera_name,
-        "main_npz": main_npz,
-        "rgb_path": rgb_path,
-        "depth_path": depth_path,
-        "intrinsics": intrinsics,
-        "extrinsics": extrinsics,
+        "scene_meta_path": camera_dir / "scene_meta.json",
+        "source_geom_path": source_geom_path,
+        "source_rgb_path": _resolve_meta_path(camera_dir, scene_meta.get("source_rgb_path")),
+        "source_depth_path": _resolve_meta_path(camera_dir, scene_meta.get("source_depth_path")),
+        "source_frame_index": source_frame_index,
+        "stored_extrinsics_mode": stored_extrinsics_mode,
+        "intrinsics": intrinsics_all[source_frame_index].astype(np.float32),
+        "extrinsics": extrinsics_all[source_frame_index].astype(np.float32),
         "depth": depth,
         "rgb": rgb,
     }
@@ -282,7 +360,12 @@ def main() -> None:
         summary["groups"][group] = {}
         for camera_name, camera_dir in camera_dirs.items():
             bundle = load_camera_bundle(camera_dir, args.frame_index)
-            if group == "w2c":
+            if bundle["stored_extrinsics_mode"] != group:
+                raise ValueError(
+                    f"Input group '{group}' does not match stored extrinsics mode "
+                    f"'{bundle['stored_extrinsics_mode']}' for {camera_dir}"
+                )
+            if bundle["stored_extrinsics_mode"] == "w2c":
                 points, colors = step06.create_pointcloud_arrays(
                     rgb=bundle["rgb"],
                     depth=bundle["depth"],
@@ -322,13 +405,15 @@ def main() -> None:
             save_ply_binary(indiv_path, points, colors)
 
             summary["groups"][group][camera_name] = {
-                "input_dir": str(camera_dir),
-                "stored_extrinsics_mode": group,
+                "input_dir": str(bundle["episode_dir"]),
+                "stored_extrinsics_mode": bundle["stored_extrinsics_mode"],
                 "points": int(len(points)),
                 "ply_path": str(indiv_path),
-                "main_npz": str(bundle["main_npz"]),
-                "image_path": str(bundle["rgb_path"]),
-                "depth_path": str(bundle["depth_path"]),
+                "scene_meta_path": str(bundle["scene_meta_path"]),
+                "source_geom_path": str(bundle["source_geom_path"]),
+                "source_rgb_path": _stringify_path(bundle["source_rgb_path"]),
+                "source_depth_path": _stringify_path(bundle["source_depth_path"]),
+                "source_frame_index": int(bundle["source_frame_index"]),
             }
 
         merged_points = np.concatenate(group_points, axis=0)
