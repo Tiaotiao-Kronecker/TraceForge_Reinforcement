@@ -12,6 +12,7 @@
 | [traceforge_tracking_math.md](traceforge_tracking_math.md) | 当前底层 3D tracking / refinement / support query 机制的数学说明 |
 | [traceforge_outer_support_grid_summary.md](traceforge_outer_support_grid_summary.md) | 外层 `support_grid_ratio` 的采样、数量、重合与 tracker 作用结论 |
 | [sample_traceforge_dataset.md](sample_traceforge_dataset.md) | `sample_traceforge_dataset.py` 的当前适用范围与用法 |
+| [xperience_sample_tooling.md](xperience_sample_tooling.md) | `xperience-10m-sample` 的 loader、分析和可视化脚本 |
 | [traj_filter_method_summary_2026-03-17.md](traj_filter_method_summary_2026-03-17.md) | 当前轨迹过滤 profile 和验证结论 |
 
 ## 脚本文档

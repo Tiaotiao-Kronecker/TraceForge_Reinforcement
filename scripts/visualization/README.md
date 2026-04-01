@@ -15,6 +15,9 @@
 - `visualize_3d_keypoint_comparison.py`
   - 同时读取 baseline / variant 两个 episode output
   - 把 `baseline-only / overlap / variant-only` 三类轨迹叠在一个 3D 视图里
+- `visualize_xperience_sample.py`
+  - 为 `xperience-10m-sample` 导出 storyboard、单帧 dashboard 和 GIF
+  - 复用 `scripts/data_analysis/xperience_sample_utils.py` 的多模态对齐 loader
 - `verify_episode_trajectory_outputs.py`
   - 对单个 episode 导出 PLY、验证图和可选 GIF
 - `export_pointcloud_ply.py`
@@ -25,6 +28,7 @@
 ## 文档
 
 - [visualization_features.md](visualization_features.md)
+- [docs/xperience_sample_tooling.md](../../docs/xperience_sample_tooling.md)
 
 ## 历史调查脚本
 

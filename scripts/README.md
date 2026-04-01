@@ -10,6 +10,7 @@
   - 3D 可视化、PLY 导出、episode 验证
 - `data_analysis/`
   - 当前仍保留的数据分析和数据集工具
+  - 也包含 `xperience-10m-sample` 的多模态 loader 和分析脚本
 - `archived/`
   - 历史脚本，不作为当前工作流入口
 

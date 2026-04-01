@@ -33,6 +33,11 @@
 - `check_action_format.py`
 - `check_action_info.py`
 - `analyze_dataset_structure.py`
+- `analyze_xperience_sample.py`
+  - 汇总 `xperience-10m-sample` 的 HDF5 schema、视频元信息和关键统计
+  - 输出 `summary.json`、`annotation_schema.tsv`、以及一个对齐后的单帧 probe JSON
+- `xperience_sample_utils.py`
+  - 提供 `XperienceSampleDataset`，按 sample frame index 对齐视频、depth、SLAM、mocap、IMU 和 caption segment
 - `analyze_first_frame_transform.py`
 - `analyze_rotation_representation.py`
 - `analyze_transform_relationship.py`
@@ -42,6 +47,7 @@
 
 - [action_data_format_analysis.md](action_data_format_analysis.md)
 - [docs/sample_traceforge_dataset.md](../../docs/sample_traceforge_dataset.md)
+- [docs/xperience_sample_tooling.md](../../docs/xperience_sample_tooling.md)
 
 ## 推荐入口
 
