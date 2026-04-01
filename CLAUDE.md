@@ -53,6 +53,9 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
     --gpu_id 0,1,2,3,4,5,6,7 \
     --min_free_gpu_mem_gb 40 \
     --gpu_recovery_poll_sec 60 \
+    --collect_profile_stats \
+    --hardware_telemetry_interval_sec 30 \
+    --depth_filter_workers 8 \
     --keyframes_per_sec_min 2 \
     --keyframes_per_sec_max 3 \
     --skip_existing
@@ -171,6 +174,9 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 - Multi-GPU batch inference keeps a resident worker per GPU and schedules `episode/camera` tasks from a shared queue
 - `--gpu_id` should list the actual currently usable physical GPU indices; the list may be sparse if some cards are unavailable (for example `1,3,5,6`)
 - The shared query-frame schedule design keeps multi-camera keyframes aligned without breaking dynamic multi-GPU scheduling
+- `--collect_profile_stats` writes task-level `profile_stats` / `save_profile_stats` into `_camera_task_profiles.jsonl`
+- `--hardware_telemetry_interval_sec > 0` writes periodic GPU/CPU/IO samples into `_hardware_telemetry.jsonl`
+- `--depth_filter_workers` controls `_DepthFilterRuntime` thread count for filtered-depth precomputation
 
 **Keypoint Sampling**:
 - `--grid_size N`: Samples N×N keypoints per frame (e.g., 20 = 400 points, 80 = 6400 points)
@@ -247,6 +253,17 @@ For button/sim episode outputs written in-place:
 
 If `--out_dir` is provided, the same per-episode structure is written under
 `<out_dir>/<episode_name>/` instead of `<episode_dir>/trajectory/`.
+
+When `batch_infer_press_one_button_demo.py` runs with `--out_dir`, the output
+root also stores batch telemetry files:
+
+```
+<out_dir>/
+├── _batch_run_summary.json
+├── _camera_task_metrics.jsonl
+├── _camera_task_profiles.jsonl   # only when --collect_profile_stats
+└── _hardware_telemetry.jsonl     # only when --hardware_telemetry_interval_sec > 0
+```
 
 When local scene caches are needed, pass `--scene_storage_mode cache`; that adds:
 

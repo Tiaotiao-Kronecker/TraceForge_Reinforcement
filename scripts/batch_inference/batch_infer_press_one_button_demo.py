@@ -39,6 +39,7 @@ import json
 import multiprocessing as mp
 import os
 import queue
+import socket
 import subprocess
 import sys
 import threading
@@ -84,6 +85,9 @@ _QUERY_FRAME_SCHEDULE_VERSION = 3
 _QUERY_FRAME_SHARED_DIRNAME = "_shared"
 _BATCH_RUN_SUMMARY_BASENAME = "_batch_run_summary.json"
 _CAMERA_TASK_METRICS_BASENAME = "_camera_task_metrics.jsonl"
+_CAMERA_TASK_PROFILES_BASENAME = "_camera_task_profiles.jsonl"
+_HARDWARE_TELEMETRY_BASENAME = "_hardware_telemetry.jsonl"
+_DEFAULT_DEPTH_FILTER_WORKERS = 8
 
 
 @dataclass(frozen=True)
@@ -130,24 +134,61 @@ class WorkerProcessResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class CpuIoSnapshot:
+    captured_at_unix: float
+    cpu_total_ticks: int
+    cpu_iowait_ticks: int
+    disk_read_bytes: int
+    disk_write_bytes: int
+
+
 class BatchTelemetryWriter:
-    def __init__(self, out_root: Path, *, lock=None):
+    def __init__(
+        self,
+        out_root: Path,
+        *,
+        enable_profile_records: bool = False,
+        enable_hardware_records: bool = False,
+        lock=None,
+    ):
         self.out_root = out_root.resolve()
         self.summary_path = self.out_root / _BATCH_RUN_SUMMARY_BASENAME
         self.task_metrics_path = self.out_root / _CAMERA_TASK_METRICS_BASENAME
+        self.task_profiles_path = self.out_root / _CAMERA_TASK_PROFILES_BASENAME
+        self.hardware_telemetry_path = self.out_root / _HARDWARE_TELEMETRY_BASENAME
+        self.enable_profile_records = bool(enable_profile_records)
+        self.enable_hardware_records = bool(enable_hardware_records)
         self._lock = lock
         self.out_root.mkdir(parents=True, exist_ok=True)
         self.task_metrics_path.write_text("", encoding="utf-8")
+        if self.enable_profile_records:
+            self.task_profiles_path.write_text("", encoding="utf-8")
+        if self.enable_hardware_records:
+            self.hardware_telemetry_path.write_text("", encoding="utf-8")
 
-    def record_task(self, payload: dict[str, Any]) -> None:
+    def _append_jsonl(self, path: Path, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         if self._lock is None:
-            with self.task_metrics_path.open("a", encoding="utf-8") as handle:
+            with path.open("a", encoding="utf-8") as handle:
                 handle.write(encoded + "\n")
             return
         with self._lock:
-            with self.task_metrics_path.open("a", encoding="utf-8") as handle:
+            with path.open("a", encoding="utf-8") as handle:
                 handle.write(encoded + "\n")
+
+    def record_task(self, payload: dict[str, Any]) -> None:
+        self._append_jsonl(self.task_metrics_path, payload)
+
+    def record_task_profile(self, payload: dict[str, Any]) -> None:
+        if not self.enable_profile_records:
+            return
+        self._append_jsonl(self.task_profiles_path, payload)
+
+    def record_hardware_sample(self, payload: dict[str, Any]) -> None:
+        if not self.enable_hardware_records:
+            return
+        self._append_jsonl(self.hardware_telemetry_path, payload)
 
     def write_summary(self, payload: dict[str, Any]) -> None:
         if self._lock is None:
@@ -196,6 +237,10 @@ def build_camera_task_metric_record(
     task: CameraTask,
     gpu_id: int | None,
     args: argparse.Namespace,
+    worker_label: str | None,
+    worker_index: int | None,
+    gpu_slot_index: int | None,
+    gpu_slot_count: int | None,
     query_frame_count: int | None,
     process_seconds: float | None,
     save_seconds: float | None,
@@ -214,8 +259,13 @@ def build_camera_task_metric_record(
         "episode_name": task.episode_dir.name,
         "camera_name": task.camera_name,
         "gpu_id": gpu_id,
+        "worker_label": worker_label,
+        "worker_index": worker_index,
+        "gpu_slot_index": gpu_slot_index,
+        "gpu_slot_count": gpu_slot_count,
         "device": getattr(args, "device", None),
         "num_iters": int(args.num_iters),
+        "depth_filter_workers": int(getattr(args, "depth_filter_workers", _DEFAULT_DEPTH_FILTER_WORKERS)),
         "traj_filter_profile": getattr(args, "traj_filter_profile", None),
         "query_frame_schedule_path": (
             str(task.query_frame_schedule_path.resolve())
@@ -238,12 +288,81 @@ def build_camera_task_metric_record(
     }
 
 
+def build_camera_task_profile_record(
+    *,
+    task: CameraTask,
+    gpu_id: int | None,
+    args: argparse.Namespace,
+    worker_label: str | None,
+    worker_index: int | None,
+    gpu_slot_index: int | None,
+    gpu_slot_count: int | None,
+    query_frame_count: int | None,
+    process_seconds: float | None,
+    save_seconds: float | None,
+    started_at_unix: float,
+    finished_at_unix: float,
+    status: str,
+    retryable_cuda_error: bool,
+    error_message: str | None,
+    profile_stats: dict[str, float] | None,
+    save_profile_stats: dict[str, float] | None,
+    per_query_save_seconds: dict[int, float] | None,
+    scene_finalize_overhead_seconds: float | None,
+) -> dict[str, Any]:
+    normalized_per_query_save_seconds = {
+        str(int(query_frame_idx)): float(seconds)
+        for query_frame_idx, seconds in (per_query_save_seconds or {}).items()
+    }
+    return {
+        "task_index": int(task.task_index),
+        "total_tasks": int(task.total_tasks),
+        "episode_name": task.episode_dir.name,
+        "camera_name": task.camera_name,
+        "gpu_id": gpu_id,
+        "worker_label": worker_label,
+        "worker_index": worker_index,
+        "gpu_slot_index": gpu_slot_index,
+        "gpu_slot_count": gpu_slot_count,
+        "device": getattr(args, "device", None),
+        "num_iters": int(args.num_iters),
+        "depth_filter_workers": int(getattr(args, "depth_filter_workers", _DEFAULT_DEPTH_FILTER_WORKERS)),
+        "traj_filter_profile": getattr(args, "traj_filter_profile", None),
+        "query_frame_count": query_frame_count,
+        "process_seconds": process_seconds,
+        "save_seconds": save_seconds,
+        "status": status,
+        "retryable_cuda_error": bool(retryable_cuda_error),
+        "error_message": error_message,
+        "started_at_unix": float(started_at_unix),
+        "finished_at_unix": float(finished_at_unix),
+        "profile_stats": dict(profile_stats or {}),
+        "save_profile_stats": dict(save_profile_stats or {}),
+        "per_query_save_seconds": normalized_per_query_save_seconds,
+        "scene_finalize_overhead_seconds": (
+            float(scene_finalize_overhead_seconds)
+            if scene_finalize_overhead_seconds is not None
+            else None
+        ),
+        "query_frame_schedule_path": (
+            str(task.query_frame_schedule_path.resolve())
+            if task.query_frame_schedule_path is not None
+            else None
+        ),
+        "output_camera_dir": str((task.out_episode_dir / task.camera_name).resolve()),
+    }
+
+
 def build_batch_run_summary(
     *,
     args: argparse.Namespace,
     base_path: Path,
     out_dir: Path | None,
     gpu_ids: list[int],
+    telemetry_gpu_ids: list[int],
+    host_name: str | None,
+    gpu_info: list[dict[str, Any]] | None,
+    worker_slot_count: int,
     episode_count: int,
     camera_task_count: int,
     total_camera_success: int,
@@ -255,12 +374,22 @@ def build_batch_run_summary(
         "out_dir": str(out_dir.resolve()) if out_dir is not None else None,
         "camera_names": list(args.camera_names),
         "gpu_ids": [int(gpu_id) for gpu_id in gpu_ids],
+        "telemetry_gpu_ids": [int(gpu_id) for gpu_id in telemetry_gpu_ids],
+        "host_name": host_name,
+        "gpu_info": list(gpu_info or []),
+        "workers_per_gpu": int(getattr(args, "workers_per_gpu", 1)),
+        "worker_slot_count": int(worker_slot_count),
         "episode_count": int(episode_count),
         "camera_task_count": int(camera_task_count),
         "camera_success_count": int(total_camera_success),
         "camera_fail_count": int(total_camera_fail),
         "wall_clock_seconds": float(wall_clock_seconds),
+        "collect_profile_stats": bool(getattr(args, "collect_profile_stats", False)),
+        "hardware_telemetry_interval_sec": float(
+            getattr(args, "hardware_telemetry_interval_sec", 0.0)
+        ),
         "num_iters": int(args.num_iters),
+        "depth_filter_workers": int(getattr(args, "depth_filter_workers", _DEFAULT_DEPTH_FILTER_WORKERS)),
         "keyframe_seed": int(args.keyframe_seed),
         "keyframes_per_sec_min": int(args.keyframes_per_sec_min),
         "keyframes_per_sec_max": int(args.keyframes_per_sec_max),
@@ -329,6 +458,20 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Number of resident workers to launch per listed physical GPU. "
             "Use values >1 when sharing lightly loaded GPUs."
+        ),
+    )
+    parser.add_argument(
+        "--collect_profile_stats",
+        action="store_true",
+        help="Persist infer.py process/save timing breakdowns into batch telemetry JSONL.",
+    )
+    parser.add_argument(
+        "--hardware_telemetry_interval_sec",
+        type=float,
+        default=0.0,
+        help=(
+            "If >0 and --out_dir is set, periodically record GPU/CPU/IO telemetry "
+            "into _hardware_telemetry.jsonl."
         ),
     )
     parser.add_argument(
@@ -483,6 +626,12 @@ def parse_args() -> argparse.Namespace:
         help="Support-point grid ratio relative to grid_size. 0 disables support points.",
     )
     parser.add_argument(
+        "--depth_filter_workers",
+        type=int,
+        default=_DEFAULT_DEPTH_FILTER_WORKERS,
+        help="Thread count used by infer.py when precomputing filtered depth segments.",
+    )
+    parser.add_argument(
         "--filter_level",
         type=str,
         default="standard",
@@ -578,6 +727,10 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--support_grid_ratio must be >= 0")
     if args.workers_per_gpu <= 0:
         raise ValueError("--workers_per_gpu must be >= 1")
+    if args.depth_filter_workers <= 0:
+        raise ValueError("--depth_filter_workers must be >= 1")
+    if args.hardware_telemetry_interval_sec < 0.0:
+        raise ValueError("--hardware_telemetry_interval_sec must be >= 0")
 
     return args
 
@@ -651,6 +804,277 @@ def get_gpu_memory_info(gpu_id: int) -> GpuMemoryInfo | None:
             )
         except Exception:
             return None
+
+
+def _parse_optional_float(raw: str) -> float | None:
+    value = raw.strip()
+    if not value or value in {"N/A", "[N/A]", "[Not Supported]"}:
+        return None
+    return float(value)
+
+
+def resolve_telemetry_gpu_ids(
+    *,
+    gpu_ids: list[int],
+    device: str | None,
+) -> list[int]:
+    if gpu_ids:
+        return list(dict.fromkeys(int(gpu_id) for gpu_id in gpu_ids))
+    if device is None or not str(device).startswith("cuda"):
+        return []
+    if str(device) == "cuda":
+        return [0]
+    try:
+        return [int(str(device).split(":", maxsplit=1)[1])]
+    except Exception:
+        return [0]
+
+
+def get_gpu_static_info(gpu_id: int) -> dict[str, Any]:
+    payload: dict[str, Any] = {"gpu_id": int(gpu_id)}
+    query_cmd = [
+        "nvidia-smi",
+        f"--id={gpu_id}",
+        "--query-gpu=index,name,memory.total",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        result = subprocess.run(
+            query_cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        line = result.stdout.strip().splitlines()[0]
+        gpu_id_str, name, total_mib_str = [part.strip() for part in line.split(",", maxsplit=2)]
+        payload.update(
+            {
+                "gpu_id": int(gpu_id_str),
+                "name": name,
+                "memory_total_gib": float(total_mib_str) / 1024.0,
+                "probe_source": "nvidia-smi",
+            }
+        )
+        return payload
+    except Exception:
+        payload["probe_source"] = "fallback"
+        try:
+            payload["name"] = torch.cuda.get_device_name(gpu_id)
+            _free_bytes, total_bytes = torch.cuda.mem_get_info(gpu_id)
+            payload["memory_total_gib"] = float(total_bytes) / float(1024 ** 3)
+        except Exception as exc:
+            payload["probe_error"] = str(exc)
+        return payload
+
+
+def collect_gpu_static_info(gpu_ids: list[int]) -> list[dict[str, Any]]:
+    return [get_gpu_static_info(gpu_id) for gpu_id in gpu_ids]
+
+
+def collect_gpu_runtime_samples(gpu_ids: list[int]) -> tuple[list[dict[str, Any]], str | None]:
+    if not gpu_ids:
+        return [], None
+
+    query_cmd = [
+        "nvidia-smi",
+        f"--id={','.join(str(gpu_id) for gpu_id in gpu_ids)}",
+        "--query-gpu=index,name,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        result = subprocess.run(
+            query_cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:
+        return [], str(exc)
+
+    samples: list[dict[str, Any]] = []
+    for line in result.stdout.strip().splitlines():
+        parts = [part.strip() for part in line.split(",", maxsplit=6)]
+        if len(parts) != 7:
+            continue
+        gpu_id_str, name, util_gpu_str, util_mem_str, mem_used_str, mem_total_str, power_draw_str = parts
+        samples.append(
+            {
+                "gpu_id": int(gpu_id_str),
+                "name": name,
+                "utilization_gpu_pct": _parse_optional_float(util_gpu_str),
+                "utilization_memory_pct": _parse_optional_float(util_mem_str),
+                "memory_used_mib": _parse_optional_float(mem_used_str),
+                "memory_total_mib": _parse_optional_float(mem_total_str),
+                "power_draw_watts": _parse_optional_float(power_draw_str),
+            }
+        )
+    return samples, None
+
+
+def _list_sampled_block_devices() -> set[str]:
+    sys_block = Path("/sys/block")
+    if not sys_block.is_dir():
+        return set()
+    ignored_prefixes = ("loop", "ram", "dm-", "md", "sr", "fd")
+    device_names = {
+        path.name
+        for path in sys_block.iterdir()
+        if path.is_dir() and not path.name.startswith(ignored_prefixes)
+    }
+    return device_names
+
+
+def _read_cpu_total_and_iowait_ticks() -> tuple[int, int] | None:
+    proc_stat = Path("/proc/stat")
+    if not proc_stat.is_file():
+        return None
+    for line in proc_stat.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("cpu "):
+            continue
+        fields = [int(value) for value in line.split()[1:]]
+        if len(fields) < 5:
+            return None
+        return int(sum(fields)), int(fields[4])
+    return None
+
+
+def _read_disk_io_bytes(block_devices: set[str]) -> tuple[int, int] | None:
+    proc_diskstats = Path("/proc/diskstats")
+    if not proc_diskstats.is_file():
+        return None
+    read_bytes = 0
+    write_bytes = 0
+    for line in proc_diskstats.read_text(encoding="utf-8").splitlines():
+        parts = line.split()
+        if len(parts) < 10:
+            continue
+        device_name = parts[2]
+        if device_name not in block_devices:
+            continue
+        read_bytes += int(parts[5]) * 512
+        write_bytes += int(parts[9]) * 512
+    return read_bytes, write_bytes
+
+
+def capture_cpu_io_snapshot(block_devices: set[str]) -> CpuIoSnapshot | None:
+    cpu_ticks = _read_cpu_total_and_iowait_ticks()
+    disk_bytes = _read_disk_io_bytes(block_devices)
+    if cpu_ticks is None or disk_bytes is None:
+        return None
+    return CpuIoSnapshot(
+        captured_at_unix=time.time(),
+        cpu_total_ticks=cpu_ticks[0],
+        cpu_iowait_ticks=cpu_ticks[1],
+        disk_read_bytes=disk_bytes[0],
+        disk_write_bytes=disk_bytes[1],
+    )
+
+
+def build_cpu_io_metrics(
+    previous_snapshot: CpuIoSnapshot | None,
+    current_snapshot: CpuIoSnapshot | None,
+) -> dict[str, Any] | None:
+    if previous_snapshot is None or current_snapshot is None:
+        return None
+
+    elapsed_seconds = float(
+        max(
+            current_snapshot.captured_at_unix - previous_snapshot.captured_at_unix,
+            1e-6,
+        )
+    )
+    delta_cpu_total = max(
+        current_snapshot.cpu_total_ticks - previous_snapshot.cpu_total_ticks,
+        0,
+    )
+    delta_cpu_iowait = max(
+        current_snapshot.cpu_iowait_ticks - previous_snapshot.cpu_iowait_ticks,
+        0,
+    )
+    delta_read_bytes = max(
+        current_snapshot.disk_read_bytes - previous_snapshot.disk_read_bytes,
+        0,
+    )
+    delta_write_bytes = max(
+        current_snapshot.disk_write_bytes - previous_snapshot.disk_write_bytes,
+        0,
+    )
+    return {
+        "sample_window_seconds": elapsed_seconds,
+        "cpu_iowait_pct": (
+            float(100.0 * float(delta_cpu_iowait) / float(delta_cpu_total))
+            if delta_cpu_total > 0
+            else None
+        ),
+        "disk_read_bytes_per_sec": float(delta_read_bytes / elapsed_seconds),
+        "disk_write_bytes_per_sec": float(delta_write_bytes / elapsed_seconds),
+    }
+
+
+class HardwareTelemetrySampler:
+    def __init__(
+        self,
+        *,
+        telemetry_writer: BatchTelemetryWriter,
+        interval_sec: float,
+        host_name: str | None,
+        gpu_ids: list[int],
+    ) -> None:
+        self._telemetry_writer = telemetry_writer
+        self._interval_sec = float(interval_sec)
+        self._host_name = host_name
+        self._gpu_ids = list(gpu_ids)
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._sample_index = 0
+        self._block_devices = _list_sampled_block_devices()
+        self._previous_cpu_io_snapshot = capture_cpu_io_snapshot(self._block_devices)
+
+    def start(self) -> None:
+        if self._interval_sec <= 0.0:
+            return
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="traceforge-hardware-telemetry",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop_event.set()
+        self._thread.join(timeout=max(self._interval_sec, 1.0) + 2.0)
+        self._thread = None
+
+    def _run(self) -> None:
+        self._record_sample(include_cpu_io_metrics=False)
+        while not self._stop_event.wait(self._interval_sec):
+            self._record_sample(include_cpu_io_metrics=True)
+
+    def _record_sample(self, *, include_cpu_io_metrics: bool) -> None:
+        current_snapshot = capture_cpu_io_snapshot(self._block_devices)
+        cpu_io_metrics = None
+        if include_cpu_io_metrics:
+            cpu_io_metrics = build_cpu_io_metrics(
+                self._previous_cpu_io_snapshot,
+                current_snapshot,
+            )
+        gpu_samples, gpu_sample_error = collect_gpu_runtime_samples(self._gpu_ids)
+        self._telemetry_writer.record_hardware_sample(
+            {
+                "sample_index": int(self._sample_index),
+                "captured_at_unix": float(time.time()),
+                "host_name": self._host_name,
+                "gpu_samples": gpu_samples,
+                "gpu_sample_error": gpu_sample_error,
+                "cpu_io_metrics": cpu_io_metrics,
+            }
+        )
+        self._sample_index += 1
+        self._previous_cpu_io_snapshot = current_snapshot
 
 
 def filter_gpu_ids_by_free_memory(
@@ -1126,8 +1550,8 @@ def save_result(
     camera_name: str,
     result: dict,
     args: argparse.Namespace,
-) -> None:
-    infer.save_structured_data(
+) -> dict[str, Any]:
+    return infer.save_structured_data(
         video_name=camera_name,
         output_dir=str(out_episode_dir),
         video_tensor=result["video_tensor"],
@@ -1160,6 +1584,7 @@ def run_camera_task(
     args: argparse.Namespace,
     model_3dtracker,
     gpu_id: int | None = None,
+    worker_slot: WorkerSlot | None = None,
     telemetry_writer: BatchTelemetryWriter | None = None,
 ) -> tuple[bool, bool]:
     if args.copy_lang and not (task.out_episode_dir / "lang.txt").is_file():
@@ -1183,6 +1608,8 @@ def run_camera_task(
     status = "failed"
     retryable_cuda_error = False
     error_message: str | None = None
+    result: dict[str, Any] | None = None
+    save_artifacts: dict[str, Any] | None = None
     try:
         model_depth_pose = infer.video_depth_pose_dict[camera_args.depth_pose_method](camera_args)
         process_start = time.perf_counter()
@@ -1197,7 +1624,7 @@ def run_camera_task(
         query_frame_results = result.get("query_frame_results") or {}
         query_frame_count = int(len(query_frame_results))
         save_start = time.perf_counter()
-        save_result(
+        save_artifacts = save_result(
             episode_dir=task.episode_dir,
             out_episode_dir=task.out_episode_dir,
             camera_name=task.camera_name,
@@ -1226,6 +1653,10 @@ def run_camera_task(
                     task=task,
                     gpu_id=gpu_id,
                     args=camera_args,
+                    worker_label=worker_slot.label if worker_slot is not None else None,
+                    worker_index=worker_slot.worker_index if worker_slot is not None else None,
+                    gpu_slot_index=worker_slot.gpu_slot_index if worker_slot is not None else None,
+                    gpu_slot_count=worker_slot.gpu_slot_count if worker_slot is not None else None,
                     query_frame_count=query_frame_count,
                     process_seconds=process_seconds,
                     save_seconds=save_seconds,
@@ -1236,6 +1667,46 @@ def run_camera_task(
                     error_message=error_message,
                 )
             )
+            if bool(getattr(camera_args, "collect_profile_stats", False)):
+                telemetry_writer.record_task_profile(
+                    build_camera_task_profile_record(
+                        task=task,
+                        gpu_id=gpu_id,
+                        args=camera_args,
+                        worker_label=worker_slot.label if worker_slot is not None else None,
+                        worker_index=worker_slot.worker_index if worker_slot is not None else None,
+                        gpu_slot_index=worker_slot.gpu_slot_index if worker_slot is not None else None,
+                        gpu_slot_count=worker_slot.gpu_slot_count if worker_slot is not None else None,
+                        query_frame_count=query_frame_count,
+                        process_seconds=process_seconds,
+                        save_seconds=save_seconds,
+                        started_at_unix=started_at_unix,
+                        finished_at_unix=finished_at_unix,
+                        status=status,
+                        retryable_cuda_error=retryable_cuda_error,
+                        error_message=error_message,
+                        profile_stats=(
+                            result.get("profile_stats")
+                            if isinstance(result, dict)
+                            else None
+                        ),
+                        save_profile_stats=(
+                            save_artifacts.get("save_profile_stats")
+                            if isinstance(save_artifacts, dict)
+                            else None
+                        ),
+                        per_query_save_seconds=(
+                            save_artifacts.get("per_query_save_seconds")
+                            if isinstance(save_artifacts, dict)
+                            else None
+                        ),
+                        scene_finalize_overhead_seconds=(
+                            save_artifacts.get("scene_finalize_overhead_seconds")
+                            if isinstance(save_artifacts, dict)
+                            else None
+                        ),
+                    )
+                )
         if "model_depth_pose" in locals():
             del model_depth_pose
         safe_empty_cuda_cache(
@@ -1366,6 +1837,7 @@ def process_camera_tasks_on_gpu(
                     args=worker_args,
                     model_3dtracker=model_3dtracker,
                     gpu_id=worker_slot.gpu_id,
+                    worker_slot=worker_slot,
                     telemetry_writer=telemetry_writer,
                 )
                 if ok:
@@ -1444,9 +1916,16 @@ def main() -> None:
     gpu_ids = parse_gpu_ids(args.gpu_id)
     worker_slots = build_worker_slots(gpu_ids, workers_per_gpu=args.workers_per_gpu)
     probe_gpu_ids = list(dict.fromkeys(gpu_ids))
+    telemetry_gpu_ids = resolve_telemetry_gpu_ids(
+        gpu_ids=gpu_ids,
+        device=args.device,
+    )
     gpu_memory: dict[int, GpuMemoryInfo | None] = {}
     skipped_gpu_ids: list[int] = []
     telemetry_writer: BatchTelemetryWriter | None = None
+    hardware_sampler: HardwareTelemetrySampler | None = None
+    host_name = socket.gethostname()
+    gpu_info = collect_gpu_static_info(telemetry_gpu_ids)
 
     if probe_gpu_ids:
         available_gpu_ids, gpu_memory, skipped_gpu_ids = filter_gpu_ids_by_free_memory(
@@ -1533,8 +2012,19 @@ def main() -> None:
         f"keyframes_per_sec={args.keyframes_per_sec_min}~{args.keyframes_per_sec_max}, "
         f"future_len={args.future_len}, grid_size={args.grid_size}, "
         f"query_prefilter={args.query_prefilter_mode}, support_grid_ratio={args.support_grid_ratio}, "
-        f"load_stride={args.fps}"
+        f"load_stride={args.fps}, depth_filter_workers={args.depth_filter_workers}"
     )
+    logger.info(
+        f"collect_profile_stats={args.collect_profile_stats}, "
+        f"hardware_telemetry_interval_sec={args.hardware_telemetry_interval_sec}"
+    )
+    if gpu_info:
+        logger.info(f"telemetry_gpu_ids={telemetry_gpu_ids}")
+        for gpu_record in gpu_info:
+            logger.info(
+                f"[GPU {gpu_record['gpu_id']}] model={gpu_record.get('name')} "
+                f"total_mem_gib={gpu_record.get('memory_total_gib')}"
+            )
     logger.info("=" * 80)
 
     dynamic_tasks: list[CameraTask] | None = None
@@ -1563,134 +2053,162 @@ def main() -> None:
     batch_start = time.time()
     camera_task_count = 0
 
-    if gpu_ids:
-        worker_count = len(worker_slots)
-        assert dynamic_tasks is not None
-        camera_task_count = len(dynamic_tasks)
-        if not dynamic_tasks:
-            logger.info("No pending camera tasks after filtering.")
-            logger.info("=" * 80)
-            return
-        if args.copy_lang:
-            for episode_dir in episodes_for_run:
-                copy_episode_lang(
-                    episode_dir,
-                    resolve_episode_output_dir(
+    try:
+        if gpu_ids:
+            assert dynamic_tasks is not None
+            camera_task_count = len(dynamic_tasks)
+            if not dynamic_tasks:
+                logger.info("No pending camera tasks after filtering.")
+                logger.info("=" * 80)
+                return
+            if args.copy_lang:
+                for episode_dir in episodes_for_run:
+                    copy_episode_lang(
+                        episode_dir,
+                        resolve_episode_output_dir(
+                            episode_dir,
+                            args=args,
+                            out_root=out_dir,
+                        ),
+                    )
+
+            mp_ctx = mp.get_context("spawn")
+            if out_dir is not None:
+                telemetry_writer = BatchTelemetryWriter(
+                    out_dir,
+                    enable_profile_records=args.collect_profile_stats,
+                    enable_hardware_records=args.hardware_telemetry_interval_sec > 0.0,
+                    lock=mp_ctx.Lock(),
+                )
+                if args.hardware_telemetry_interval_sec > 0.0:
+                    hardware_sampler = HardwareTelemetrySampler(
+                        telemetry_writer=telemetry_writer,
+                        interval_sec=args.hardware_telemetry_interval_sec,
+                        host_name=host_name,
+                        gpu_ids=telemetry_gpu_ids,
+                    )
+                    hardware_sampler.start()
+            task_queue = mp_ctx.JoinableQueue()
+            for task in dynamic_tasks:
+                task_queue.put(task)
+            stop_event = mp_ctx.Event()
+            remaining_tasks = mp_ctx.Value("i", len(dynamic_tasks))
+            result_queue = mp_ctx.Queue()
+            worker_processes: list[tuple[WorkerSlot, mp.Process]] = []
+
+            for worker_slot in worker_slots:
+                process = mp_ctx.Process(
+                    target=process_camera_tasks_on_gpu_entrypoint,
+                    kwargs={
+                        "worker_slot": worker_slot,
+                        "task_queue": task_queue,
+                        "args": args,
+                        "stop_event": stop_event,
+                        "remaining_tasks": remaining_tasks,
+                        "result_queue": result_queue,
+                        "telemetry_writer": telemetry_writer,
+                    },
+                    name=f"traceforge-{worker_slot.gpu_id}-{worker_slot.gpu_slot_index}",
+                )
+                process.start()
+                worker_processes.append((worker_slot, process))
+
+            try:
+                while remaining_tasks.value > 0:
+                    dead_workers = [
+                        (worker_slot, process)
+                        for worker_slot, process in worker_processes
+                        if not process.is_alive()
+                    ]
+                    if dead_workers:
+                        logger.error("A dynamic GPU worker exited before all tasks completed.")
+                        break
+                    time.sleep(min(max(args.gpu_recovery_poll_sec, 1.0), 30.0))
+            finally:
+                stop_event.set()
+                for _ in worker_slots:
+                    task_queue.put(None)
+
+                for worker_slot, process in worker_processes:
+                    process.join(timeout=max(args.gpu_recovery_poll_sec, 1.0) + 10.0)
+                    if process.is_alive():
+                        logger.warning(
+                            f"[{worker_slot.label}] worker did not exit promptly; terminating."
+                        )
+                        process.terminate()
+                        process.join(timeout=5.0)
+
+            worker_results: dict[str, WorkerProcessResult] = {}
+            while True:
+                try:
+                    worker_result = result_queue.get_nowait()
+                except queue.Empty:
+                    break
+                worker_results[worker_result.worker_label] = worker_result
+
+            for worker_slot, process in worker_processes:
+                worker_result = worker_results.get(worker_slot.label)
+                if worker_result is not None:
+                    total_camera_success += worker_result.success_count
+                    total_camera_fail += worker_result.fail_count
+                    if worker_result.error is not None:
+                        logger.error(
+                            f"[{worker_result.worker_label}] dynamic worker reported error: "
+                            f"{worker_result.error}"
+                        )
+                    continue
+                if process.exitcode not in (0, None):
+                    logger.error(
+                        f"[{worker_slot.label}] dynamic worker exited with code {process.exitcode}"
+                    )
+
+            remaining_task_count = remaining_tasks.value
+            if remaining_task_count > 0:
+                total_camera_fail += remaining_task_count
+                logger.error(
+                    f"Dynamic scheduler left {remaining_task_count} camera tasks unprocessed."
+                )
+        else:
+            if out_dir is not None:
+                telemetry_writer = BatchTelemetryWriter(
+                    out_dir,
+                    enable_profile_records=args.collect_profile_stats,
+                    enable_hardware_records=args.hardware_telemetry_interval_sec > 0.0,
+                )
+                if args.hardware_telemetry_interval_sec > 0.0:
+                    hardware_sampler = HardwareTelemetrySampler(
+                        telemetry_writer=telemetry_writer,
+                        interval_sec=args.hardware_telemetry_interval_sec,
+                        host_name=host_name,
+                        gpu_ids=telemetry_gpu_ids,
+                    )
+                    hardware_sampler.start()
+            logger.info(f"Loading 3D tracker once on {args.device}")
+            model_3dtracker = infer.load_model(args.checkpoint).to(args.device)
+            try:
+                for idx, episode_dir in enumerate(episodes_for_run, start=1):
+                    logger.info(f"[{idx}/{len(episodes_for_run)}] episode={episode_dir.name}")
+                    out_episode_dir = resolve_episode_output_dir(
                         episode_dir,
                         args=args,
                         out_root=out_dir,
-                    ),
-                )
-
-        mp_ctx = mp.get_context("spawn")
-        if out_dir is not None:
-            telemetry_writer = BatchTelemetryWriter(out_dir, lock=mp_ctx.Lock())
-        task_queue = mp_ctx.JoinableQueue()
-        for task in dynamic_tasks:
-            task_queue.put(task)
-        stop_event = mp_ctx.Event()
-        remaining_tasks = mp_ctx.Value("i", len(dynamic_tasks))
-        result_queue = mp_ctx.Queue()
-        worker_processes: list[tuple[WorkerSlot, mp.Process]] = []
-
-        for worker_slot in worker_slots:
-            process = mp_ctx.Process(
-                target=process_camera_tasks_on_gpu_entrypoint,
-                kwargs={
-                    "worker_slot": worker_slot,
-                    "task_queue": task_queue,
-                    "args": args,
-                    "stop_event": stop_event,
-                    "remaining_tasks": remaining_tasks,
-                    "result_queue": result_queue,
-                    "telemetry_writer": telemetry_writer,
-                },
-                name=f"traceforge-{worker_slot.gpu_id}-{worker_slot.gpu_slot_index}",
-            )
-            process.start()
-            worker_processes.append((worker_slot, process))
-
-        try:
-            while remaining_tasks.value > 0:
-                dead_workers = [
-                    (worker_slot, process)
-                    for worker_slot, process in worker_processes
-                    if not process.is_alive()
-                ]
-                if dead_workers:
-                    logger.error("A dynamic GPU worker exited before all tasks completed.")
-                    break
-                time.sleep(min(max(args.gpu_recovery_poll_sec, 1.0), 30.0))
-        finally:
-            stop_event.set()
-            for _ in worker_slots:
-                task_queue.put(None)
-
-            for worker_slot, process in worker_processes:
-                process.join(timeout=max(args.gpu_recovery_poll_sec, 1.0) + 10.0)
-                if process.is_alive():
-                    logger.warning(
-                        f"[{worker_slot.label}] worker did not exit promptly; terminating."
                     )
-                    process.terminate()
-                    process.join(timeout=5.0)
-
-        worker_results: dict[str, WorkerProcessResult] = {}
-        while True:
-            try:
-                worker_result = result_queue.get_nowait()
-            except queue.Empty:
-                break
-            worker_results[worker_result.worker_label] = worker_result
-
-        for worker_slot, process in worker_processes:
-            worker_result = worker_results.get(worker_slot.label)
-            if worker_result is not None:
-                total_camera_success += worker_result.success_count
-                total_camera_fail += worker_result.fail_count
-                if worker_result.error is not None:
-                    logger.error(
-                        f"[{worker_result.worker_label}] dynamic worker reported error: "
-                        f"{worker_result.error}"
+                    success_count, fail_count = run_episode(
+                        episode_dir=episode_dir,
+                        out_episode_dir=out_episode_dir,
+                        args=args,
+                        model_3dtracker=model_3dtracker,
+                        telemetry_writer=telemetry_writer,
                     )
-                continue
-            if process.exitcode not in (0, None):
-                logger.error(
-                    f"[{worker_slot.label}] dynamic worker exited with code {process.exitcode}"
-                )
-
-        remaining_task_count = remaining_tasks.value
-        if remaining_task_count > 0:
-            total_camera_fail += remaining_task_count
-            logger.error(
-                f"Dynamic scheduler left {remaining_task_count} camera tasks unprocessed."
-            )
-    else:
-        if out_dir is not None:
-            telemetry_writer = BatchTelemetryWriter(out_dir)
-        logger.info(f"Loading 3D tracker once on {args.device}")
-        model_3dtracker = infer.load_model(args.checkpoint).to(args.device)
-        try:
-            for idx, episode_dir in enumerate(episodes_for_run, start=1):
-                logger.info(f"[{idx}/{len(episodes_for_run)}] episode={episode_dir.name}")
-                out_episode_dir = resolve_episode_output_dir(
-                    episode_dir,
-                    args=args,
-                    out_root=out_dir,
-                )
-                success_count, fail_count = run_episode(
-                    episode_dir=episode_dir,
-                    out_episode_dir=out_episode_dir,
-                    args=args,
-                    model_3dtracker=model_3dtracker,
-                    telemetry_writer=telemetry_writer,
-                )
-                total_camera_success += success_count
-                total_camera_fail += fail_count
-            camera_task_count = total_camera_success + total_camera_fail
-        finally:
-            del model_3dtracker
-            safe_empty_cuda_cache("single_gpu_main cleanup")
+                    total_camera_success += success_count
+                    total_camera_fail += fail_count
+                camera_task_count = total_camera_success + total_camera_fail
+            finally:
+                del model_3dtracker
+                safe_empty_cuda_cache("single_gpu_main cleanup")
+    finally:
+        if hardware_sampler is not None:
+            hardware_sampler.stop()
 
     wall_clock_seconds = time.time() - batch_start
     if telemetry_writer is not None:
@@ -1700,6 +2218,10 @@ def main() -> None:
                 base_path=base_path,
                 out_dir=out_dir,
                 gpu_ids=gpu_ids,
+                telemetry_gpu_ids=telemetry_gpu_ids,
+                host_name=host_name,
+                gpu_info=gpu_info,
+                worker_slot_count=len(worker_slots),
                 episode_count=len(episodes_for_run),
                 camera_task_count=camera_task_count,
                 total_camera_success=total_camera_success,

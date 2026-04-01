@@ -108,12 +108,17 @@ class InferCliSurfaceTests(unittest.TestCase):
         self.assertIn("--query_prefilter_wrist_rank_keep_ratio", _CLI_FLAGS)
         self.assertIn("--support_grid_ratio", _CLI_FLAGS)
         self.assertIn("--traj_filter_ablation_mode", _CLI_FLAGS)
+        self.assertIn("--collect_profile_stats", _CLI_FLAGS)
+        self.assertIn("--depth_filter_workers", _CLI_FLAGS)
 
     def test_num_iters_default_is_five(self):
         self.assertEqual(_CLI_DEFAULTS.get("--num_iters"), 5)
 
     def test_support_grid_ratio_default_is_point_eight(self):
         self.assertEqual(_CLI_DEFAULTS.get("--support_grid_ratio"), 0.8)
+
+    def test_depth_filter_workers_default_is_eight(self):
+        self.assertEqual(_CLI_DEFAULTS.get("--depth_filter_workers"), 8)
 
     def test_exposes_wrist_pick_place_no_heatmap_profile(self):
         self.assertIn("wrist_pick_place_no_heatmap", _CLI_CHOICES.get("--traj_filter_profile", ()))

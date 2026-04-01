@@ -76,6 +76,9 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
   --gpu_id 0,1,2,3 \
   --min_free_gpu_mem_gb 40 \
   --gpu_recovery_poll_sec 60 \
+  --collect_profile_stats \
+  --hardware_telemetry_interval_sec 30 \
+  --depth_filter_workers 8 \
   --keyframes_per_sec_min 2 \
   --keyframes_per_sec_max 3 \
   --skip_existing
@@ -93,6 +96,10 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
 - 维护态默认值已经覆盖 `camera_names=varied_camera_1,2,3`、`depth_pose_method=external`、
   `external_geom_name=trajectory_valid.h5`、`fps=1`、`max_num_frames=512`、
   `future_len=32`、`grid_size=80`、`filter_level=standard`、`traj_filter_profile=auto`
+- `--collect_profile_stats` 会把每个 camera task 的 `profile_stats` / `save_profile_stats`
+  额外落到 `_camera_task_profiles.jsonl`
+- `--hardware_telemetry_interval_sec > 0` 会周期记录 GPU/CPU/IO 指标到 `_hardware_telemetry.jsonl`
+- `--depth_filter_workers` 控制 `infer.py` 里 `_DepthFilterRuntime` 的线程数，便于 CPU 侧隔离实验
 - 对 wrist-like 相机，`auto` 仍是维护态默认映射，但只应当把它视为 press-like 任务的默认起点；
   `pick_place` 优先显式切到 `wrist_pick_place` / `wrist_pick_place_no_heatmap`，
   `push_pull` 优先从 `wrist` 起步
@@ -181,6 +188,13 @@ button/sim episode 默认就地写回：
 如果显式传入了 `--out_dir <output_root>`，则把上面的 `<episode_dir>/trajectory/`
 整体替换为 `<output_root>/<episode_name>/`；目录内部的 `_shared/` 和各相机子目录
 结构保持不变。
+
+同时 `<output_root>/` 根目录会额外保存：
+
+- `_batch_run_summary.json`
+- `_camera_task_metrics.jsonl`
+- `_camera_task_profiles.jsonl`（仅当 `--collect_profile_stats`）
+- `_hardware_telemetry.jsonl`（仅当 `--hardware_telemetry_interval_sec > 0`）
 
 ## 检查与回归
 

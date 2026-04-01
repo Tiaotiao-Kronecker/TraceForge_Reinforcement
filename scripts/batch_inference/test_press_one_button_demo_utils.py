@@ -44,6 +44,11 @@ _BUILD_TASK_RECORD_AST = next(
     for node in _SOURCE_AST.body
     if isinstance(node, ast.FunctionDef) and node.name == "build_camera_task_metric_record"
 )
+_BUILD_TASK_PROFILE_AST = next(
+    node
+    for node in _SOURCE_AST.body
+    if isinstance(node, ast.FunctionDef) and node.name == "build_camera_task_profile_record"
+)
 _BUILD_BATCH_SUMMARY_AST = next(
     node
     for node in _SOURCE_AST.body
@@ -54,6 +59,7 @@ _TELEMETRY_MODULE = ast.Module(
         _CAMERA_TASK_AST,
         _SAFE_PER_QUERY_AST,
         _BUILD_TASK_RECORD_AST,
+        _BUILD_TASK_PROFILE_AST,
         _BUILD_BATCH_SUMMARY_AST,
     ],
     type_ignores=[],
@@ -63,10 +69,12 @@ _TELEMETRY_GLOBALS = {
     "Path": Path,
     "argparse": __import__("argparse"),
     "Any": object,
+    "_DEFAULT_DEPTH_FILTER_WORKERS": 8,
 }
 exec(compile(_TELEMETRY_MODULE, str(_SOURCE_PATH), "exec"), _TELEMETRY_GLOBALS)
 CameraTask = _TELEMETRY_GLOBALS["CameraTask"]
 build_camera_task_metric_record = _TELEMETRY_GLOBALS["build_camera_task_metric_record"]
+build_camera_task_profile_record = _TELEMETRY_GLOBALS["build_camera_task_profile_record"]
 build_batch_run_summary = _TELEMETRY_GLOBALS["build_batch_run_summary"]
 
 
@@ -247,6 +255,9 @@ class PressOneButtonCliSurfaceTests(unittest.TestCase):
         self.assertIn("--query_prefilter_wrist_rank_keep_ratio", _CLI_FLAGS)
         self.assertIn("--support_grid_ratio", _CLI_FLAGS)
         self.assertIn("--traj_filter_ablation_mode", _CLI_FLAGS)
+        self.assertIn("--collect_profile_stats", _CLI_FLAGS)
+        self.assertIn("--hardware_telemetry_interval_sec", _CLI_FLAGS)
+        self.assertIn("--depth_filter_workers", _CLI_FLAGS)
 
     def test_num_iters_default_is_five(self):
         self.assertEqual(_CLI_DEFAULTS.get("--num_iters"), 5)
@@ -274,6 +285,7 @@ class BatchTelemetryRecordTests(unittest.TestCase):
             {
                 "device": "cuda:0",
                 "num_iters": 5,
+                "depth_filter_workers": 12,
                 "traj_filter_profile": "external",
             },
         )()
@@ -282,6 +294,10 @@ class BatchTelemetryRecordTests(unittest.TestCase):
             task=task,
             gpu_id=0,
             args=args,
+            worker_label="GPU 0 slot 1/4",
+            worker_index=1,
+            gpu_slot_index=1,
+            gpu_slot_count=4,
             query_frame_count=10,
             process_seconds=50.0,
             save_seconds=2.0,
@@ -295,11 +311,62 @@ class BatchTelemetryRecordTests(unittest.TestCase):
         self.assertEqual(record["episode_name"], "episode_00001_green")
         self.assertEqual(record["camera_name"], "varied_camera_1")
         self.assertEqual(record["num_iters"], 5)
+        self.assertEqual(record["depth_filter_workers"], 12)
+        self.assertEqual(record["worker_label"], "GPU 0 slot 1/4")
         self.assertEqual(record["query_frame_count"], 10)
         self.assertAlmostEqual(record["process_seconds_per_query"], 5.0)
         self.assertAlmostEqual(record["save_seconds_per_query"], 0.2)
         self.assertAlmostEqual(record["total_seconds_per_query"], 5.2)
         self.assertEqual(record["status"], "success")
+
+    def test_build_camera_task_profile_record_keeps_nested_profile_stats(self):
+        task = CameraTask(
+            task_index=1,
+            total_tasks=60,
+            episode_dir=Path("/tmp/episode_00001_green"),
+            out_episode_dir=Path("/tmp/output/episode_00001_green"),
+            camera_name="varied_camera_1",
+            query_frame_schedule_path=Path("/tmp/output/episode_00001_green/_shared/schedule.json"),
+        )
+        args = type(
+            "Args",
+            (),
+            {
+                "device": "cuda:0",
+                "num_iters": 5,
+                "depth_filter_workers": 8,
+                "traj_filter_profile": "external",
+            },
+        )()
+
+        record = build_camera_task_profile_record(
+            task=task,
+            gpu_id=0,
+            args=args,
+            worker_label="GPU 0 slot 1/2",
+            worker_index=1,
+            gpu_slot_index=1,
+            gpu_slot_count=2,
+            query_frame_count=3,
+            process_seconds=12.0,
+            save_seconds=1.5,
+            started_at_unix=100.0,
+            finished_at_unix=113.5,
+            status="success",
+            retryable_cuda_error=False,
+            error_message=None,
+            profile_stats={"tracker_model_forward_seconds": 10.0},
+            save_profile_stats={"sample_write_seconds": 1.0},
+            per_query_save_seconds={7: 0.5, 9: 0.7},
+            scene_finalize_overhead_seconds=0.3,
+        )
+
+        self.assertEqual(record["worker_label"], "GPU 0 slot 1/2")
+        self.assertEqual(record["query_frame_count"], 3)
+        self.assertEqual(record["profile_stats"]["tracker_model_forward_seconds"], 10.0)
+        self.assertEqual(record["save_profile_stats"]["sample_write_seconds"], 1.0)
+        self.assertEqual(record["per_query_save_seconds"], {"7": 0.5, "9": 0.7})
+        self.assertAlmostEqual(record["scene_finalize_overhead_seconds"], 0.3)
 
     def test_build_batch_run_summary_preserves_fixed_keyframe_config(self):
         args = type(
@@ -307,7 +374,11 @@ class BatchTelemetryRecordTests(unittest.TestCase):
             (),
             {
                 "camera_names": ["varied_camera_1", "varied_camera_3"],
+                "workers_per_gpu": 4,
+                "collect_profile_stats": True,
+                "hardware_telemetry_interval_sec": 30.0,
                 "num_iters": 6,
+                "depth_filter_workers": 16,
                 "keyframe_seed": 0,
                 "keyframes_per_sec_min": 5,
                 "keyframes_per_sec_max": 5,
@@ -328,6 +399,10 @@ class BatchTelemetryRecordTests(unittest.TestCase):
             base_path=Path("/data2/test"),
             out_dir=Path("/data2/out"),
             gpu_ids=[0, 1, 2, 3],
+            telemetry_gpu_ids=[0, 1, 2, 3],
+            host_name="worker-host",
+            gpu_info=[{"gpu_id": 0, "name": "NVIDIA H200"}],
+            worker_slot_count=16,
             episode_count=30,
             camera_task_count=60,
             total_camera_success=60,
@@ -337,6 +412,13 @@ class BatchTelemetryRecordTests(unittest.TestCase):
 
         self.assertEqual(summary["camera_names"], ["varied_camera_1", "varied_camera_3"])
         self.assertEqual(summary["gpu_ids"], [0, 1, 2, 3])
+        self.assertEqual(summary["telemetry_gpu_ids"], [0, 1, 2, 3])
+        self.assertEqual(summary["host_name"], "worker-host")
+        self.assertEqual(summary["workers_per_gpu"], 4)
+        self.assertEqual(summary["worker_slot_count"], 16)
+        self.assertTrue(summary["collect_profile_stats"])
+        self.assertAlmostEqual(summary["hardware_telemetry_interval_sec"], 30.0)
+        self.assertEqual(summary["depth_filter_workers"], 16)
         self.assertEqual(summary["episode_count"], 30)
         self.assertEqual(summary["camera_task_count"], 60)
         self.assertEqual(summary["keyframes_per_sec_min"], 5)

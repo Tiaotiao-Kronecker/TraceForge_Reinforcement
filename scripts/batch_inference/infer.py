@@ -144,6 +144,10 @@ def _count_true(mask: np.ndarray | None) -> int:
     return int(np.count_nonzero(np.asarray(mask, dtype=bool)))
 
 
+def _resolve_depth_filter_workers(args) -> int:
+    return max(1, int(getattr(args, "depth_filter_workers", 8)))
+
+
 SHORT_TAIL_SKIP_MAX_SEGMENT_LEN = 8
 
 
@@ -679,6 +683,12 @@ def parse_args():
     )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num_iters", type=int, default=5)
+    parser.add_argument(
+        "--collect_profile_stats",
+        action="store_true",
+        default=False,
+        help="Populate process/save timing breakdowns in the returned result payloads.",
+    )
     parser.add_argument("--fps", type=int, default=1)
     parser.add_argument("--out_dir", type=str, default="outputs")
     parser.add_argument(
@@ -796,6 +806,12 @@ def parse_args():
         help="Support-point grid ratio relative to grid_size. 0 disables extra support points.",
     )
     parser.add_argument(
+        "--depth_filter_workers",
+        type=int,
+        default=8,
+        help="Thread count for filtered-depth precomputation inside _DepthFilterRuntime.",
+    )
+    parser.add_argument(
         "--filter_level",
         type=str,
         default="standard",
@@ -898,6 +914,8 @@ def parse_args():
         parser.error("--query_prefilter_wrist_rank_keep_ratio must be within [0, 1].")
     if args.support_grid_ratio < 0.0:
         parser.error("--support_grid_ratio must be >= 0.")
+    if args.depth_filter_workers <= 0:
+        parser.error("--depth_filter_workers must be >= 1.")
     return args
 
 def retarget_trajectories(
@@ -2868,6 +2886,7 @@ def run_single_query_frame(
         np.asarray(scene_ctx["intrs_npy"], dtype=np.float32),
         [(start_frame, end_frame)],
         profile_stats=profile_stats,
+        max_workers=_resolve_depth_filter_workers(args),
     ) as depth_filter_runtime:
         query_frame_result = _run_query_frame_core(
             scene_ctx=scene_ctx,
@@ -3163,6 +3182,7 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
         np.asarray(scene_ctx["intrs_npy"], dtype=np.float32),
         tracking_segments,
         profile_stats=profile_stats,
+        max_workers=_resolve_depth_filter_workers(args),
     ) as depth_filter_runtime:
         for start_frame, _end_frame in tracking_segments:
             query_frame_results[int(start_frame)] = _run_query_frame_core(
