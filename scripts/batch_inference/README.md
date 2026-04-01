@@ -36,7 +36,7 @@
 - `check_failed_inference.py`
 - `test_inference_output_shapes.py`
 - `verify_pointcloud.py`
-- `verify_traj_valid_mask.py`
+- `verify_traj_valid_mask.py`（单个 NPZ 的历史/兼容性排查脚本，不是当前维护态 `v2` 的标准回归入口）
 
 ## 文档
 

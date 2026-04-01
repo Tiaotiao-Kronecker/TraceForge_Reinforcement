@@ -13,7 +13,8 @@ Current maintained pipeline:
 - visualization and verification on saved artifacts
 
 For the current maintained trajectory-filter behavior, including the default
-`external` path and the wrist-like default `wrist_manipulator_top95` path, see
+`external` path, the wrist-like default `wrist_manipulator_top95` path, and the
+task-specific caveats for `pick_place` / `push_pull`, see
 [docs/maintained_traj_filter_logic.md](docs/maintained_traj_filter_logic.md).
 
 The repository still contains a few compatibility paths, notably
@@ -73,6 +74,11 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
   --skip_existing
 ```
 
+By default, batch outputs are written in-place under
+`<episode>/trajectory/<camera_name>/...`. If you pass `--out_dir <output_root>`,
+the same per-episode camera outputs are written under
+`<output_root>/<episode_name>/<camera_name>/...` instead.
+
 ### Sim / button batch inference
 
 ```bash
@@ -104,6 +110,10 @@ Its maintained defaults already cover `camera_names=varied_camera_1,2,3`,
 `depth_pose_method=external`, `external_geom_name=trajectory_valid.h5`,
 `fps=1`, `max_num_frames=512`, `future_len=32`, `num_iters=5`, `grid_size=80`,
 `filter_level=standard`, and `traj_filter_profile=auto`.
+For wrist-like cameras, `auto` is still the maintained default, but it should
+not be treated as the best choice for every task: for `pick_place`, prefer
+`wrist_pick_place` when `pick` heatmaps are available and
+`wrist_pick_place_no_heatmap` otherwise; for `push_pull`, start from `wrist`.
 
 ### 3D visualization
 
@@ -111,14 +121,16 @@ Its maintained defaults already cover `camera_names=varied_camera_1,2,3`,
 
 ```bash
 python scripts/visualization/visualize_single_image.py \
-  --npz_path <episode_dir>/samples/<sample>.npz \
+  --npz_path <camera_output_dir>/samples/<sample>.npz \
   --port 8080
 ```
 
 `visualize_single_image.py` expects a sample NPZ path such as
-`samples/<episode_name>_<query_frame>.npz`. By default it loads RGB, depth,
-intrinsics, and extrinsics from the episode scene artifacts. `--image_path` and
-`--depth_path` are optional overrides, not required inputs.
+`samples/<camera_output_name>_<query_frame>.npz`. For button/sim in-place
+outputs, `camera_output_dir` is typically
+`<episode>/trajectory/<camera_name>`. By default it loads RGB, depth,
+intrinsics, and extrinsics from the camera output scene artifacts.
+`--image_path` and `--depth_path` are optional overrides, not required inputs.
 
 #### 3D animation viewer
 
@@ -126,7 +138,7 @@ Standard dynamic point-cloud view:
 
 ```bash
 python scripts/visualization/visualize_3d_keypoint_animation.py \
-  --episode_dir <episode_dir> \
+  --episode_dir <camera_output_dir> \
   --query_frame 15 \
   --dense_pointcloud \
   --port 8080
@@ -136,7 +148,7 @@ Lighter-weight animation view:
 
 ```bash
 python scripts/visualization/visualize_3d_keypoint_animation.py \
-  --episode_dir <episode_dir> \
+  --episode_dir <camera_output_dir> \
   --query_frame 15 \
   --dense_pointcloud \
   --keypoint_stride 2 \
@@ -159,7 +171,7 @@ Both `visualize_single_image.py` and
 
 | Parameter | Default | Meaning | When to change |
 | --- | --- | --- | --- |
-| `--episode_dir` | required | Episode root directory, not a sample NPZ file. The script reads `samples/` and scene artifacts from here. | Always set it. |
+| `--episode_dir` | required | Camera output root directory, not a sample NPZ file. The script reads `samples/` and scene artifacts from here. For button/sim in-place outputs this is typically `<episode>/trajectory/<camera_name>`. | Always set it. |
 | `--query_frame` | `None` | Query frame to visualize. If omitted, the script uses the first available sample. If the requested frame is missing, it falls back to the first available sample. | Set it when comparing a specific query frame such as `15`. |
 | `--keypoint_stride` | `10` | Display every Nth kept trajectory in the animation. Larger values render fewer keypoints and improve interactivity. | Increase it for dense samples or slow browsers. |
 | `--dense_pointcloud` | `False` | Reconstruct and animate dense point clouds from scene artifacts. In `v2`, this follows `segment_frame_indices` and produces a dynamic background. | Enable it when depth / geometry consistency needs to be inspected. |
@@ -169,8 +181,9 @@ Both `visualize_single_image.py` and
 
 Animation behavior notes:
 
-- `--episode_dir` is the episode folder itself, unlike `visualize_single_image.py`
-  which takes `--npz_path`.
+- `--episode_dir` is the camera output root itself, unlike
+  `visualize_single_image.py` which takes a sample NPZ path inside
+  `samples/`.
 - With `--dense_pointcloud`, `v2` outputs reconstruct dynamic dense point clouds
   directly from scene artifacts and source references.
 - When the sample contains more than `500` kept trajectories and
@@ -186,10 +199,10 @@ python checker/batch_process_result_checker.py <output_dir> --max-videos 1 --max
 
 ## Output Layout
 
-Default output is `v2` with `scene_storage_mode=source_ref`:
+Default per-camera output root is `v2` with `scene_storage_mode=source_ref`:
 
 ```text
-<episode_dir>/
+<camera_output_dir>/
 ├── scene_meta.json
 └── samples/
     ├── <sample0>.npz
@@ -207,9 +220,15 @@ contains a shared keyframe manifest:
 ├── _shared/
 │   └── query_frame_schedule_v3_<hash>.json
 ├── varied_camera_1/
+│   ├── scene_meta.json
+│   └── samples/
 ├── varied_camera_2/
 └── varied_camera_3/
 ```
+
+When using the visualization tools on button/sim outputs, point them at a
+camera output root such as `<episode_dir>/trajectory/varied_camera_3`, or at a
+sample NPZ inside that directory.
 
 When local scene caches are required, pass `--scene_storage_mode cache`; that variant also writes:
 

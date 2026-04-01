@@ -1,6 +1,7 @@
 import ast
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 
 _SOURCE_PATH = Path(__file__).resolve().with_name("batch_infer_press_one_button_demo.py")
@@ -12,6 +13,22 @@ _RESOLVE_MODULE = ast.Module(body=[_RESOLVE_FUNC_AST], type_ignores=[])
 _RESOLVE_NAMESPACE: dict[str, object] = {}
 exec(compile(_RESOLVE_MODULE, str(_SOURCE_PATH), "exec"), _RESOLVE_NAMESPACE)
 resolve_traj_filter_profile = _RESOLVE_NAMESPACE["resolve_traj_filter_profile"]
+
+_HAS_FILES_AST = next(
+    node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "_has_files"
+)
+_FIND_VALID_EPISODES_AST = next(
+    node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "find_valid_episodes"
+)
+_FIND_VALID_EPISODES_MODULE = ast.Module(
+    body=[_HAS_FILES_AST, _FIND_VALID_EPISODES_AST],
+    type_ignores=[],
+)
+_FIND_VALID_EPISODES_NAMESPACE = {
+    "Path": Path,
+}
+exec(compile(_FIND_VALID_EPISODES_MODULE, str(_SOURCE_PATH), "exec"), _FIND_VALID_EPISODES_NAMESPACE)
+find_valid_episodes = _FIND_VALID_EPISODES_NAMESPACE["find_valid_episodes"]
 
 _PARSE_ARGS_FUNC_AST = next(
     node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "parse_args"
@@ -151,6 +168,66 @@ class ResolveTrajFilterProfileTests(unittest.TestCase):
             resolve_traj_filter_profile("varied_camera_3", "wrist"),
             "wrist",
         )
+
+    def test_pick_place_profile_only_applies_to_wrist_like_cameras(self):
+        self.assertEqual(
+            resolve_traj_filter_profile("varied_camera_3", "wrist_pick_place_no_heatmap"),
+            "wrist_pick_place_no_heatmap",
+        )
+        self.assertEqual(
+            resolve_traj_filter_profile("varied_camera_1", "wrist_pick_place_no_heatmap"),
+            "external",
+        )
+
+
+class FindValidEpisodesTests(unittest.TestCase):
+    def _write_file(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"test")
+
+    def _make_valid_episode(self, base_path: Path, episode_name: str, camera_name: str = "varied_camera_1") -> Path:
+        episode_dir = base_path / episode_name
+        self._write_file(episode_dir / "trajectory_valid.h5")
+        self._write_file(episode_dir / "rgb" / camera_name / "000000.png")
+        self._write_file(episode_dir / "depth" / camera_name / "000000.npy")
+        return episode_dir
+
+    def test_accepts_prefixed_and_numeric_episode_directory_names(self):
+        with TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir)
+            episode_prefixed = self._make_valid_episode(base_path, "episode_00001")
+            episode_numeric = self._make_valid_episode(base_path, "00002")
+            self._make_valid_episode(base_path, "session_00003")
+
+            episodes = find_valid_episodes(base_path, ["varied_camera_1"], "trajectory_valid.h5")
+
+            self.assertEqual(episodes, [episode_numeric, episode_prefixed])
+
+    def test_requires_geom_and_any_camera_with_rgb_and_depth_files(self):
+        with TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir)
+            valid_episode = self._make_valid_episode(base_path, "episode_00001", camera_name="varied_camera_2")
+
+            missing_geom = base_path / "episode_00002"
+            self._write_file(missing_geom / "rgb" / "varied_camera_1" / "000000.png")
+            self._write_file(missing_geom / "depth" / "varied_camera_1" / "000000.npy")
+
+            missing_depth = base_path / "episode_00003"
+            self._write_file(missing_depth / "trajectory_valid.h5")
+            self._write_file(missing_depth / "rgb" / "varied_camera_1" / "000000.png")
+
+            wrong_suffix = base_path / "episode_00004"
+            self._write_file(wrong_suffix / "trajectory_valid.h5")
+            self._write_file(wrong_suffix / "rgb" / "varied_camera_1" / "000000.txt")
+            self._write_file(wrong_suffix / "depth" / "varied_camera_1" / "000000.bin")
+
+            episodes = find_valid_episodes(
+                base_path,
+                ["varied_camera_1", "varied_camera_2"],
+                "trajectory_valid.h5",
+            )
+
+            self.assertEqual(episodes, [valid_episode])
 
 
 class PressOneButtonCliSurfaceTests(unittest.TestCase):

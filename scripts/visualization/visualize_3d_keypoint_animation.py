@@ -86,6 +86,50 @@ def fade_track_colors(colors: np.ndarray, *, blend: float = 0.72) -> np.ndarray:
     return colors * (1.0 - blend) + blend
 
 
+def compute_scene_bounds(point_sets: list[np.ndarray]) -> tuple[np.ndarray, float] | None:
+    finite_sets: list[np.ndarray] = []
+    for points in point_sets:
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 3:
+            continue
+        finite = points[np.isfinite(points).all(axis=1)]
+        if len(finite) > 0:
+            finite_sets.append(finite)
+
+    if not finite_sets:
+        return None
+
+    merged = np.concatenate(finite_sets, axis=0)
+    mins = np.min(merged, axis=0)
+    maxs = np.max(merged, axis=0)
+    center = 0.5 * (mins + maxs)
+    radius = 0.5 * float(np.linalg.norm(maxs - mins))
+    radius = max(radius, 0.05)
+    return center.astype(np.float64), radius
+
+
+def set_initial_camera_from_scene(
+    server: viser.ViserServer,
+    *,
+    scene_center: np.ndarray,
+    scene_radius: float,
+) -> None:
+    scene_center = np.asarray(scene_center, dtype=np.float64)
+    direction = np.asarray([2.2, 1.4, 2.2], dtype=np.float64)
+    direction /= np.linalg.norm(direction)
+    distance = max(scene_radius * 4.0, 0.35)
+
+    server.initial_camera.look_at = scene_center
+    server.initial_camera.position = scene_center + direction * distance
+    server.initial_camera.near = max(scene_radius * 0.02, 1e-3)
+    server.initial_camera.far = max(scene_radius * 40.0, 5.0)
+
+    logger.info(
+        "Initial camera fitted to scene: "
+        f"center={scene_center.tolist()}, radius={scene_radius:.4f}, distance={distance:.4f}"
+    )
+
+
 def load_dense_sequence_from_scene(
     scene_reader: SceneReader,
     *,
@@ -235,7 +279,7 @@ def main() -> None:
         "--episode_dir",
         type=str,
         required=True,
-        help="episode 目录，如 output_bridge_depth_grid80/00000/images0",
+        help="camera 输出目录，例如 <episode>/trajectory/varied_camera_3 或外部 out_dir 下的对应目录",
     )
     parser.add_argument(
         "--query_frame",
@@ -393,6 +437,16 @@ def main() -> None:
 
     server = viser.ViserServer(port=args.port)
     server.scene.set_up_direction("-y")
+    scene_bounds = compute_scene_bounds(
+        [traj_full.reshape(-1, 3)] + ([dense_per_frame[0]] if dense_per_frame is not None and len(dense_per_frame) > 0 else [])
+    )
+    if scene_bounds is not None:
+        scene_center, scene_radius = scene_bounds
+        set_initial_camera_from_scene(
+            server,
+            scene_center=scene_center,
+            scene_radius=scene_radius,
+        )
 
     def get_points_at_time(t: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if n_valid <= 0:

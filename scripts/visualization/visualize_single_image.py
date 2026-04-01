@@ -354,7 +354,7 @@ if __name__ == "__main__":
         "--npz_path",
         type=str,
         required=True,
-        help="Path to a sample NPZ file under <episode>/samples/",
+        help="Path to a sample NPZ file under <camera_output_dir>/samples/",
     )
     parser.add_argument(
         "--image_path",

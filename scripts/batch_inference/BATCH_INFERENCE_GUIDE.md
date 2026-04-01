@@ -81,6 +81,10 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
   --skip_existing
 ```
 
+默认会就地写回到 `<episode>/trajectory/<camera_name>/...`。如果显式传入
+`--out_dir <output_root>`，则会改为写到
+`<output_root>/<episode_name>/<camera_name>/...`。
+
 适用场景：
 
 - button/sim episode 数据集
@@ -89,6 +93,9 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
 - 维护态默认值已经覆盖 `camera_names=varied_camera_1,2,3`、`depth_pose_method=external`、
   `external_geom_name=trajectory_valid.h5`、`fps=1`、`max_num_frames=512`、
   `future_len=32`、`grid_size=80`、`filter_level=standard`、`traj_filter_profile=auto`
+- 对 wrist-like 相机，`auto` 仍是维护态默认映射，但只应当把它视为 press-like 任务的默认起点；
+  `pick_place` 优先显式切到 `wrist_pick_place` / `wrist_pick_place_no_heatmap`，
+  `push_pull` 优先从 `wrist` 起步
 
 ## Press-One-Button Demo
 
@@ -120,6 +127,7 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
 - `--keyframe_seed` 用于可复现的 deterministic schedule；默认 `0`
 - 如果某些 `trajectory_valid.h5` 缺少根属性 `fps`，可以显式提供 `--fallback_episode_fps`
 - `auto` 会把 wrist-like camera 映射到 `wrist_manipulator_top95`
+- 这个默认映射更接近 press 类任务；对 `pick_place` / `push_pull` 不应再把它当成通用默认
 - `external_manipulator`、`external_manipulator_v2`、`wrist_manipulator_top95`、`wrist_manipulator`
   需要显式指定
 - `wrist_manipulator_top95` 是 wrist_manipulator 的临时去噪 profile：先走 wrist_manipulator，再按
@@ -170,14 +178,20 @@ button/sim episode 默认就地写回：
 - `keyframes_per_sec_min`
 - `keyframes_per_sec_max`
 
+如果显式传入了 `--out_dir <output_root>`，则把上面的 `<episode_dir>/trajectory/`
+整体替换为 `<output_root>/<episode_name>/`；目录内部的 `_shared/` 和各相机子目录
+结构保持不变。
+
 ## 检查与回归
 
 ```bash
 python -m unittest utils.test_keyframe_schedule_utils
 python scripts/batch_inference/test_inference_output_shapes.py
 python scripts/batch_inference/verify_pointcloud.py
-python scripts/batch_inference/verify_traj_valid_mask.py
 ```
+
+`verify_traj_valid_mask.py` 目前只适合作为单个 NPZ 的历史/兼容性排查脚本，需要显式传入
+`<npz_path>`，而且不属于当前维护态 `v2` 输出的标准回归检查链路。
 
 ## 不在本文档范围内的内容
 

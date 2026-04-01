@@ -165,16 +165,24 @@ def parse_camera_names(camera_names: str) -> list[str]:
 
 
 def resolve_traj_filter_profile(camera_name: str, requested_profile: str) -> str:
-    if requested_profile != "auto":
-        return requested_profile
     camera_name = camera_name.lower()
-    if (
+    is_wrist_like = (
         camera_name.endswith("camera_3")
         or "wrist" in camera_name
         or "hand" in camera_name
-    ):
-        return "wrist_manipulator_top95"
-    return "external"
+    )
+    if requested_profile == "auto":
+        if is_wrist_like:
+            return "wrist_manipulator_top95"
+        return "external"
+    if requested_profile in {
+        "wrist_pick_place",
+        "wrist_pick_place_no_heatmap",
+    }:
+        if is_wrist_like:
+            return requested_profile
+        return "external"
+    return requested_profile
 
 
 def _safe_per_query_seconds(total_seconds: float | None, query_frame_count: int | None) -> float | None:
@@ -814,7 +822,7 @@ def find_valid_episodes(base_path: Path, camera_names: list[str], geom_name: str
     for episode_dir in sorted(base_path.iterdir()):
         if not episode_dir.is_dir():
             continue
-        if not episode_dir.name.startswith("episode_"):
+        if not (episode_dir.name.startswith("episode_") or episode_dir.name.isdigit()):
             continue
 
         geom_path = episode_dir / geom_name

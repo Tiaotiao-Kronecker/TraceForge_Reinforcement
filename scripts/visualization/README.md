@@ -5,12 +5,13 @@
 ## 当前脚本
 
 - `visualize_single_image.py`
-  - 读取 sample NPZ 和 episode scene artifacts
+  - 读取 sample NPZ 和对应 camera output root 下的 scene artifacts
   - 按 `traj_valid_mask` 显示过滤后的 3D 轨迹
   - `--image_path` / `--depth_path` 只是可选 override
 - `visualize_3d_keypoint_animation.py`
   - 逐时间步播放 keypoint 轨迹
   - 支持 `v2` 和 `legacy`
+  - `--episode_dir` 实际上传入的是 camera output root，例如 `<episode>/trajectory/varied_camera_3`
 - `visualize_3d_keypoint_comparison.py`
   - 同时读取 baseline / variant 两个 episode output
   - 把 `baseline-only / overlap / variant-only` 三类轨迹叠在一个 3D 视图里
