@@ -1,6 +1,6 @@
 # pick_place Batch Telemetry 实验结论
 
-日期：2026-04-01
+日期：2026-04-01（2026-04-02 更新）
 
 本文档作为这轮 `pick_place` 批量性能实验的持续更新结论页。
 
@@ -27,22 +27,24 @@
 | shared save 向量化与 profile 细化 | 已完成 | external save 已接近亚秒级，wrist 剩余主要是 profile-specific filter |
 | `prepare_depth_filter` cache / ray cache / 分阶段 profiling | 已完成 | 重点已从“有没有 cache”转向“cache 后每帧自身计算还重不重” |
 | `pick_place` 路径复用与 fast path | 已完成 | 已有 `world_tracks` 复用、reference geometry 复用、candidate 子集 fast path |
+| `manipulator_motion` motion metrics 向量化 | 已完成 | helper local microbenchmark 约 `9.2x`，且 `filter_result_manipulator_motion_seconds/query` 已从 `0.104` 降到 `0.0046`；但端到端总吞吐未改善，已降为次要方向 |
 
 ### 本轮不改语义性能实验
 
 | 项目 | 当前状态 | 当前结论 / 默认建议 |
 | --- | --- | --- |
 | 单卡 `workers_per_gpu = 1/2/3/4` | 已完成 | `>1` 不提吞吐，只放大同卡竞争；默认固定 `workers_per_gpu=1` |
-| 单卡 `depth_filter_workers = 4/8/16` | 已完成 | CPU 侧仍会影响总吞吐；默认固定 `depth_filter_workers=16` |
+| 单卡 `depth_filter_workers = 4/8/16` | 已完成 | 单卡隔离时 `16` 最快，可作为单卡 override baseline |
+| 两卡 `depth_filter_workers = 8/16` 小样本确认 | 已完成 | 本次 `df16` 未复现单卡收益；当前代码默认先维持 `8` |
 | 8 卡 `workers_per_gpu = 1/2/4` | 未执行 | 如果继续看并发策略，应先做 8 卡 `workers_per_gpu=1` 基线，`>1` 低优先级 |
 
 ### 未完成同语义优化清单
 
 | 项目 | 优先级 | 当前状态 | 备注 |
 | --- | --- | --- | --- |
-| `manipulator_motion` 的向量化 / candidate 子集化 | `P0` | 未开始 | 当前最适合先落地、再立即复测的同语义优化 |
-| `prepare_depth_filter` 的 per-frame kernel 优化 | `P1` | 未开始 | 重点看 `points_to_normals`、`edge_mask`、`distance_transform` |
-| tracker 侧 batching / feature cache 复用 | `P2` | 未开始 | 收益上限最高，但风险和改动面也最大 |
+| `prepare_depth_filter` 的 per-frame kernel 优化 | `P0` | 未开始 | 当前最该继续的同语义主线，重点看 `points_to_normals`、`edge_mask`、`distance_transform` |
+| tracker 侧 batching / feature cache 复用 | `P1` | 未开始 | 收益上限最高，但风险和改动面也最大 |
+| `manipulator_motion` 的 candidate 子集化 | `P2` | 暂不继续 | 向量化后 `filter_result_manipulator_motion_seconds/query` 已压到 `0.0046`，继续深挖对总吞吐预期收益很小 |
 
 ### 改语义性能-质量权衡实验
 
@@ -57,7 +59,7 @@
 
 ### 当前推荐 baseline
 
-如果目标是“当前 H200 + pick_place 维护态 workload 的最低时间消耗”，当前推荐固定：
+如果目标是“单卡 isolate benchmark 的最低时间消耗”，当前推荐固定：
 
 - `workers_per_gpu=1`
 - `depth_filter_workers=16`
@@ -67,9 +69,19 @@
 - `future_len=32`
 - `grid_size=80`
 
+如果目标是“当前代码默认值 / 多卡路径的稳妥配置”，当前建议固定：
+
+- `workers_per_gpu=1`
+- `depth_filter_workers=8`
+- `num_iters=5`
+- `support_grid_ratio=0.8`
+- `query_prefilter_mode=off`
+- `future_len=32`
+- `grid_size=80`
+
 ## 当前固定条件
 
-本轮默认固定：
+单卡 isolate sweep 固定：
 
 - 数据集：`/DATA/disk1/zoyo/mjc_1000_step1`
 - profile：`traj_filter_profile=wrist_pick_place_no_heatmap`
@@ -280,25 +292,131 @@
 - 变化主要来自 `prepare_depth_filter_seconds/query` 和 `prepare_inputs_seconds/query` 下降，不是 `tracker_model_forward_seconds/query` 或 `save` 变快。
 - 后续单卡 baseline 应更新为 `workers_per_gpu=1`、`depth_filter_workers=16`。
 
+### 7. `manipulator_motion` motion metrics 向量化（代码级）
+
+代码位置：
+
+- `utils/traj_filter_utils.py`
+- `utils/test_traj_filter_utils.py`
+
+验证：
+
+- `/DATA/disk2/wangchen/projects/TraceForge_Reinforcement/.venv/bin/python -m unittest utils.test_traj_filter_utils.MotionMetricHelperTests`
+- `/DATA/disk2/wangchen/projects/TraceForge_Reinforcement/.venv/bin/python -m unittest utils.test_traj_filter_utils`
+
+local microbenchmark（synthetic `4096 tracks x 32 frames x 3 masks`）：
+
+- 旧版 reference loop：`0.3445 s/call`
+- 向量化实现：`0.0373 s/call`
+- helper 层加速约 `9.24x`
+
+结论：
+
+- `_compute_motion_metrics_for_valid_masks` 已移除按 track 的 Python 双层循环。
+- 语义保持不变：仍然以“首个 valid 点”为 motion extent anchor，`step median` 与 `NaN` 行为均已用直接回归测试锁住。
+- 这只是 helper 层结果，不等价于端到端 `pick_place` 吞吐已经同比例提升。
+- 对应的单卡 telemetry 复测结果见下一节。
+
+### 8. `manipulator_motion` 向量化后的单卡 telemetry 复测
+
+输出根：
+
+- `/DATA/disk2/wangchen/projects/traceforge_runs/mjc_1000_step1_single_gpu_manipulator_motion_retest_20260401_df16`
+
+报告：
+
+- `data_tmp/telemetry_reports/mjc_1000_step1_single_gpu_manipulator_motion_retest_20260401_df16.md`
+- `data_tmp/telemetry_reports/mjc_1000_step1_single_gpu_manipulator_motion_retest_20260401_df16.json`
+
+与上一版 `depth_filter_workers=16` baseline 对比：
+
+| 指标 | 旧 baseline | 本次复测 | 变化 |
+| --- | ---: | ---: | ---: |
+| `single_gpu_seconds/query` | `15.31` | `15.91` | `+0.59` |
+| `process/query` | `14.91` | `15.24` | `+0.33` |
+| `save/query` | `0.19` | `0.10` | `-0.09` |
+| `filter_result_manipulator_motion_seconds/query` | `0.1043` | `0.0046` | `-0.0998` |
+| `filter_result_total_seconds/query` | `0.1314` | `0.0323` | `-0.0991` |
+
+补充对比：
+
+- `prepare_depth_filter_seconds/query` 从 `0.65` 升到 `0.96`。
+- `prepare_inputs_seconds/query` 从 `0.68` 升到 `1.01`。
+- `tracker_model_forward_seconds/query` 从 `13.51` 微降到 `13.44`。
+
+结论：
+
+- 这次向量化确实把 wrist 路径里的 `manipulator_motion` 评估基本压平了，helper 改动是有效的。
+- 但它只影响 save/filter 的一小段时间，量级约 `0.10 s/query`；对总吞吐的贡献上限太小。
+- 在真实单卡复测里，总 wall clock 反而回到 `811.19s`，说明当前主导总耗时的仍然不是这块。
+- 因此同语义主线优先级应回到 `prepare_depth_filter` per-frame kernel，而不是继续深挖 `manipulator_motion` candidate 子集化。
+
+### 9. 两卡 `depth_filter_workers=8 vs 16` 小样本确认
+
+固定条件：
+
+- 数据集：`/DATA/disk1/zoyo/mjc_1000_step1`
+- manifest：`scripts/data_analysis/manifests/mjc_1000_step1_single_gpu_workers_sweep_20260401.txt`
+- episodes：`00000`, `00001`
+- `gpu_id=0,1`
+- `workers_per_gpu=1`
+- `traj_filter_profile=wrist_pick_place_no_heatmap`
+- `future_len=32`
+- `grid_size=80`
+- `num_iters=5`
+- `support_grid_ratio=0.8`
+- `query_prefilter_mode=off`
+
+输出根：
+
+- `data_tmp/mjc_1000_multigpu_depth_filter_confirm_20260402_df8`
+- `data_tmp/mjc_1000_multigpu_depth_filter_confirm_20260402_df16`
+
+报告：
+
+- `data_tmp/telemetry_reports/mjc_1000_multigpu_depth_filter_confirm_20260402_df8.md`
+- `data_tmp/telemetry_reports/mjc_1000_multigpu_depth_filter_confirm_20260402_df8.json`
+- `data_tmp/telemetry_reports/mjc_1000_multigpu_depth_filter_confirm_20260402_df16.md`
+- `data_tmp/telemetry_reports/mjc_1000_multigpu_depth_filter_confirm_20260402_df16.json`
+
+核心结果：
+
+| depth_filter_workers | Wall(s) | Queries | SingleGPU/query | Slot/query | Process/query | Save/query | PrepDepth/query | PrepInputs/query | Tracker/query |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `8` | `421.37` | `51` | `16.52` | `15.53` | `15.43` | `0.11` | `1.10` | `1.15` | `13.47` |
+| `16` | `452.88` | `51` | `17.76` | `15.53` | `15.42` | `0.10` | `1.08` | `1.14` | `13.48` |
+
+结论：
+
+- 本次两卡小样本里，`df16` 没有复现单卡 `df16 > df8` 的吞吐优势。
+- `slot/query`、`process/query`、`tracker/query` 基本持平，说明 `16` 并没有把关键路径继续压短。
+- `prepare_depth_filter/query` 与 `prepare_inputs/query` 只出现极小幅改善，不足以抵消更差的 wall clock。
+- 因此当前不能把“单卡 isolate 最优”直接推广为“多卡默认值应改成 `16`”。
+- 代码默认值先维持 `depth_filter_workers=8`；只有单卡隔离实验才继续把 `16` 当作 override baseline。
+
 ## 当前阶段性结论
 
 截至目前，可以先确认：
 
 1. telemetry 埋点已经足够支撑函数级和硬件级归因。
 2. 当前单卡 H200 上，`workers_per_gpu=1/2/3/4` 的吞吐都几乎相同，稳定在 `15.90~15.91 s/query/H200`，所以并发 worker 不是当前优化重点。
-3. CPU 侧深度过滤仍然会影响总吞吐，`depth_filter_workers=4/8/16` 分别对应约 `16.49/15.90/15.31 s/query/H200`。
-4. `depth_filter_workers` 带来的收益主要体现在 `prepare_depth_filter_seconds/query` 和 `prepare_inputs_seconds/query`，而不是 `tracker_model_forward_seconds/query` 或 `save`。
-5. 当前单卡后续 baseline 应固定为 `workers_per_gpu=1`、`depth_filter_workers=16`。
-6. 后续若继续做纯性能 sweep，应基于这个新 baseline 再看 `num_iters`、`support_grid_ratio`、`query_prefilter_mode`。
+3. CPU 侧深度过滤仍然会影响总吞吐，单卡 `depth_filter_workers=4/8/16` 分别对应约 `16.49/15.90/15.31 s/query/H200`。
+4. 但这条单卡结论在本次两卡小样本上没有复现：`df16` 的 `SingleGPU/query=17.76` 反而劣于 `df8` 的 `16.52`。
+5. 因此当前应区分两套 baseline：
+   - 单卡 isolate：`workers_per_gpu=1`、`depth_filter_workers=16`
+   - 当前代码默认 / 多卡稳妥配置：`workers_per_gpu=1`、`depth_filter_workers=8`
+6. `manipulator_motion` 向量化虽然把 `filter_result_manipulator_motion_seconds/query` 从 `0.104` 压到 `0.0046`，但没有形成可见的总吞吐收益，因此不再是主优化重点。
+7. 后续若继续做纯性能 sweep，应优先转向 `prepare_depth_filter` per-frame kernel，再看 `num_iters`、`support_grid_ratio`、`query_prefilter_mode`。
 
 ## 待补实验
 
 当前还没补完：
 
+- `prepare_depth_filter` per-frame kernel 优化（优先看 `points_to_normals`、`edge_mask`、`distance_transform`）
 - `num_iters=5/4/3`
 - `support_grid_ratio=0.8/0.6/0.4`
 - `query_prefilter_mode=off/profile_aware_static_v1`
-- 如需继续看并发策略，优先把 8 卡 `workers_per_gpu=1`、`depth_filter_workers=16` 作为基线；单卡 `>1` 已不再是高优先级
+- 如需继续看并发策略，优先补更大样本的多卡 `depth_filter_workers=8/16` 复测，再决定是否调整默认值；单卡 `>1` 已不再是高优先级
 
 ## 更新规则
 
