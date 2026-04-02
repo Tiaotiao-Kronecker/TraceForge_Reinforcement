@@ -51,7 +51,7 @@
 | 项目 | 当前状态 | 当前结论 / 备注 |
 | --- | --- | --- |
 | `num_iters: 6 -> 5` | 历史上已完成 | 已经进入维护态默认值，当前默认是 `num_iters=5` |
-| `num_iters: 5 -> 4 -> 3` | 未执行 | 下一轮可继续做，但必须带质量对照 |
+| `num_iters: 5 -> 4 -> 3` | 已完成 | `4` 在当前固定子集上带来约 `1.225x` wall-clock 加速、`3` 带来约 `1.498x`，但 wrist `varied_camera_3` 质量明显回退；默认值仍维持 `5` |
 | `support_grid_ratio: 0.8 -> 0.6 -> 0.4` | 未执行 | 属于明确改语义项，当前默认仍是 `0.8` |
 | `query_prefilter_mode: off -> profile_aware_static_v1` | 未执行 | 属于明确改语义项，当前默认仍是 `off` |
 | `future_len: 32 -> 24` | 当前冻结 | 用户已要求本轮先不要动 |
@@ -394,6 +394,65 @@ local microbenchmark（synthetic `4096 tracks x 32 frames x 3 masks`）：
 - 因此当前不能把“单卡 isolate 最优”直接推广为“多卡默认值应改成 `16`”。
 - 代码默认值先维持 `depth_filter_workers=8`；只有单卡隔离实验才继续把 `16` 当作 override baseline。
 
+### 10. 单卡 `num_iters=5 vs 4 vs 3` batch sweep
+
+固定条件：
+
+- 数据集：`/DATA/disk1/zoyo/mjc_1000_step1`
+- batch episode list：`scripts/data_analysis/manifests/mjc_1000_step1_single_gpu_workers_sweep_20260401.txt`
+- compare manifest：`scripts/data_analysis/manifests/mjc_1000_step1_single_gpu_workers_sweep_20260401.json`
+- episodes：`00000`, `00001`
+- `gpu_id=0`
+- `workers_per_gpu=1`
+- `depth_filter_workers=8`
+- `traj_filter_profile=wrist_pick_place_no_heatmap`
+- `future_len=32`
+- `grid_size=80`
+- `support_grid_ratio=0.8`
+- `query_prefilter_mode=off`
+
+输出根：
+
+- baseline `iters_5`：
+  `/DATA/disk2/wangchen/projects/traceforge_runs/mjc_1000_step1_single_gpu_workers_sweep_20260401_w1`
+- variant `iters_4`：
+  `/DATA/disk2/wangchen/projects/traceforge_runs/mjc_1000_step1_single_gpu_num_iters_sweep_20260402_n4`
+- variant `iters_3`：
+  `/DATA/disk2/wangchen/projects/traceforge_runs/mjc_1000_step1_single_gpu_num_iters_sweep_20260402_n3`
+
+报告：
+
+- telemetry：
+  - `data_tmp/telemetry_reports/mjc_1000_step1_single_gpu_workers_sweep_20260401_w1.md`
+  - `data_tmp/telemetry_reports/mjc_1000_step1_single_gpu_num_iters_sweep_20260402_n4.md`
+  - `data_tmp/telemetry_reports/mjc_1000_step1_single_gpu_num_iters_sweep_20260402_n3.md`
+- quality compare：
+  - `data_tmp/output_root_compares/mjc_1000_step1_num_iters_5_vs_4_20260402/comparison_summary.md`
+  - `data_tmp/output_root_compares/mjc_1000_step1_num_iters_5_vs_3_20260402/comparison_summary.md`
+
+核心速度结果：
+
+| num_iters | Wall(s) | SingleGPU/query | Process/query | Save/query | Tracker/query | Speedup vs `5` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `5` | `810.84` | `15.90` | `15.06` | `0.20` | `13.43` | `1.000x` |
+| `4` | `661.94` | `12.98` | `12.64` | `0.10` | `10.78` | `1.225x` |
+| `3` | `541.28` | `10.61` | `9.99` | `0.10` | `8.12` | `1.498x` |
+
+质量对照（相对 baseline `iters_5`）：
+
+| Variant | `varied_camera_1` Jaccard | `varied_camera_2` Jaccard | `varied_camera_3` Jaccard | `varied_camera_3` Valid Delta | Worst Wrist Jaccard |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `iters_4` | `0.9972` | `0.9968` | `0.8710` | `-38.47` | `0.4830` |
+| `iters_3` | `0.9971` | `0.9967` | `0.8481` | `-73.38` | `0.4436` |
+
+结论：
+
+- 这条线已经证明：`num_iters` 确实能给到两位数收益，且收益几乎全部来自 tracker forward 压缩。
+- `tracker_model_forward_seconds/query` 明确随 `num_iters` 下调而下降：`13.43 -> 10.78 -> 8.12`。
+- `prepare_depth_filter_seconds/query` 没有随之下降，甚至略有上升：`0.89 -> 1.08 -> 1.12`，说明这次收益不是来自 CPU depth filter。
+- 两个 external 相机基本稳定，但 wrist `varied_camera_3` 质量回退明显，`iters_4` 已经低到 `0.871`，`iters_3` 进一步降到 `0.848`。
+- 因此这轮 sweep 只能作为“速度上限”结论，不能直接收敛成新的维护态默认值；当前默认 `num_iters=5` 继续保持。
+
 ## 当前阶段性结论
 
 截至目前，可以先确认：
@@ -406,16 +465,17 @@ local microbenchmark（synthetic `4096 tracks x 32 frames x 3 masks`）：
    - 单卡 isolate：`workers_per_gpu=1`、`depth_filter_workers=16`
    - 当前代码默认 / 多卡稳妥配置：`workers_per_gpu=1`、`depth_filter_workers=8`
 6. `manipulator_motion` 向量化虽然把 `filter_result_manipulator_motion_seconds/query` 从 `0.104` 压到 `0.0046`，但没有形成可见的总吞吐收益，因此不再是主优化重点。
-7. 后续若继续做纯性能 sweep，应优先转向 `prepare_depth_filter` per-frame kernel，再看 `num_iters`、`support_grid_ratio`、`query_prefilter_mode`。
+7. `num_iters=4/3` 已经证明全局降迭代次数可以带来明确的两位数 wall-clock 收益，但 wrist `varied_camera_3` 质量退化过大，当前不能直接改默认值。
+8. 后续若继续找“可上线”的收益，应优先看 profile-aware / camera-aware 的收敛策略，或者回到 `prepare_depth_filter` per-frame kernel；不要把 `iters_4` / `iters_3` 直接当成维护态默认值。
 
 ## 待补实验
 
 当前还没补完：
 
 - `prepare_depth_filter` per-frame kernel 优化（优先看 `points_to_normals`、`edge_mask`、`distance_transform`）
-- `num_iters=5/4/3`
 - `support_grid_ratio=0.8/0.6/0.4`
 - `query_prefilter_mode=off/profile_aware_static_v1`
+- 如果继续沿 `num_iters` 这条线深挖，应优先验证 profile-aware / camera-aware 的差异化收敛，而不是继续全局下调
 - 如需继续看并发策略，优先补更大样本的多卡 `depth_filter_workers=8/16` 复测，再决定是否调整默认值；单卡 `>1` 已不再是高优先级
 
 ## 更新规则

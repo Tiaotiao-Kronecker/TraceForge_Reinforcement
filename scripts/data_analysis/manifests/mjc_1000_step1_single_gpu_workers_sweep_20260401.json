@@ -1,0 +1,7 @@
+{
+  "dataset_root": "/DATA/disk1/zoyo/mjc_1000_step1",
+  "episodes": [
+    "00000",
+    "00001"
+  ]
+}

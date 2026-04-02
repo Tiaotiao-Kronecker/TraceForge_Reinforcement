@@ -28,6 +28,7 @@
 - [pick_place_single_gpu_workers_per_gpu_sweep_2026-04-01.md](pick_place_single_gpu_workers_per_gpu_sweep_2026-04-01.md)
 - [pick_place_single_gpu_depth_filter_workers_sweep_2026-04-01.md](pick_place_single_gpu_depth_filter_workers_sweep_2026-04-01.md)
 - [manipulator_motion_rollout_status_2026-04-02.md](manipulator_motion_rollout_status_2026-04-02.md)
+- [pick_place_num_iters_sweep_2026-04-02.md](pick_place_num_iters_sweep_2026-04-02.md)
 - [interface_surface_simplification_plan_2026-03-28.md](interface_surface_simplification_plan_2026-03-28.md)
 - [press_one_button_demo_v5_camera3_tail_empty_root_cause_2026-03-24.md](press_one_button_demo_v5_camera3_tail_empty_root_cause_2026-03-24.md)
 - [pick_place_wrist_pick_place_history_2026-03-26.md](pick_place_wrist_pick_place_history_2026-03-26.md)
