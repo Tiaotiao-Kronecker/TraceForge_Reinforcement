@@ -277,28 +277,45 @@ def _compute_motion_metrics_for_valid_masks(
             )
         normalized_masks.append(finite_mask & valid_mask)
 
-    motion_extent_list = [np.full(num_tracks, np.nan, dtype=np.float32) for _ in normalized_masks]
-    motion_step_median_list = [np.full(num_tracks, np.nan, dtype=np.float32) for _ in normalized_masks]
+    motion_extent_list: list[np.ndarray] = []
+    motion_step_median_list: list[np.ndarray] = []
 
     step_norm = None
-    pair_valid_masks: list[np.ndarray] = []
     if num_frames > 1:
         step_norm = np.linalg.norm(np.diff(world_tracks, axis=1), axis=-1)
-        pair_valid_masks = [valid_mask[:, :-1] & valid_mask[:, 1:] for valid_mask in normalized_masks]
 
-    for track_idx in range(num_tracks):
-        for mask_idx, valid_mask in enumerate(normalized_masks):
-            valid_indices = np.flatnonzero(valid_mask[track_idx])
-            if valid_indices.size >= 2:
-                pts = world_tracks[track_idx, valid_indices]
-                motion_extent_list[mask_idx][track_idx] = float(np.max(np.linalg.norm(pts - pts[0], axis=1)))
+    for valid_mask in normalized_masks:
+        motion_extent = np.full(num_tracks, np.nan, dtype=np.float32)
+        motion_step_median = np.full(num_tracks, np.nan, dtype=np.float32)
 
-            if step_norm is None:
-                continue
+        valid_counts = np.count_nonzero(valid_mask, axis=1)
+        extent_track_indices = np.flatnonzero(valid_counts >= 2)
+        if extent_track_indices.size > 0:
+            valid_subset = valid_mask[extent_track_indices]
+            first_valid_idx = np.argmax(valid_subset, axis=1)
+            start_points = world_tracks[extent_track_indices, first_valid_idx]
+            distances = np.linalg.norm(
+                world_tracks[extent_track_indices] - start_points[:, None, :],
+                axis=-1,
+            )
+            masked_distances = np.where(valid_subset, distances, np.nan)
+            motion_extent[extent_track_indices] = np.nanmax(masked_distances, axis=1).astype(np.float32)
 
-            valid_steps = step_norm[track_idx, pair_valid_masks[mask_idx][track_idx]]
-            if valid_steps.size > 0:
-                motion_step_median_list[mask_idx][track_idx] = float(np.median(valid_steps))
+        if step_norm is not None:
+            pair_valid = valid_mask[:, :-1] & valid_mask[:, 1:]
+            step_track_indices = np.flatnonzero(np.any(pair_valid, axis=1))
+            if step_track_indices.size > 0:
+                masked_steps = np.where(
+                    pair_valid[step_track_indices],
+                    step_norm[step_track_indices],
+                    np.nan,
+                )
+                motion_step_median[step_track_indices] = np.nanmedian(masked_steps, axis=1).astype(
+                    np.float32
+                )
+
+        motion_extent_list.append(motion_extent)
+        motion_step_median_list.append(motion_step_median)
 
     return tuple(zip(motion_extent_list, motion_step_median_list))
 

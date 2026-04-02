@@ -20,6 +20,7 @@ from utils.traj_filter_utils import (
     TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_MOTION,
     TRAJ_FILTER_ABLATION_MODE_WRIST_NO_QUERY_EDGE,
     TRAJ_FILTER_ABLATION_MODE_WRIST_SEED_TOP95,
+    _compute_motion_metrics_for_valid_masks,
     _apply_manipulator_aware_filter,
     _apply_pick_place_object_filter,
     _compute_linear_percentiles_for_masked_columns,
@@ -1905,6 +1906,63 @@ class BuildTrajValidMaskTests(unittest.TestCase):
         self.assertFalse(bool(result["traj_pick_place_contact_mask"][hidden_query_idx]))
         self.assertFalse(bool(result["traj_pick_place_delayed_contact_rescue_mask"][hidden_query_idx]))
         self.assertFalse(bool(result["traj_valid_mask"][hidden_query_idx]))
+
+
+class MotionMetricHelperTests(unittest.TestCase):
+    def test_compute_motion_metrics_keeps_first_valid_anchor_and_nan_semantics(self):
+        world_tracks = np.array(
+            [
+                [[0.0, 0.0, 0.5], [1.0, 0.0, 0.5], [3.0, 0.0, 0.5], [6.0, 0.0, 0.5]],
+                [[5.0, 1.0, 0.4], [np.nan, np.nan, np.nan], [8.0, 1.0, 0.4], [10.0, 1.0, 0.4]],
+                [[2.0, 2.0, 0.3], [2.0, 2.0, 0.3], [2.0, 2.0, 0.3], [2.0, 2.0, 0.3]],
+            ],
+            dtype=np.float32,
+        )
+        supervision_mask = np.array(
+            [
+                [False, True, True, False],
+                [True, True, True, True],
+                [True, False, False, False],
+            ],
+            dtype=bool,
+        )
+        late_mask = np.array(
+            [
+                [False, False, True, True],
+                [False, False, True, False],
+                [True, True, True, True],
+            ],
+            dtype=bool,
+        )
+
+        (
+            (motion_extent, motion_step_median),
+            (motion_extent_late, motion_step_median_late),
+        ) = _compute_motion_metrics_for_valid_masks(
+            world_tracks,
+            (supervision_mask, late_mask),
+        )
+
+        np.testing.assert_allclose(
+            motion_extent,
+            np.array([2.0, 5.0, np.nan], dtype=np.float32),
+            equal_nan=True,
+        )
+        np.testing.assert_allclose(
+            motion_step_median,
+            np.array([2.0, 2.0, np.nan], dtype=np.float32),
+            equal_nan=True,
+        )
+        np.testing.assert_allclose(
+            motion_extent_late,
+            np.array([3.0, np.nan, 0.0], dtype=np.float32),
+            equal_nan=True,
+        )
+        np.testing.assert_allclose(
+            motion_step_median_late,
+            np.array([3.0, np.nan, 0.0], dtype=np.float32),
+            equal_nan=True,
+        )
 
 
 class PickPlaceFilterRegressionTests(unittest.TestCase):
