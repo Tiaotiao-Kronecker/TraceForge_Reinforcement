@@ -52,6 +52,7 @@
 | --- | --- | --- |
 | `num_iters: 6 -> 5` | 历史上已完成 | 已经进入维护态默认值，当前默认是 `num_iters=5` |
 | `num_iters: 5 -> 4 -> 3` | 已完成 | `4` 在当前固定子集上带来约 `1.225x` wall-clock 加速、`3` 带来约 `1.498x`，但 wrist `varied_camera_3` 质量明显回退；默认值仍维持 `5` |
+| camera-aware `num_iters: external=4, wrist=5` | 已完成 | clean run `810.84s -> 811.23s` 基本无收益，且 wrist `varied_camera_3` 进一步恶化到 Jaccard `0.8574`、worst query `0.0990`；当前拒绝 |
 | `support_grid_ratio: 0.8 -> 0.6 -> 0.4` | 未执行 | 属于明确改语义项，当前默认仍是 `0.8` |
 | `query_prefilter_mode: off -> profile_aware_static_v1` | 未执行 | 属于明确改语义项，当前默认仍是 `off` |
 | `future_len: 32 -> 24` | 当前冻结 | 用户已要求本轮先不要动 |
@@ -429,6 +430,11 @@ local microbenchmark（synthetic `4096 tracks x 32 frames x 3 masks`）：
 - quality compare：
   - `data_tmp/output_root_compares/mjc_1000_step1_num_iters_5_vs_4_20260402/comparison_summary.md`
   - `data_tmp/output_root_compares/mjc_1000_step1_num_iters_5_vs_3_20260402/comparison_summary.md`
+- worst-case `RGB / 2D / 3D` triptych exports：
+  - `data_tmp/query_rgb_scan/mjc_1000_step1_num_iters_5_vs_4_20260402_top10_jaccard/summary.md`
+  - `data_tmp/query_rgb_scan/mjc_1000_step1_num_iters_5_vs_4_20260402_top10_jaccard/summary.json`
+  - `data_tmp/query_rgb_scan/mjc_1000_step1_num_iters_5_vs_3_20260402_top10_jaccard/summary.md`
+  - `data_tmp/query_rgb_scan/mjc_1000_step1_num_iters_5_vs_3_20260402_top10_jaccard/summary.json`
 
 核心速度结果：
 
@@ -445,6 +451,12 @@ local microbenchmark（synthetic `4096 tracks x 32 frames x 3 masks`）：
 | `iters_4` | `0.9972` | `0.9968` | `0.8710` | `-38.47` | `0.4830` |
 | `iters_3` | `0.9971` | `0.9967` | `0.8481` | `-73.38` | `0.4436` |
 
+最差样本三列轨迹可视化已经导出并按 `traj_valid_mask_jaccard` 升序取 top-10：
+
+- `iters_4`：`data_tmp/query_rgb_scan/mjc_1000_step1_num_iters_5_vs_4_20260402_top10_jaccard/summary.md`
+- `iters_3`：`data_tmp/query_rgb_scan/mjc_1000_step1_num_iters_5_vs_3_20260402_top10_jaccard/summary.md`
+- 两组 top-1 都是 `00001 / varied_camera_3 / query_frame=16`
+
 结论：
 
 - 这条线已经证明：`num_iters` 确实能给到两位数收益，且收益几乎全部来自 tracker forward 压缩。
@@ -452,6 +464,79 @@ local microbenchmark（synthetic `4096 tracks x 32 frames x 3 masks`）：
 - `prepare_depth_filter_seconds/query` 没有随之下降，甚至略有上升：`0.89 -> 1.08 -> 1.12`，说明这次收益不是来自 CPU depth filter。
 - 两个 external 相机基本稳定，但 wrist `varied_camera_3` 质量回退明显，`iters_4` 已经低到 `0.871`，`iters_3` 进一步降到 `0.848`。
 - 因此这轮 sweep 只能作为“速度上限”结论，不能直接收敛成新的维护态默认值；当前默认 `num_iters=5` 继续保持。
+
+### 11. camera-aware `num_iters`: external=`4`, wrist=`5`
+
+固定条件：
+
+- 数据集：`/DATA/disk1/zoyo/mjc_1000_step1`
+- batch episode list：`scripts/data_analysis/manifests/mjc_1000_step1_single_gpu_workers_sweep_20260401.txt`
+- compare manifest：`scripts/data_analysis/manifests/mjc_1000_step1_single_gpu_workers_sweep_20260401.json`
+- episodes：`00000`, `00001`
+- `workers_per_gpu=1`
+- `depth_filter_workers=8`
+- `traj_filter_profile=wrist_pick_place_no_heatmap`
+- `future_len=32`
+- `grid_size=80`
+- `support_grid_ratio=0.8`
+- `query_prefilter_mode=off`
+- global `num_iters=5`
+- per-camera override：`varied_camera_1:4,varied_camera_2:4,varied_camera_3:5`
+
+输出根：
+
+- 首次尝试（无效，不纳入结论）：
+  `data_tmp/mjc_1000_step1_camera_aware_num_iters_20260402_ext4_wrist5`
+- clean run：
+  `data_tmp/mjc_1000_step1_camera_aware_num_iters_20260402_ext4_wrist5_gpu3`
+
+报告：
+
+- telemetry：
+  - `data_tmp/telemetry_reports/mjc_1000_step1_camera_aware_num_iters_20260402_ext4_wrist5_gpu3.md`
+  - `data_tmp/telemetry_reports/mjc_1000_step1_camera_aware_num_iters_20260402_ext4_wrist5_gpu3.json`
+- quality compare：
+  - `data_tmp/output_root_compares/mjc_1000_step1_num_iters_5_vs_ext4_wrist5_20260402_gpu3/comparison_summary.md`
+  - `data_tmp/output_root_compares/mjc_1000_step1_num_iters_5_vs_ext4_wrist5_20260402_gpu3/comparison_results.json`
+- worst-case `RGB / 2D / 3D` triptych exports：
+  - `data_tmp/query_rgb_scan/mjc_1000_step1_num_iters_5_vs_ext4_wrist5_20260402_gpu3_top10_jaccard/summary.md`
+  - `data_tmp/query_rgb_scan/mjc_1000_step1_num_iters_5_vs_ext4_wrist5_20260402_gpu3_top10_jaccard/summary.json`
+
+补充说明：
+
+- 首次 GPU0 尝试因同卡已有进程占用约 `93 GiB` 显存，在 `00000 / varied_camera_3` 上触发 OOM；该 root 只保留为 contention 记录，不用于结论。
+
+核心速度结果：
+
+| Variant | Wall(s) | SingleGPU/query | Process/query | Save/query | Tracker/query | PrepDepth/query | Speedup vs `5` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `iters_5` | `810.84` | `15.90` | `15.06` | `0.20` | `13.43` | `0.89` | `1.000x` |
+| `ext4_wrist5` | `811.23` | `15.91` | `15.40` | `0.14` | `12.65` | `1.56` | `1.000x` |
+
+按相机看，总时间出现了明显分化：
+
+- `varied_camera_1`：`14.47 -> 13.95 s/query`
+- `varied_camera_2`：`14.04 -> 13.51 s/query`
+- `varied_camera_3`：`17.25 -> 19.14 s/query`
+
+质量对照（相对 baseline `iters_5`）：
+
+| Camera | Valid Jaccard | Valid Delta | World L2 Mean | Worst Query Jaccard |
+| --- | ---: | ---: | ---: | ---: |
+| `varied_camera_1` | `0.9972` | `-2.92` | `0.000171` | n/a |
+| `varied_camera_2` | `0.9968` | `+0.94` | `0.000172` | n/a |
+| `varied_camera_3` | `0.8574` | `+39.17` | `0.001008` | `0.0990` |
+
+最差样本三列轨迹可视化同样已导出并按 `traj_valid_mask_jaccard` 升序取 top-10：
+
+- `ext4_wrist5`：`data_tmp/query_rgb_scan/mjc_1000_step1_num_iters_5_vs_ext4_wrist5_20260402_gpu3_top10_jaccard/summary.md`
+- top-1 仍是 `00001 / varied_camera_3 / query_frame=16`，但 Jaccard 已恶化到 `0.0990`
+
+结论：
+
+- external 两路 tracker forward 确实更快，但 `prepare_depth_filter` 也明显变慢，抵消了大部分收益。
+- 更关键的是，wrist 即使保持 `num_iters=5` 也明显变差：总时长更长、质量更差，且最坏样本显著劣于全局 `iters_4`。
+- 因此最直接的 camera-aware 方案 `external=4, wrist=5` 不能作为 rollout 候选；当前默认继续保持 `num_iters=5`、`depth_filter_workers=8`。
 
 ## 当前阶段性结论
 
@@ -466,7 +551,8 @@ local microbenchmark（synthetic `4096 tracks x 32 frames x 3 masks`）：
    - 当前代码默认 / 多卡稳妥配置：`workers_per_gpu=1`、`depth_filter_workers=8`
 6. `manipulator_motion` 向量化虽然把 `filter_result_manipulator_motion_seconds/query` 从 `0.104` 压到 `0.0046`，但没有形成可见的总吞吐收益，因此不再是主优化重点。
 7. `num_iters=4/3` 已经证明全局降迭代次数可以带来明确的两位数 wall-clock 收益，但 wrist `varied_camera_3` 质量退化过大，当前不能直接改默认值。
-8. 后续若继续找“可上线”的收益，应优先看 profile-aware / camera-aware 的收敛策略，或者回到 `prepare_depth_filter` per-frame kernel；不要把 `iters_4` / `iters_3` 直接当成维护态默认值。
+8. 最直接的 camera-aware 方案 `external=4, wrist=5` 已完成验证，但 wall-clock 仍然贴着 baseline，且 wrist 进一步恶化到 aggregate Jaccard `0.8574`、worst query `0.0990`，因此也不能作为默认值候选。
+9. 如果后续还要沿 `num_iters` 深挖，前提是先解释为什么 external 改成 `4` 后，wrist 在保持 `5` 时仍会明显退化；在根因清楚前，优先级应回到 `prepare_depth_filter` per-frame kernel。
 
 ## 待补实验
 
@@ -475,7 +561,7 @@ local microbenchmark（synthetic `4096 tracks x 32 frames x 3 masks`）：
 - `prepare_depth_filter` per-frame kernel 优化（优先看 `points_to_normals`、`edge_mask`、`distance_transform`）
 - `support_grid_ratio=0.8/0.6/0.4`
 - `query_prefilter_mode=off/profile_aware_static_v1`
-- 如果继续沿 `num_iters` 这条线深挖，应优先验证 profile-aware / camera-aware 的差异化收敛，而不是继续全局下调
+- 如果未来重开 `num_iters` 差异化收敛，先定位 `external=4, wrist=5` 为什么会让 wrist 回退；在根因不清楚前，不继续扫更简单的 camera-aware 组合
 - 如需继续看并发策略，优先补更大样本的多卡 `depth_filter_workers=8/16` 复测，再决定是否调整默认值；单卡 `>1` 已不再是高优先级
 
 ## 更新规则
