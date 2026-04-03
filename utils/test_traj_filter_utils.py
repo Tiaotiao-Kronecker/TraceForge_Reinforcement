@@ -1751,6 +1751,108 @@ class BuildTrajValidMaskTests(unittest.TestCase):
             np.zeros(traj.shape[0], dtype=bool),
         )
 
+    def test_wrist_pick_place_no_heatmap_keeps_query_local_object_when_late_track_depth_turns_invalid(self):
+        anchor_tracks = []
+        for track_idx in range(10):
+            start_u = 20.0 + 8.0 * float(track_idx)
+            start_v = 20.0 + 4.0 * float(track_idx % 5)
+            depth = 0.20 + 0.001 * float(track_idx)
+            anchor_tracks.append(
+                np.array(
+                    [
+                        [start_u, start_v, depth],
+                        [start_u + 18.0, start_v, depth],
+                        [start_u + 36.0, start_v, depth],
+                        [start_u + 54.0, start_v, depth],
+                        [start_u + 72.0, start_v, depth],
+                        [start_u + 90.0, start_v, depth],
+                    ],
+                    dtype=np.float32,
+                )[None, ...]
+            )
+
+        late_invalid_local_track = np.array(
+            [
+                [82.0, 32.0, 0.2065],
+                [83.0, 32.0, 0.2065],
+                [84.0, 32.0, 0.2065],
+                [85.0, 32.0, 0.2065],
+                [86.0, 32.0, -0.02],
+                [87.0, 32.0, -0.02],
+            ],
+            dtype=np.float32,
+        )[None, ...]
+        traj = np.concatenate(
+            anchor_tracks
+            + [
+                late_invalid_local_track,
+                _make_track(u_values=[40.0, 40.0, 40.0, 40.0, 40.0, 40.0], v=220.0, depth=0.80),
+                _make_track(u_values=[80.0, 80.0, 80.0, 80.0, 80.0, 80.0], v=220.0, depth=0.90),
+                _make_track(u_values=[120.0, 120.0, 120.0, 120.0, 120.0, 120.0], v=220.0, depth=1.00),
+                _make_track(u_values=[160.0, 160.0, 160.0, 160.0, 160.0, 160.0], v=220.0, depth=1.10),
+                _make_track(u_values=[200.0, 200.0, 200.0, 200.0, 200.0, 200.0], v=220.0, depth=1.20),
+                _make_track(u_values=[220.0, 220.0, 220.0, 220.0, 220.0, 220.0], v=160.0, depth=1.30),
+            ],
+            axis=0,
+        )
+        fixture = _make_multi_track_fixture(traj=traj, height=256, width=256)
+        fixture["intrinsics_segment"] = _make_scaled_intrinsics(traj.shape[1], fx=100.0, fy=100.0)
+
+        late_invalid_idx = 10
+        far_noise_idx = 16
+        for frame_idx in (4, 5):
+            _paint_patch(
+                fixture["raw_depths_segment"][frame_idx],
+                x=float(traj[late_invalid_idx, frame_idx, 0]),
+                y=float(traj[late_invalid_idx, frame_idx, 1]),
+                value=0.2065,
+                radius=0,
+            )
+
+        base_geometry = compute_traj_base_geometry(
+            fixture["traj"],
+            visibs=fixture["visibs"],
+            image_width=fixture["image_width"],
+            image_height=fixture["image_height"],
+            min_valid_frames=3,
+            min_depth=0.01,
+            max_depth=10.0,
+            boundary_margin=0,
+            visibility_threshold=0.5,
+            check_depth_smoothness=True,
+            depth_change_threshold=0.5,
+        )
+
+        self.assertFalse(bool(base_geometry["depth_range_mask"][late_invalid_idx]))
+        self.assertTrue(bool(base_geometry["boundary_mask"][late_invalid_idx]))
+        self.assertTrue(bool(base_geometry["depth_smooth_mask"][late_invalid_idx]))
+        self.assertFalse(bool(base_geometry["traj_valid_mask"][late_invalid_idx]))
+
+        result = build_traj_filter_result(
+            traj=fixture["traj"],
+            visibs=fixture["visibs"],
+            image_width=fixture["image_width"],
+            image_height=fixture["image_height"],
+            filter_args=_make_filter_args(
+                traj_filter_profile="wrist_pick_place_no_heatmap",
+                boundary_margin=0,
+            ),
+            keypoints=fixture["keypoints"],
+            query_depth=fixture["query_depth"],
+            raw_depths_segment=fixture["raw_depths_segment"],
+            intrinsics_segment=fixture["intrinsics_segment"],
+            extrinsics_segment=fixture["extrinsics_segment"],
+            depth_volatility_map=fixture["depth_volatility_map"],
+        )
+
+        self.assertTrue(bool(result["traj_base_mask"][late_invalid_idx]))
+        self.assertTrue(bool(result["traj_wrist_seed_mask"][late_invalid_idx]))
+        self.assertTrue(bool(result["traj_near_depth_mask"][late_invalid_idx]))
+        self.assertTrue(bool(result["traj_cluster_mask"][late_invalid_idx]))
+        self.assertTrue(bool(result["traj_valid_mask"][late_invalid_idx]))
+        self.assertEqual(int(result["traj_mask_reason_bits"][late_invalid_idx]), 0)
+        self.assertFalse(bool(result["traj_valid_mask"][far_noise_idx]))
+
     def test_wrist_pick_place_no_heatmap_falls_back_to_rank_only_when_anchor_count_is_small(self):
         traj = np.concatenate(
             [

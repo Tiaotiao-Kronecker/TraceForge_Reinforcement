@@ -2457,6 +2457,10 @@ def build_traj_filter_result(
         & np.asarray(base_geometry["depth_range_mask"]).astype(bool, copy=False)
         & np.asarray(base_geometry["depth_smooth_mask"]).astype(bool, copy=False)
     )
+    wrist_pick_place_base_mask = (
+        np.asarray(base_geometry["valid_count_mask"]).astype(bool, copy=False)
+        & np.asarray(base_geometry["depth_smooth_mask"]).astype(bool, copy=False)
+    )
 
     query_depth_quality_mask = np.ones(num_tracks, dtype=bool)
     query_depth_mask = np.ones(num_tracks, dtype=bool)
@@ -2739,7 +2743,13 @@ def build_traj_filter_result(
             reason_bits[wrist_seed_mask & (~traj_motion_mask)] |= MASK_REASON_MANIPULATOR_MOTION_FAIL
             reason_bits[traj_manipulator_candidate_mask & (~traj_cluster_mask)] |= MASK_REASON_MANIPULATOR_CLUSTER_FAIL
     else:
-        traj_base_mask = wrist_base_mask.copy()
+        wrist_profile_base_mask = wrist_base_mask
+        if profile in {
+            TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE,
+            TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE_NO_HEATMAP,
+        }:
+            wrist_profile_base_mask = wrist_pick_place_base_mask
+        traj_base_mask = wrist_profile_base_mask.copy()
         required_prefix_frames = _resolve_support_frame_requirement(
             num_frames=num_frames,
             min_frames=config["wrist_min_prefix_frames"],
@@ -2756,12 +2766,12 @@ def build_traj_filter_result(
             supervision_count >= required_support_frames
         )
         traj_supervision_support_mask = supervision_support_mask.copy()
-        reason_bits[~wrist_base_mask] |= MASK_REASON_BASE_GEOMETRY_FAIL
+        reason_bits[~wrist_profile_base_mask] |= MASK_REASON_BASE_GEOMETRY_FAIL
         reason_bits[~query_depth_quality_mask] |= MASK_REASON_QUERY_DEPTH_FAIL
         if ablation_mode != TRAJ_FILTER_ABLATION_MODE_WRIST_NO_QUERY_EDGE:
             reason_bits[traj_query_depth_edge_risk_mask] |= MASK_REASON_QUERY_DEPTH_EDGE_FAIL
         reason_bits[~supervision_support_mask] |= MASK_REASON_TEMPORAL_CONSISTENCY_FAIL
-        wrist_seed_mask = wrist_base_mask & query_depth_mask & supervision_support_mask
+        wrist_seed_mask = wrist_profile_base_mask & query_depth_mask & supervision_support_mask
 
         if profile == TRAJ_FILTER_PROFILE_WRIST:
             final_mask = wrist_seed_mask

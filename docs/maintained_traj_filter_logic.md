@@ -757,10 +757,22 @@ wrist-like `auto` 默认逻辑不是在问：
 - 保住 wrist seed 里的 manipulator / gripper 轨迹
 - 同时救回与 manipulator 接触并被 `pick` heatmap 支撑的物体轨迹
 
+和普通 `wrist` / `wrist_manipulator` 不同，当前代码对这条分支的 base 几何门槛专门放宽了一档：
+
+```text
+wrist_pick_place_base_mask = valid_count_mask & depth_smooth_mask
+```
+
+也就是说，这里不再把整段 `depth_range_mask` 当成进入 pick_place 分支前的硬门槛。当前实现这样做的原因是：
+
+- pick_place 的被抓物体在抬升阶段可能出现 `traj_uvz[..., 2]` 局部失真
+- 但 query frame 深度和时域支撑仍然可信
+- 如果仍要求整段 `depth_range_mask` 全通过，会把本来应该交给 pick_place 分支处理的局部物体点提前误杀
+
 代码上可概括为：
 
 ```text
-wrist_seed_mask
+wrist_pick_place_base_mask & query_depth_mask & supervision_support_mask
     -> manipulator 分支
     -> pick_place object 分支
 
@@ -802,19 +814,27 @@ final_mask = manipulator_final_mask | pick_place_object_mask
 
 `wrist_pick_place_no_heatmap` 是为“没有 per-frame `pick` heatmap”的 pick_place wrist 数据额外提供的显式 profile。它同样不是默认 `auto` 路径，必须手动指定。
 
-它的目标不是复刻 `wrist_pick_place` 的 object branch，而是在尽量不增加时间花销的前提下，对 `wrist` 结果做一层很轻的局部去噪：
+它的目标不是复刻 `wrist_pick_place` 的完整 object branch，而是在尽量不增加时间花销的前提下，同时做两件事：
 
 - 保留 query frame 局部活动区域里的近深度轨迹
 - 压掉距离夹爪/物体较远的桌面伪轨迹和视野边缘伪轨迹
+- 对 query frame 可见、但在接触发生前还不属于 local region 的 pre-grasp object，补一层 delayed-contact rescue
+
+和 `wrist_pick_place` 一样，这条分支当前也不再要求整段 `depth_range_mask` 先全通过，进入分支前的 base 门槛是：
+
+```text
+wrist_pick_place_base_mask = valid_count_mask & depth_smooth_mask
+```
 
 代码上可概括为：
 
 ```text
-wrist_seed_mask
+wrist_pick_place_base_mask & query_depth_mask & supervision_support_mask
     -> near-depth + motion anchors
     -> query-frame local keep region
+    -> delayed-contact rescue
 
-final_mask = traj_near_depth_mask & local_region_mask
+final_mask = local_keep_mask | delayed_contact_rescue_mask
 ```
 
 其中：
@@ -823,6 +843,28 @@ final_mask = traj_near_depth_mask & local_region_mask
 - motion 统计使用 all-valid motion，而不是 supervised prefix motion
 - local region 直接在 query frame 上根据 anchor 的 2D 包围框构造，并做固定像素 padding
 - 如果 anchor 数量太少，就回退成只做 near-depth rank gate，不额外做 region 限制
+- delayed-contact rescue 只面向：
+  - query frame 可见
+  - 当前不在 local keep region 内
+  - 后续某帧与 manipulator reference 发生接触
+  - query depth 没有比最近 manipulator component 明显更远
+
+换句话说，这条分支当前的实际结构是：
+
+```text
+local_keep_mask =
+    traj_near_depth_mask
+  & local_region_mask
+
+delayed_contact_rescue_mask =
+    wrist_seed_mask
+  & query_visible_mask
+  & (~local_keep_mask)
+  & delayed_contact_mask
+  & depth_guard_mask
+
+final_mask = local_keep_mask | delayed_contact_rescue_mask
+```
 
 当前实现对应的维护态阈值是：
 
@@ -830,12 +872,19 @@ final_mask = traj_near_depth_mask & local_region_mask
 - anchor 的 all-valid motion extent 至少 `0.03m`
 - query-frame region padding：左右各 `80px`、上 `40px`、下 `220px`
 - 至少需要 `8` 条 anchor 才启用 local region；否则走 rank-only fallback
+- delayed-contact rescue 的 contact 距离阈值是 `0.20m`
+- delayed-contact rescue 的 query depth 相对最近 manipulator component 容差是 `0.25m`
 
 这条分支的物理语义是：
 
-“先用 wrist seed 保住前缀可信轨迹，再用会动且更近的局部 anchor 估计夹爪活动带，只保留这片局部区域里的近深度点。”
+“先用 wrist seed 保住前缀可信轨迹，再用会动且更近的局部 anchor 估计夹爪活动带，保住这片局部区域里的近深度点；如果某些 query 可见的 pre-grasp object 只是在接触前不属于 local region，再用 delayed-contact rescue 把它们补回来。”
 
-它刻意不再额外区分 manipulator 和 object 两类语义，也不依赖 heatmap I/O；目标只是用一层很便宜的局部几何约束，把 `wrist` 在 pick_place 里常见的远处桌面噪声压掉。
+它仍然不依赖 heatmap I/O，也不试图做完整的 object semantic 分类；当前实现更接近：
+
+- 一层低成本 local denoise
+- 再加一层低成本 delayed-contact object rescue
+
+它的目标不是彻底解决 pick/place 里的 3D 跟踪失真，而是在不显著增加 I/O 和算时的前提下，先避免把 query 可见的抓取物体在过滤前阶段提前误杀。
 
 ### 7.5 query prefilter 和 ablation mode
 
@@ -951,7 +1000,7 @@ final_mask = traj_near_depth_mask & local_region_mask
 | --- | --- | --- |
 | `press` | 继续可用 `auto` | 当前默认就是围绕“机械臂主体”优化的 |
 | `pick_place` | 优先用 `traj_filter_profile=wrist_pick_place` | 保留 manipulator 分支，并额外救回被 `pick` heatmap 支撑且与 manipulator 接触的被抓物体 |
-| `pick_place` 无可用 `pick` heatmap | 优先用 `traj_filter_profile=wrist_pick_place_no_heatmap` | 仍从 wrist seed 出发，但增加一层低成本局部区域去噪，压掉远处桌面/视野外伪轨迹 |
+| `pick_place` 无可用 `pick` heatmap | 优先用 `traj_filter_profile=wrist_pick_place_no_heatmap` | 从放宽后的 pick_place seed 出发，先做低成本局部区域去噪，再补一层 delayed-contact rescue |
 | `push_pull` | 先用 `traj_filter_profile=wrist` | 先避免 near-depth / motion / cluster / top95 把把手裁掉 |
 | `push_pull` 若把手仍严重丢失 | 再试 `traj_filter_ablation_mode=wrist_no_query_edge` | 把手很容易死在 edge-risk 这一步 |
 | 所有新场景 | `query_prefilter_mode=off` | 不要在 tracking 之前就按 wrist-manipulator 偏好裁 query seed |
@@ -1004,16 +1053,23 @@ final_mask = traj_near_depth_mask & local_region_mask
 - 继续从 `wrist_seed_mask` 出发
 - 尽量保住夹爪附近、与活动区域局部相关的 pick/place 轨迹
 - 用最低额外成本压掉远处桌面和视野外伪轨迹
+- 对 query frame 可见、后续才接触到夹爪的 pre-grasp object，补一层轻量 rescue
 
 当前实现的物理逻辑：
 
-1. 先从 `wrist_seed_mask` 出发
+1. 先从放宽后的 pick_place seed 出发，不要求整段 `depth_range_mask` 都通过
 2. 用 near-depth + all-valid motion 选出一批局部 activity anchors
 3. 在 query frame 上用这些 anchors 构造一个带 padding 的局部 keep region
-4. 最终只保留 `near_depth_mask & local_region_mask`
-5. 如果 anchor 太少，则回退成 rank-only near-depth gate
+4. 先保留 `local_keep_mask = near_depth_mask & local_region_mask`
+5. 再对 query frame 可见、但当前不在 local keep region 里的轨迹做 delayed-contact rescue
+6. 如果 anchor 太少，则回退成 rank-only near-depth gate
 
-这条分支的核心不是“识别出 object 类别”，而是“把真正发生交互的局部区域框出来”。它比直接退回 `wrist` 更干净，但又明显比重新做 heatmap/object 推断更便宜。
+这条分支的核心不是“识别出 object 类别”，而是：
+
+- 先把真正发生交互的局部区域框出来
+- 再把一部分 query 可见的 pre-grasp object 补回来
+
+它比直接退回 `wrist` 更干净，也比完整依赖 heatmap/object 推断更便宜。
 
 #### 仍建议新增：`wrist_push_pull`
 
