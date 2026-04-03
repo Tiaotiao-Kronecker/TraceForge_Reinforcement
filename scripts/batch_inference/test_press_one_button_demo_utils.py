@@ -33,6 +33,15 @@ find_valid_episodes = _FIND_VALID_EPISODES_NAMESPACE["find_valid_episodes"]
 _PARSE_ARGS_FUNC_AST = next(
     node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "parse_args"
 )
+_PARSE_CAMERA_INT_OVERRIDES_AST = next(
+    node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "parse_camera_int_overrides"
+)
+_RESOLVE_CAMERA_NUM_ITERS_AST = next(
+    node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "resolve_camera_num_iters"
+)
+_BUILD_CAMERA_ARGS_AST = next(
+    node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "build_camera_args"
+)
 _CAMERA_TASK_AST = next(
     node for node in _SOURCE_AST.body if isinstance(node, ast.ClassDef) and node.name == "CameraTask"
 )
@@ -76,6 +85,25 @@ CameraTask = _TELEMETRY_GLOBALS["CameraTask"]
 build_camera_task_metric_record = _TELEMETRY_GLOBALS["build_camera_task_metric_record"]
 build_camera_task_profile_record = _TELEMETRY_GLOBALS["build_camera_task_profile_record"]
 build_batch_run_summary = _TELEMETRY_GLOBALS["build_batch_run_summary"]
+
+_CAMERA_ARGS_MODULE = ast.Module(
+    body=[
+        _PARSE_CAMERA_INT_OVERRIDES_AST,
+        _RESOLVE_FUNC_AST,
+        _RESOLVE_CAMERA_NUM_ITERS_AST,
+        _BUILD_CAMERA_ARGS_AST,
+    ],
+    type_ignores=[],
+)
+_CAMERA_ARGS_GLOBALS = {
+    "Path": Path,
+    "argparse": __import__("argparse"),
+    "copy": __import__("copy"),
+}
+exec(compile(_CAMERA_ARGS_MODULE, str(_SOURCE_PATH), "exec"), _CAMERA_ARGS_GLOBALS)
+parse_camera_int_overrides = _CAMERA_ARGS_GLOBALS["parse_camera_int_overrides"]
+resolve_camera_num_iters = _CAMERA_ARGS_GLOBALS["resolve_camera_num_iters"]
+build_camera_args = _CAMERA_ARGS_GLOBALS["build_camera_args"]
 
 
 def _collect_cli_flags(func_ast: ast.FunctionDef) -> set[str]:
@@ -258,15 +286,64 @@ class PressOneButtonCliSurfaceTests(unittest.TestCase):
         self.assertIn("--collect_profile_stats", _CLI_FLAGS)
         self.assertIn("--hardware_telemetry_interval_sec", _CLI_FLAGS)
         self.assertIn("--depth_filter_workers", _CLI_FLAGS)
+        self.assertIn("--camera_num_iters", _CLI_FLAGS)
 
     def test_num_iters_default_is_five(self):
         self.assertEqual(_CLI_DEFAULTS.get("--num_iters"), 5)
+        self.assertIsNone(_CLI_DEFAULTS.get("--camera_num_iters"))
 
     def test_support_grid_ratio_default_is_point_eight(self):
         self.assertEqual(_CLI_DEFAULTS.get("--support_grid_ratio"), 0.8)
 
     def test_exposes_wrist_pick_place_no_heatmap_profile(self):
         self.assertIn("wrist_pick_place_no_heatmap", _CLI_CHOICES.get("--traj_filter_profile", ()))
+
+
+class CameraNumItersOverrideTests(unittest.TestCase):
+    def test_parse_camera_int_overrides_accepts_sparse_subset(self):
+        overrides = parse_camera_int_overrides(
+            "varied_camera_1:4,varied_camera_3:5",
+            option_name="--camera_num_iters",
+        )
+        self.assertEqual(overrides, {"varied_camera_1": 4, "varied_camera_3": 5})
+
+    def test_parse_camera_int_overrides_rejects_malformed_or_nonpositive_values(self):
+        with self.assertRaises(ValueError):
+            parse_camera_int_overrides("varied_camera_1", option_name="--camera_num_iters")
+        with self.assertRaises(ValueError):
+            parse_camera_int_overrides("varied_camera_1:0", option_name="--camera_num_iters")
+        with self.assertRaises(ValueError):
+            parse_camera_int_overrides("varied_camera_1:4,varied_camera_1:5", option_name="--camera_num_iters")
+
+    def test_build_camera_args_applies_per_camera_num_iters_override(self):
+        base_args = type(
+            "Args",
+            (),
+            {
+                "num_iters": 5,
+                "camera_num_iters_overrides": {"varied_camera_1": 4},
+                "traj_filter_profile": "wrist_pick_place_no_heatmap",
+                "external_geom_name": "trajectory_valid.h5",
+            },
+        )()
+
+        external_args = build_camera_args(
+            base_args,
+            Path("/tmp/episode_00001"),
+            "varied_camera_1",
+            query_frame_schedule_path=Path("/tmp/schedule.json"),
+        )
+        wrist_args = build_camera_args(
+            base_args,
+            Path("/tmp/episode_00001"),
+            "varied_camera_3",
+            query_frame_schedule_path=Path("/tmp/schedule.json"),
+        )
+
+        self.assertEqual(external_args.num_iters, 4)
+        self.assertEqual(external_args.traj_filter_profile, "external")
+        self.assertEqual(wrist_args.num_iters, 5)
+        self.assertEqual(wrist_args.traj_filter_profile, "wrist_pick_place_no_heatmap")
 
 
 class BatchTelemetryRecordTests(unittest.TestCase):
@@ -285,6 +362,7 @@ class BatchTelemetryRecordTests(unittest.TestCase):
             {
                 "device": "cuda:0",
                 "num_iters": 5,
+                "camera_num_iters_overrides": {"varied_camera_1": 4},
                 "depth_filter_workers": 12,
                 "traj_filter_profile": "external",
             },
@@ -311,6 +389,7 @@ class BatchTelemetryRecordTests(unittest.TestCase):
         self.assertEqual(record["episode_name"], "episode_00001_green")
         self.assertEqual(record["camera_name"], "varied_camera_1")
         self.assertEqual(record["num_iters"], 5)
+        self.assertEqual(record["camera_num_iters_overrides"], {"varied_camera_1": 4})
         self.assertEqual(record["depth_filter_workers"], 12)
         self.assertEqual(record["worker_label"], "GPU 0 slot 1/4")
         self.assertEqual(record["query_frame_count"], 10)
@@ -334,6 +413,7 @@ class BatchTelemetryRecordTests(unittest.TestCase):
             {
                 "device": "cuda:0",
                 "num_iters": 5,
+                "camera_num_iters_overrides": {"varied_camera_1": 4},
                 "depth_filter_workers": 8,
                 "traj_filter_profile": "external",
             },
@@ -363,6 +443,7 @@ class BatchTelemetryRecordTests(unittest.TestCase):
 
         self.assertEqual(record["worker_label"], "GPU 0 slot 1/2")
         self.assertEqual(record["query_frame_count"], 3)
+        self.assertEqual(record["camera_num_iters_overrides"], {"varied_camera_1": 4})
         self.assertEqual(record["profile_stats"]["tracker_model_forward_seconds"], 10.0)
         self.assertEqual(record["save_profile_stats"]["sample_write_seconds"], 1.0)
         self.assertEqual(record["per_query_save_seconds"], {"7": 0.5, "9": 0.7})
@@ -378,6 +459,7 @@ class BatchTelemetryRecordTests(unittest.TestCase):
                 "collect_profile_stats": True,
                 "hardware_telemetry_interval_sec": 30.0,
                 "num_iters": 6,
+                "camera_num_iters_overrides": {"varied_camera_1": 4, "varied_camera_2": 4},
                 "depth_filter_workers": 16,
                 "keyframe_seed": 0,
                 "keyframes_per_sec_min": 5,
@@ -418,6 +500,7 @@ class BatchTelemetryRecordTests(unittest.TestCase):
         self.assertEqual(summary["worker_slot_count"], 16)
         self.assertTrue(summary["collect_profile_stats"])
         self.assertAlmostEqual(summary["hardware_telemetry_interval_sec"], 30.0)
+        self.assertEqual(summary["camera_num_iters_overrides"], {"varied_camera_1": 4, "varied_camera_2": 4})
         self.assertEqual(summary["depth_filter_workers"], 16)
         self.assertEqual(summary["episode_count"], 30)
         self.assertEqual(summary["camera_task_count"], 60)

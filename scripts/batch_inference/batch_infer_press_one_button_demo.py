@@ -205,6 +205,46 @@ def parse_camera_names(camera_names: str) -> list[str]:
     return values
 
 
+def parse_camera_int_overrides(
+    raw: str | None,
+    *,
+    option_name: str,
+) -> dict[str, int]:
+    if raw is None:
+        return {}
+
+    overrides: dict[str, int] = {}
+    for item in str(raw).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        camera_name, separator, value_str = item.partition(":")
+        camera_name = camera_name.strip()
+        value_str = value_str.strip()
+        if separator != ":" or not camera_name or not value_str:
+            raise ValueError(
+                f"{option_name} expects comma-separated camera:value pairs, got {item!r}"
+            )
+        value = int(value_str)
+        if value <= 0:
+            raise ValueError(f"{option_name} values must be >= 1, got {item!r}")
+        if camera_name in overrides:
+            raise ValueError(f"{option_name} contains duplicate camera {camera_name!r}")
+        overrides[camera_name] = value
+    return overrides
+
+
+def resolve_camera_num_iters(
+    *,
+    base_num_iters: int,
+    camera_name: str,
+    overrides: dict[str, int] | None,
+) -> int:
+    if not overrides:
+        return int(base_num_iters)
+    return int(overrides.get(camera_name, base_num_iters))
+
+
 def resolve_traj_filter_profile(camera_name: str, requested_profile: str) -> str:
     camera_name = camera_name.lower()
     is_wrist_like = (
@@ -265,6 +305,7 @@ def build_camera_task_metric_record(
         "gpu_slot_count": gpu_slot_count,
         "device": getattr(args, "device", None),
         "num_iters": int(args.num_iters),
+        "camera_num_iters_overrides": dict(getattr(args, "camera_num_iters_overrides", {})),
         "depth_filter_workers": int(getattr(args, "depth_filter_workers", _DEFAULT_DEPTH_FILTER_WORKERS)),
         "traj_filter_profile": getattr(args, "traj_filter_profile", None),
         "query_frame_schedule_path": (
@@ -326,6 +367,7 @@ def build_camera_task_profile_record(
         "gpu_slot_count": gpu_slot_count,
         "device": getattr(args, "device", None),
         "num_iters": int(args.num_iters),
+        "camera_num_iters_overrides": dict(getattr(args, "camera_num_iters_overrides", {})),
         "depth_filter_workers": int(getattr(args, "depth_filter_workers", _DEFAULT_DEPTH_FILTER_WORKERS)),
         "traj_filter_profile": getattr(args, "traj_filter_profile", None),
         "query_frame_count": query_frame_count,
@@ -389,6 +431,7 @@ def build_batch_run_summary(
             getattr(args, "hardware_telemetry_interval_sec", 0.0)
         ),
         "num_iters": int(args.num_iters),
+        "camera_num_iters_overrides": dict(getattr(args, "camera_num_iters_overrides", {})),
         "depth_filter_workers": int(getattr(args, "depth_filter_workers", _DEFAULT_DEPTH_FILTER_WORKERS)),
         "keyframe_seed": int(args.keyframe_seed),
         "keyframes_per_sec_min": int(args.keyframes_per_sec_min),
@@ -544,6 +587,15 @@ def parse_args() -> argparse.Namespace:
         help="Single-GPU execution device. In --gpu_id mode each worker binds its own CUDA device automatically.",
     )
     parser.add_argument("--num_iters", type=int, default=5)
+    parser.add_argument(
+        "--camera_num_iters",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated camera:num_iters overrides, for example "
+            "varied_camera_1:4,varied_camera_2:4,varied_camera_3:5."
+        ),
+    )
     parser.add_argument("--fps", type=int, default=1)
     parser.add_argument("--max_num_frames", type=int, default=512)
     parser.add_argument("--save_video", action="store_true", default=False)
@@ -714,6 +766,10 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     args.camera_names = parse_camera_names(args.camera_names)
+    args.camera_num_iters_overrides = parse_camera_int_overrides(
+        args.camera_num_iters,
+        option_name="--camera_num_iters",
+    )
 
     if args.fps <= 0:
         raise ValueError("--fps must be >= 1 for shared per-second keyframe sampling.")
@@ -731,6 +787,16 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--depth_filter_workers must be >= 1")
     if args.hardware_telemetry_interval_sec < 0.0:
         raise ValueError("--hardware_telemetry_interval_sec must be >= 0")
+    unknown_override_cameras = sorted(
+        camera_name
+        for camera_name in args.camera_num_iters_overrides
+        if camera_name not in args.camera_names
+    )
+    if unknown_override_cameras:
+        raise ValueError(
+            "--camera_num_iters contains cameras outside --camera_names: "
+            + ",".join(unknown_override_cameras)
+        )
 
     return args
 
@@ -1535,6 +1601,11 @@ def build_camera_args(
     camera_args.traj_filter_profile = resolve_traj_filter_profile(
         camera_name,
         base_args.traj_filter_profile,
+    )
+    camera_args.num_iters = resolve_camera_num_iters(
+        base_num_iters=int(base_args.num_iters),
+        camera_name=camera_name,
+        overrides=getattr(base_args, "camera_num_iters_overrides", None),
     )
     camera_args.external_geom_npz = str(episode_dir / base_args.external_geom_name)
     camera_args.query_frame_schedule_path = (
