@@ -61,10 +61,12 @@ RESAMPLE_LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
 GIF_TRACK_SAMPLING_SHARED = "shared"
 GIF_TRACK_SAMPLING_BALANCED = "balanced"
 GIF_TRACK_SAMPLING_TOP_MOTION = "top_motion"
+GIF_TRACK_SAMPLING_SPATIAL = "spatial"
 GIF_TRACK_SAMPLING_MODES = (
     GIF_TRACK_SAMPLING_SHARED,
     GIF_TRACK_SAMPLING_BALANCED,
     GIF_TRACK_SAMPLING_TOP_MOTION,
+    GIF_TRACK_SAMPLING_SPATIAL,
 )
 
 
@@ -345,6 +347,74 @@ def choose_track_indices(traj_world: np.ndarray, max_tracks: int) -> np.ndarray:
     return ranked[: min(max_tracks, len(ranked))]
 
 
+def choose_gif_candidate_indices(
+    *,
+    traj_world: np.ndarray,
+    max_tracks: int,
+    gif_track_sampling: str,
+    shared_track_indices: np.ndarray | None = None,
+) -> np.ndarray:
+    if gif_track_sampling == GIF_TRACK_SAMPLING_SHARED and shared_track_indices is not None:
+        shared_track_indices = np.asarray(shared_track_indices, dtype=np.int32).reshape(-1)
+        return shared_track_indices.copy()
+    if gif_track_sampling in {GIF_TRACK_SAMPLING_SHARED, GIF_TRACK_SAMPLING_TOP_MOTION}:
+        return choose_track_indices(traj_world, max_tracks)
+    return np.arange(len(traj_world), dtype=np.int32)
+
+
+def choose_spatial_subset(
+    track_indices: np.ndarray,
+    max_tracks: int,
+    query_points: np.ndarray,
+) -> np.ndarray:
+    track_indices = np.asarray(track_indices, dtype=np.int32).reshape(-1)
+    max_tracks = int(max_tracks)
+    if max_tracks <= 0 or track_indices.size <= max_tracks:
+        return track_indices.copy()
+
+    query_points = np.asarray(query_points, dtype=np.float32)
+    if query_points.shape != (track_indices.size, 2):
+        raise ValueError(
+            f"Expected query_points shape {(track_indices.size, 2)}, got {query_points.shape}"
+        )
+
+    finite_positions = np.flatnonzero(np.isfinite(query_points).all(axis=1))
+    if finite_positions.size == 0:
+        return track_indices[:max_tracks].copy()
+
+    points = query_points[finite_positions]
+    mins = points.min(axis=0)
+    spans = np.maximum(points.max(axis=0) - mins, 1.0)
+    normalized = (points - mins) / spans
+    center = normalized.mean(axis=0, keepdims=True)
+    center_dist2 = np.sum((normalized - center) ** 2, axis=1)
+
+    selected_local = [int(np.argmin(center_dist2))]
+    min_dist2 = np.sum((normalized - normalized[selected_local[0]]) ** 2, axis=1)
+    target_count = min(max_tracks, len(finite_positions))
+
+    while len(selected_local) < target_count:
+        min_dist2[np.asarray(selected_local, dtype=np.int32)] = -np.inf
+        next_local = int(np.argmax(min_dist2))
+        if not np.isfinite(min_dist2[next_local]) or min_dist2[next_local] < 0:
+            break
+        selected_local.append(next_local)
+        dist2 = np.sum((normalized - normalized[next_local]) ** 2, axis=1)
+        min_dist2 = np.minimum(min_dist2, dist2)
+
+    selected_positions = finite_positions[np.asarray(selected_local, dtype=np.int32)]
+    if selected_positions.size < max_tracks:
+        selected_mask = np.zeros(track_indices.size, dtype=bool)
+        selected_mask[selected_positions] = True
+        remaining_positions = np.flatnonzero(~selected_mask)
+        selected_positions = np.concatenate(
+            [selected_positions, remaining_positions[: max_tracks - selected_positions.size]]
+        )
+
+    selected_positions = np.sort(selected_positions[:max_tracks])
+    return track_indices[selected_positions]
+
+
 def make_track_colors(num_tracks: int) -> np.ndarray:
     if num_tracks <= 0:
         return np.zeros((0, 3), dtype=np.float32)
@@ -507,16 +577,21 @@ def choose_gif_track_indices(
     max_gif_tracks: int,
     gif_track_sampling: str,
     group_labels: list[tuple[str, int]],
+    query_points: np.ndarray | None = None,
 ) -> np.ndarray:
     track_indices = np.asarray(track_indices, dtype=np.int32).reshape(-1)
     if track_indices.size <= max_gif_tracks:
         return track_indices.copy()
     if gif_track_sampling == GIF_TRACK_SAMPLING_SHARED:
-        return track_indices.copy()
+        return track_indices[: max_gif_tracks].copy()
     if gif_track_sampling == GIF_TRACK_SAMPLING_TOP_MOTION:
         return track_indices[: max_gif_tracks].copy()
     if gif_track_sampling == GIF_TRACK_SAMPLING_BALANCED:
         return choose_balanced_subset(track_indices, max_gif_tracks, group_labels)
+    if gif_track_sampling == GIF_TRACK_SAMPLING_SPATIAL:
+        if query_points is None:
+            raise ValueError("query_points are required for spatial GIF track sampling")
+        return choose_spatial_subset(track_indices, max_gif_tracks, query_points)
     raise ValueError(f"Unsupported gif_track_sampling: {gif_track_sampling}")
 
 
@@ -923,16 +998,23 @@ def verify_camera(
         depth_max=depth_max,
     )
     track_indices = choose_track_indices(traj_world_selection, max_tracks)
+    gif_candidate_indices = choose_gif_candidate_indices(
+        traj_world=traj_world_selection,
+        max_tracks=max_gif_tracks,
+        gif_track_sampling=gif_track_sampling,
+        shared_track_indices=track_indices,
+    )
     group_labels = build_track_group_labels(
         traj_pick_place_object_mask=render_view["traj_pick_place_object_mask"],
         traj_manipulator_cluster_id=render_view["traj_manipulator_cluster_id"],
-        track_indices=track_indices,
+        track_indices=gif_candidate_indices,
     )
     gif_track_indices = choose_gif_track_indices(
-        track_indices=track_indices,
-        max_gif_tracks=min(max_gif_tracks, len(track_indices)),
+        track_indices=gif_candidate_indices,
+        max_gif_tracks=min(max_gif_tracks, len(gif_candidate_indices)),
         gif_track_sampling=gif_track_sampling,
         group_labels=group_labels,
+        query_points=np.asarray(traj_2d[gif_candidate_indices, 0], dtype=np.float32),
     )
     gif_cloud_point_count_value = int(min(len(cloud_points), max_gif_cloud_points))
 

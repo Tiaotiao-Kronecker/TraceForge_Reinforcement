@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_SCRIPT = PROJECT_ROOT / "scripts" / "visualization" / "compose_query_rgb_and_trajectory_gifs.py"
 SUMMARY_JSON_BASENAME = "summary.json"
 SUMMARY_MD_BASENAME = "summary.md"
+GIF_TRACK_SAMPLING_CHOICES = ("shared", "balanced", "top_motion", "spatial")
 
 
 def parse_csv_items(raw: str | None) -> list[str]:
@@ -65,6 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gif_fps", type=int, default=10)
     parser.add_argument("--gif_dpi", type=int, default=90)
     parser.add_argument("--max_gif_tracks", type=int, default=48)
+    parser.add_argument(
+        "--gif_track_sampling",
+        type=str,
+        default="spatial",
+        choices=GIF_TRACK_SAMPLING_CHOICES,
+    )
     parser.add_argument("--max_gif_cloud_points", type=int, default=3000)
     parser.add_argument("--ply_downsample", type=int, default=4)
     parser.add_argument("--depth_min", type=float, default=0.01)
@@ -147,6 +154,8 @@ def _run_compose(
         str(int(args.gif_dpi)),
         "--max_gif_tracks",
         str(int(args.max_gif_tracks)),
+        "--gif_track_sampling",
+        str(args.gif_track_sampling),
         "--max_gif_cloud_points",
         str(int(args.max_gif_cloud_points)),
         "--ply_downsample",
@@ -270,6 +279,7 @@ def write_markdown_summary(*, args: argparse.Namespace, summary: dict[str, Any],
         f"- Sort order: `{summary['sort_order']}`",
         f"- Requested top_k: `{summary['top_k']}`",
         f"- Exported rows: `{len(rows)}`",
+        f"- GIF track sampling: `{summary['gif_track_sampling']}`",
     ]
     if summary.get("camera_names"):
         lines.append(f"- Camera filter: `{','.join(summary['camera_names'])}`")
@@ -326,6 +336,7 @@ def main() -> None:
         "sort_order": str(args.sort_order),
         "top_k": int(args.top_k),
         "camera_names": camera_names,
+        "gif_track_sampling": str(args.gif_track_sampling),
         "artifacts": artifacts,
     }
     summary_json_path = args.output_dir / SUMMARY_JSON_BASENAME

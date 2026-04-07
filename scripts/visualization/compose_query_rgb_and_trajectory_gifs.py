@@ -103,6 +103,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of trajectories shown in 2D/3D GIFs.",
     )
     parser.add_argument(
+        "--gif_track_sampling",
+        type=str,
+        default=verify.GIF_TRACK_SAMPLING_SPATIAL,
+        choices=verify.GIF_TRACK_SAMPLING_MODES,
+        help="How GIF track subsets are chosen when --max_gif_tracks is smaller than the kept track count.",
+    )
+    parser.add_argument(
         "--max_gif_cloud_points",
         type=int,
         default=3000,
@@ -259,17 +266,23 @@ def load_query_bundle(
         depth_min=depth_min,
         depth_max=depth_max,
     )
-    track_indices = verify.choose_track_indices(traj_world_selection, max_gif_tracks)
+    gif_candidate_indices = verify.choose_gif_candidate_indices(
+        traj_world=traj_world_selection,
+        max_tracks=max_gif_tracks,
+        gif_track_sampling=gif_track_sampling,
+        shared_track_indices=None,
+    )
     group_labels = verify.build_track_group_labels(
         traj_pick_place_object_mask=render_view["traj_pick_place_object_mask"],
         traj_manipulator_cluster_id=render_view["traj_manipulator_cluster_id"],
-        track_indices=track_indices,
+        track_indices=gif_candidate_indices,
     )
     gif_track_indices = verify.choose_gif_track_indices(
-        track_indices=track_indices,
-        max_gif_tracks=min(max_gif_tracks, len(track_indices)),
+        track_indices=gif_candidate_indices,
+        max_gif_tracks=min(max_gif_tracks, len(gif_candidate_indices)),
         gif_track_sampling=gif_track_sampling,
         group_labels=group_labels,
+        query_points=np.asarray(traj_2d[gif_candidate_indices, 0], dtype=np.float32),
     )
 
     return {
@@ -372,7 +385,7 @@ def main() -> None:
             depth_min=float(args.depth_min),
             depth_max=float(args.depth_max),
             max_gif_tracks=max(1, int(args.max_gif_tracks)),
-            gif_track_sampling=verify.GIF_TRACK_SAMPLING_BALANCED,
+            gif_track_sampling=str(args.gif_track_sampling),
         )
         rgb_gif_path = aligned_rgb_dir / f"q{query_frame:05d}_rgb_segment.gif"
         gif_2d_path = tracks_2d_dir / f"q{query_frame:05d}_2d_tracks.gif"
@@ -446,6 +459,7 @@ def main() -> None:
         "render_mode": str(args.render_mode),
         "gif_fps": int(args.gif_fps),
         "gif_dpi": int(args.gif_dpi),
+        "gif_track_sampling": str(args.gif_track_sampling),
         "panel_height": int(args.panel_height),
         "artifacts": [asdict(item) for item in artifacts],
     }
