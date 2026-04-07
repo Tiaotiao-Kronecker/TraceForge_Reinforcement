@@ -21,7 +21,7 @@ import numpy as np
 
 CURRENT_REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BASELINE_REF = "8f9060d"
-DEFAULT_CAMERAS = ("varied_camera_1", "varied_camera_3")
+DEFAULT_CAMERAS = ("varied_camera_1", "varied_camera_2")
 QUERY_FRAME_SCHEDULE_VERSION = 1
 QUERY_FRAME_SHARED_DIRNAME = "_shared"
 RESULT_JSON_BASENAME = "benchmark_results.json"
@@ -38,8 +38,8 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark the depth-volatility optimization on one external camera and one "
-            "wrist-like camera, and compare the current repo against a baseline ref."
+            "Benchmark the depth-volatility optimization on two maintained external "
+            "cameras, and compare the current repo against a baseline ref."
         )
     )
     parser.add_argument(
@@ -57,15 +57,16 @@ def parse_args() -> argparse.Namespace:
         "--camera-names",
         type=str,
         default=",".join(DEFAULT_CAMERAS),
-        help="Comma-separated camera names. Defaults to one external and one wrist-like camera.",
+        help="Comma-separated camera names. Defaults to two maintained external cameras.",
     )
     parser.add_argument(
         "--traj-filter-profile",
         type=str,
-        default="auto",
+        default="external",
         help=(
-            "Trajectory filter profile. 'auto' maps wrist-like camera names to "
-            "wrist_manipulator_top95 and others to external."
+            "Trajectory filter profile. The maintained external-only default is external "
+            "for all cameras; auto is retained as a compatibility alias and currently "
+            "resolves to external."
         ),
     )
     parser.add_argument(
@@ -205,9 +206,6 @@ def parse_camera_names(camera_names: str) -> list[str]:
 def resolve_traj_filter_profile(camera_name: str, requested_profile: str) -> str:
     if requested_profile != "auto":
         return requested_profile
-    camera_name = camera_name.lower()
-    if camera_name.endswith("camera_3") or "wrist" in camera_name or "hand" in camera_name:
-        return "wrist_manipulator_top95"
     return "external"
 
 

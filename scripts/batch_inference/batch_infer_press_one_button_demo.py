@@ -76,7 +76,6 @@ from utils.traceforge_artifact_utils import is_traceforge_output_complete
 DEFAULT_CAMERAS = [
     "varied_camera_1",
     "varied_camera_2",
-    "varied_camera_3",
 ]
 
 _CUDA_LINALG_WARMUP_LOCK = threading.Lock()
@@ -267,8 +266,6 @@ def resolve_traj_filter_profile(camera_name: str, requested_profile: str) -> str
         or "hand" in camera_name
     )
     if requested_profile == "auto":
-        if is_wrist_like:
-            return "wrist_manipulator_top95"
         return "external"
     if requested_profile in {
         "wrist_pick_place",
@@ -626,7 +623,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional comma-separated camera:num_iters overrides, for example "
-            "varied_camera_1:4,varied_camera_2:4,varied_camera_3:5."
+            "varied_camera_1:4,varied_camera_2:4."
         ),
     )
     parser.add_argument("--fps", type=int, default=1)
@@ -726,7 +723,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--traj_filter_profile",
         type=str,
-        default="auto",
+        default="external",
         choices=[
             "auto",
             "external",
@@ -739,8 +736,8 @@ def parse_args() -> argparse.Namespace:
             "wrist_manipulator",
         ],
         help=(
-            "Trajectory filtering profile. auto maps wrist-like camera names to wrist_manipulator_top95 "
-            "and others to external; "
+            "Trajectory filtering profile. The maintained external-only default is external for all cameras; "
+            "auto is retained as a compatibility alias and currently resolves to external. "
             "external_manipulator, external_manipulator_v2, wrist_pick_place, "
             "wrist_pick_place_no_heatmap, wrist_manipulator_top95, "
             "and wrist_manipulator "

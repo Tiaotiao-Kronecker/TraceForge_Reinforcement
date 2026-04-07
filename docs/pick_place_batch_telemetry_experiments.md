@@ -4,6 +4,12 @@
 
 本文档作为这轮 `pick_place` 批量性能实验的持续更新结论页。
 
+2026-04-07 说明：
+
+- 本页保留的是 mixed external+wrist `pick_place` 研究结论
+- 当前维护态已经收敛到 external-only 默认路径；如需查看当前默认优化方向，请优先看
+  `docs/history/external_only_speed_reassessment_2026-04-07.md`
+
 后续相关实验结论统一追加在这里，包括：
 
 - 单卡 `workers_per_gpu` sweep

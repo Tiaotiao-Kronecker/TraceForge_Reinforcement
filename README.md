@@ -9,12 +9,11 @@ Current maintained pipeline:
 - shared per-episode query-frame schedules for multi-camera button/sim datasets
 - 3D point tracking
 - sample serialization in `v2` layout by default
-- trajectory filtering with camera-aware profiles
+- trajectory filtering with `external` as the maintained default profile
 - visualization and verification on saved artifacts
 
 For the current maintained trajectory-filter behavior, including the default
-`external` path, the wrist-like default `wrist_manipulator_top95` path, and the
-task-specific caveats for `pick_place` / `push_pull`, see
+`external` path and the retained explicit wrist-oriented historical profiles, see
 [docs/maintained_traj_filter_logic.md](docs/maintained_traj_filter_logic.md).
 
 The repository still contains a few compatibility paths, notably
@@ -106,14 +105,13 @@ video segment, it is still dropped before schedule sampling. For the retained
 tail samples that still end before `future_len`, the maintained `v2` writer
 pads the time axis to `future_len` with `inf` and marks the valid prefix via
 `valid_steps` / `segment_frame_indices`.
-Its maintained defaults already cover `camera_names=varied_camera_1,2,3`,
+Its maintained defaults already cover `camera_names=varied_camera_1,2`,
 `depth_pose_method=external`, `external_geom_name=trajectory_valid.h5`,
 `fps=1`, `max_num_frames=512`, `future_len=32`, `num_iters=5`, `grid_size=80`,
-`filter_level=standard`, and `traj_filter_profile=auto`.
-For wrist-like cameras, `auto` is still the maintained default, but it should
-not be treated as the best choice for every task: for `pick_place`, prefer
-`wrist_pick_place` when `pick` heatmaps are available and
-`wrist_pick_place_no_heatmap` otherwise; for `push_pull`, start from `wrist`.
+`filter_level=standard`, and `traj_filter_profile=external`.
+`traj_filter_profile=auto` is retained as a compatibility alias and currently
+resolves to `external`. Wrist-oriented profiles remain available only when
+explicitly requested for historical investigations or compatibility reruns.
 
 ### 3D visualization
 

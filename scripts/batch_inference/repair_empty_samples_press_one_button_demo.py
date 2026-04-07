@@ -902,7 +902,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--traj_filter_profile",
         type=str,
-        default="auto",
+        default="external",
         choices=[
             "auto",
             "external",

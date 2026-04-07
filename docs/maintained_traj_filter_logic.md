@@ -1,11 +1,10 @@
 # 维护态轨迹过滤逻辑
 
-本文档描述当前维护态 TraceForge 的轨迹过滤逻辑，重点覆盖默认的两条生产路径：
+本文档描述当前维护态 TraceForge 的轨迹过滤逻辑。当前维护态只有一条默认生产路径：
 
-- external 相机默认走 `traj_filter_profile=external`
-- wrist-like 相机在 `traj_filter_profile=auto` 下默认走 `wrist_manipulator_top95`
+- 所有维护态相机默认走 `traj_filter_profile=external`
 
-另外，维护态还支持一个显式任务特化分支：
+另外，代码中仍保留若干显式非默认分支，供历史调查、兼容性复跑和定向实验使用：
 
 - `traj_filter_profile=wrist_pick_place`
 - `traj_filter_profile=wrist_pick_place_no_heatmap`
@@ -18,24 +17,19 @@
 
 - `depth_pose_method=external`
 - `filter_level=standard`
-- `traj_filter_profile=auto`
+- `traj_filter_profile=external`
 
-`auto` 的映射规则由 `resolve_traj_filter_profile()` 决定：
-
-- 相机名以 `camera_3` 结尾，或包含 `wrist` / `hand`，映射到 `wrist_manipulator_top95`
-- 其他相机映射到 `external`
+`traj_filter_profile=auto` 仍被接受，但现在只作为兼容别名保留，并且也会解析到 `external`。
 
 因此，当前维护态最常见的默认组合是：
 
-| 相机类型 | 默认 profile |
+| 相机类型 | 维护态默认 profile |
 | --- | --- |
-| external / third-person | `external` |
-| wrist-like / hand-like | `wrist_manipulator_top95` |
+| all maintained cameras | `external` |
 
 补充说明：
 
-- `wrist` 仍然存在，但不是 wrist-like 相机在维护态默认 `auto` 下的结果
-- `wrist_pick_place` 和 `wrist_pick_place_no_heatmap` 都已实现，但都需要显式指定；它们不是 wrist-like 相机在 `auto` 下的默认映射
+- `wrist`、`wrist_manipulator_top95`、`wrist_pick_place` 和 `wrist_pick_place_no_heatmap` 都仍然存在，但都不再属于维护态默认映射
 - `external_manipulator`、`external_manipulator_v2`、`wrist_manipulator` 都需要显式指定
 - `query_prefilter_mode` 默认是 `off`，不属于默认轨迹过滤主链
 
@@ -95,9 +89,9 @@ base_mask =
   - 绝对误差不超过 `0.05m`
   - 或相对误差不超过 `10%`
 
-这一步输出的主判定是 `query_depth_quality_mask`。对 wrist-like profile，还会额外计算一层 query-depth edge risk。
+这一步输出的主判定是 `query_depth_quality_mask`。对显式 wrist-like profile，还会额外计算一层 query-depth edge risk。
 
-### 2.4 wrist-like 专用 query-depth edge risk
+### 2.4 显式 wrist-like profile 专用 query-depth edge risk
 
 只对 wrist-like profile 生效：
 
@@ -119,7 +113,7 @@ base_mask =
 query_depth_keep_mask = query_depth_quality_mask & (~query_depth_edge_risk_mask)
 ```
 
-只有在 wrist-like 默认行为下，这层 edge risk 才会作为硬拒绝进入最终 mask。若显式使用 `traj_filter_ablation_mode=wrist_no_query_edge`，这层拒绝只保留调试量，不再进入最终判定。
+只有在显式 wrist-like 路径里，这层 edge risk 才会作为硬拒绝进入最终 mask。若显式使用 `traj_filter_ablation_mode=wrist_no_query_edge`，这层拒绝只保留调试量，不再进入最终判定。
 
 ### 2.5 temporal depth consistency
 
@@ -304,9 +298,9 @@ traj_supervision_mask = [True, True, False, False]
 - `bit2`: `MASK_REASON_TEMPORAL_CONSISTENCY_FAIL`
 - `bit3`: `MASK_REASON_STABLE_TEMPORAL_FAIL`
 
-## 4. wrist-like `auto` 默认路径：wrist_manipulator_top95
+## 4. 显式 wrist-like 路径：wrist_manipulator_top95
 
-`wrist_manipulator_top95` 是 wrist-like 相机在维护态 `auto` 下的默认 profile。它不是直接从 external 放宽出来的，而是分成三层：
+`wrist_manipulator_top95` 不再是维护态默认 profile。当前 external-only 维护态默认统一使用 `external`；这里只讨论用户显式指定 wrist-like profile 做历史调查或兼容性复跑时的真实代码行为。它不是直接从 external 放宽出来的，而是分成三层：
 
 1. wrist 基础 seed
 2. manipulator-aware 收缩
@@ -314,7 +308,7 @@ traj_supervision_mask = [True, True, False, False]
 
 ### 4.1 代码执行顺序
 
-wrist-like 的 `auto` 默认结果不是单纯的 `wrist`，而是下面这条链：
+显式 wrist-like 路径不是单纯的 `wrist`，而是下面这条链：
 
 ```text
 wrist_seed_mask =
@@ -373,7 +367,7 @@ wrist_base_mask = valid_count_mask & depth_range_mask & depth_smooth_mask
 
 #### query_depth_keep_mask 在物理上是什么意思
 
-wrist-like 默认不仅要求 query depth 本身靠谱，还会额外拒绝落在危险深度边界上的点：
+显式 wrist-like 路径不仅要求 query depth 本身靠谱，还会额外拒绝落在危险深度边界上的点：
 
 ```text
 query_depth_keep_mask = query_depth_quality_mask & (~query_depth_edge_risk_mask)
@@ -384,7 +378,7 @@ query_depth_keep_mask = query_depth_quality_mask & (~query_depth_edge_risk_mask)
 - 靠近夹爪轮廓或前景/背景分界线的深度，很容易是混合像素或边界噪声
 - 这些点就算短时间能跟住，3D 也经常漂
 
-所以 wrist-like 默认会比 external 更积极地排掉深度边界风险点。
+所以显式 wrist-like 路径会比 external 更积极地排掉深度边界风险点。
 
 #### supervision support 在物理上是什么意思
 
@@ -488,7 +482,7 @@ traj_motion_extent_all_valid >= 0.03m
 - 机械臂主体通常会有比较明确的 3D 位移
 - 如果一个点几乎不动，它更可能是背景残留或偶然通过的伪点
 
-这里默认用的是 `traj_motion_extent_all_valid`，不是只看 supervised prefix 的 motion。这意味着 wrist-like 默认会把“整段可用帧上的总体运动”当成更重要的主体信号。
+这里默认用的是 `traj_motion_extent_all_valid`，不是只看 supervised prefix 的 motion。这意味着显式 wrist-like 路径会把“整段可用帧上的总体运动”当成更重要的主体信号。
 
 #### 第三步：largest_spatial_component
 
@@ -598,11 +592,11 @@ final_mask = wrist_seed_mask
 - `wrist` 的物理语义是“保住前缀阶段可信的 wrist 点”
 - `wrist_manipulator_top95` 的物理语义是“从这些 wrist 点里进一步逼近机械臂主体，并再去一点弱噪声尾巴”
 
-维护态 `auto` 默认采用的是后者。
+显式使用 `wrist_manipulator_top95` 时，采用的是后者。
 
-### 4.6 用一句话总结 wrist-like `auto`
+### 4.6 用一句话总结显式 wrist-like 路径
 
-wrist-like `auto` 默认逻辑不是在问：
+显式 wrist-like 路径不是在问：
 
 “这条轨迹是不是整段都稳定？”
 
@@ -612,7 +606,7 @@ wrist-like `auto` 默认逻辑不是在问：
 
 ### 4.7 主要调试信号
 
-排查 wrist-like 默认样本时，优先看这些字段：
+排查显式 wrist-like 样本时，优先看这些字段：
 
 - `traj_valid_mask`
 - `traj_supervision_mask`
@@ -645,11 +639,11 @@ wrist-like `auto` 默认逻辑不是在问：
 
 注意：wrist-like 路径里，`bit2` 对应的是 `supervision_support_mask` 不满足，而不是 external 那种“整条 temporal_mask 直接失败”。
 
-## 5. external vs wrist-like `auto` 的最终区别
+## 5. external vs 显式 wrist-like path 的最终区别
 
 如果只记一张表，可以记这一张：
 
-| 维度 | `external` | wrist-like `auto` (`wrist_manipulator_top95`) |
+| 维度 | `external` | 显式 wrist-like path (`wrist_manipulator_top95`) |
 | --- | --- | --- |
 | 想保留什么 | 整条都稳定、整条都几何自洽的真实 3D 点 | 前缀阶段真实可信、并且最终更像机械臂主体的一团点 |
 | base 几何门槛 | 完整 `base_mask`，包含 boundary 和 visibility | `wrist_base_mask`，不把 boundary / visibility 当硬门槛 |
@@ -662,7 +656,7 @@ wrist-like `auto` 默认逻辑不是在问：
 把它翻成一句更口语的话：
 
 - `external` 在问：“这是不是一条从头到尾都稳定、可信、几何一致的真实轨迹？”
-- wrist-like `auto` 在问：“这是不是一条前缀阶段真实可信、靠近镜头、确实在动、并且属于机械臂主体那一团的轨迹？”
+- 显式 wrist-like path 在问：“这是不是一条前缀阶段真实可信、靠近镜头、确实在动、并且属于机械臂主体那一团的轨迹？”
 
 ## 6. 如何解读 sample 输出
 
@@ -901,7 +895,7 @@ final_mask = local_keep_mask | delayed_contact_rescue_mask
 
 ## 8. 新任务场景下的适配建议
 
-本节讨论的是“当前 wrist-like `auto` 默认逻辑是否适合新任务”，不是只讨论历史建议。当前结论是：
+本节讨论的是“当前这套显式 wrist-like 逻辑是否适合新任务”，不是只讨论历史建议。当前结论是：
 
 - external 相机默认 `external` 仍然基本可沿用
 - wrist 相机不能再把 `auto -> wrist_manipulator_top95` 当成通用默认
@@ -910,7 +904,7 @@ final_mask = local_keep_mask | delayed_contact_rescue_mask
 
 ### 8.1 为什么 `press` 场景下当前 wrist 默认问题不大
 
-当前这套 wrist-like `auto` 默认逻辑，最初更接近 press 类任务：
+当前这套显式 wrist-like 逻辑，最初更接近 press 类任务：
 
 - 主要运动主体就是机械臂和夹爪
 - 被交互对象通常不需要被稳定抓住
@@ -925,11 +919,11 @@ final_mask = local_keep_mask | delayed_contact_rescue_mask
 
 虽然很偏向“机械臂主体”，但在 press 场景里通常不会造成特别大的语义损失。因为该保留的主要就是夹爪本体，而不是其他物体。
 
-### 8.2 为什么 `pick_place` 不适合继续用 wrist `auto`
+### 8.2 为什么 `pick_place` 不适合继续用显式 wrist-like 默认链路
 
 `pick_place` 的目标不只是保留夹爪，还要保留被抓住并被搬运的物体。
 
-但当前 wrist-like `auto` 默认逻辑会系统性偏向“保 gripper body，不保 object”。
+但当前这套显式 wrist-like 逻辑会系统性偏向“保 gripper body，不保 object”。
 
 #### 哪些 stage 会出问题
 
@@ -963,7 +957,7 @@ final_mask = local_keep_mask | delayed_contact_rescue_mask
 
 `push_pull` 的核心对象往往不是一个大块物体，而是门把手、拉手、抽屉边缘这类细小接触结构。
 
-当前 wrist-like `auto` 默认逻辑在这类场景下同样有明显风险。
+当前这套显式 wrist-like 逻辑在这类场景下同样有明显风险。
 
 #### 哪些 stage 会出问题
 

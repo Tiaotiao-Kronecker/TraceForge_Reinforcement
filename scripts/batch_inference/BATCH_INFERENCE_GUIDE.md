@@ -93,16 +93,16 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
 - button/sim episode 数据集
 - dynamic-only 多 GPU 常驻 worker 调度
 - 每个 episode 提供外部深度和 `trajectory_valid.h5`
-- 维护态默认值已经覆盖 `camera_names=varied_camera_1,2,3`、`depth_pose_method=external`、
+- 维护态默认值已经覆盖 `camera_names=varied_camera_1,2`、`depth_pose_method=external`、
   `external_geom_name=trajectory_valid.h5`、`fps=1`、`max_num_frames=512`、
-  `future_len=32`、`grid_size=80`、`filter_level=standard`、`traj_filter_profile=auto`
+  `future_len=32`、`grid_size=80`、`filter_level=standard`、`traj_filter_profile=external`
 - `--collect_profile_stats` 会把每个 camera task 的 `profile_stats` / `save_profile_stats`
   额外落到 `_camera_task_profiles.jsonl`
 - `--hardware_telemetry_interval_sec > 0` 会周期记录 GPU/CPU/IO 指标到 `_hardware_telemetry.jsonl`
 - `--depth_filter_workers` 控制 `infer.py` 里 `_DepthFilterRuntime` 的线程数，便于 CPU 侧隔离实验
-- 对 wrist-like 相机，`auto` 仍是维护态默认映射，但只应当把它视为 press-like 任务的默认起点；
-  `pick_place` 优先显式切到 `wrist_pick_place` / `wrist_pick_place_no_heatmap`，
-  `push_pull` 优先从 `wrist` 起步
+- `traj_filter_profile=auto` 仅保留为兼容别名，当前也解析为 `external`
+- wrist-oriented profile 仍可显式切到 `wrist_pick_place` / `wrist_pick_place_no_heatmap` /
+  `wrist` / `wrist_manipulator_top95`，但这些都不再属于维护态默认路径
 
 ## Press-One-Button Demo
 
@@ -133,8 +133,8 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
 - 维护态 batch CLI 不再暴露 `--frame_drop_rate`、`--horizon`、`--max_frames_per_video`
 - `--keyframe_seed` 用于可复现的 deterministic schedule；默认 `0`
 - 如果某些 `trajectory_valid.h5` 缺少根属性 `fps`，可以显式提供 `--fallback_episode_fps`
-- `auto` 会把 wrist-like camera 映射到 `wrist_manipulator_top95`
-- 这个默认映射更接近 press 类任务；对 `pick_place` / `push_pull` 不应再把它当成通用默认
+- `auto` 当前只作为兼容别名保留，并且会解析到 `external`
+- wrist-oriented profile 只在显式指定时才会启用；它们更适合作为历史调查或兼容性复跑路径
 - `external_manipulator`、`external_manipulator_v2`、`wrist_manipulator_top95`、`wrist_manipulator`
   需要显式指定
 - `wrist_manipulator_top95` 是 wrist_manipulator 的临时去噪 profile：先走 wrist_manipulator，再按

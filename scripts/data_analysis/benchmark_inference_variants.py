@@ -63,8 +63,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--camera-names",
         type=str,
-        default="varied_camera_1,varied_camera_3",
-        help="Comma-separated camera names. Defaults to one external and one wrist-like camera.",
+        default="varied_camera_1,varied_camera_2",
+        help="Comma-separated camera names. Defaults to two maintained external cameras.",
     )
     parser.add_argument(
         "--support-grid-ratios",
@@ -87,10 +87,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--traj-filter-profile",
         type=str,
-        default="auto",
+        default="external",
         help=(
-            "Trajectory filter profile. 'auto' maps wrist-like camera names to "
-            "wrist_manipulator_top95 and others to external."
+            "Trajectory filter profile. The maintained external-only default is external "
+            "for all cameras; auto is retained as a compatibility alias and currently "
+            "resolves to external."
         ),
     )
     parser.add_argument(

@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--baseline-root", type=Path, required=True)
     parser.add_argument("--variant-root", type=Path, required=True)
-    parser.add_argument("--camera-names", type=str, default="varied_camera_1,varied_camera_3")
+    parser.add_argument("--camera-names", type=str, default="varied_camera_1,varied_camera_2")
     parser.add_argument("--baseline-label", type=str, default="iters_6")
     parser.add_argument("--variant-label", type=str, default="iters_5")
     parser.add_argument("--baseline-num-iters", type=int, default=6)

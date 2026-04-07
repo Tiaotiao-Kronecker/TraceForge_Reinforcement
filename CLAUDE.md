@@ -154,7 +154,7 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 - `batch_infer_press_one_button_demo.py` samples shared keyframes per episode at `keyframes_per_sec_min~keyframes_per_sec_max` (default `2~3`)
 - The maintained batch entry no longer exposes `--frame_drop_rate`, `--horizon`, or `--max_frames_per_video`
 - To request a fixed per-second keyframe count in batch mode, set `keyframes_per_sec_min == keyframes_per_sec_max`
-- The maintained batch defaults already cover cameras `varied_camera_1,2,3`, `depth_pose_method=external`, `external_geom_name=trajectory_valid.h5`, `fps=1`, `max_num_frames=512`, `future_len=32`, `num_iters=5`, `grid_size=80`, `filter_level=standard`, and `traj_filter_profile=auto`
+- The maintained batch defaults already cover cameras `varied_camera_1,2`, `depth_pose_method=external`, `external_geom_name=trajectory_valid.h5`, `fps=1`, `max_num_frames=512`, `future_len=32`, `num_iters=5`, `grid_size=80`, `filter_level=standard`, and `traj_filter_profile=external`
 - `batch_infer_press_one_button_demo.py` writes in-place to `<episode>/trajectory/<camera_name>/...` by default; passing `--out_dir` switches the root to `<out_dir>/<episode>/<camera_name>/...`
 - The true episode frame rate comes from `trajectory_valid.h5` root attr `fps`
 - `--fps` is only the load stride; default `1`
@@ -202,7 +202,7 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 - Expected per-episode files include `trajectory_valid.h5`, `rgb/<camera>`, and `depth/<camera>`
 - `trajectory_valid.h5` root attr `fps` drives the per-second query-frame schedule
 - All cameras under one episode share the same raw query-frame indices
-- For wrist-like cameras, `traj_filter_profile=auto` still maps to `wrist_manipulator_top95`, but `pick_place` should prefer `wrist_pick_place` / `wrist_pick_place_no_heatmap`, and `push_pull` should start from `wrist`
+- `traj_filter_profile=auto` is retained only as a compatibility alias and currently resolves to `external`; wrist-oriented profiles remain available only when explicitly requested for historical investigations or compatibility reruns
 
 **Sim360 Dataset**:
 - Branch `curation/sim-360-extrinsics-fixed` contains extrinsics fixes

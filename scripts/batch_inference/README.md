@@ -26,8 +26,9 @@
   - 多 GPU 维护路径为 dynamic-only
   - 关键帧数量只由 `--keyframes_per_sec_min/max` 控制；固定数量时把两者设成相同值
   - 不再暴露 `--frame_drop_rate` / `--horizon` / `--max_frames_per_video`
-  - 支持 `traj_filter_profile auto`
-  - `auto` 默认把 wrist-like 相机映射到 `wrist_manipulator_top95`
+  - 维护态默认 `traj_filter_profile=external`
+  - `auto` 仅保留为兼容别名，当前也解析为 `external`
+  - wrist-oriented profile 仍可显式指定，但不再属于维护态默认路径
 - `batch_droid_external.py`
   - DROID external-only 批处理入口
 

@@ -190,18 +190,18 @@ _CLI_CHOICES = _collect_cli_choices(_PARSE_ARGS_FUNC_AST)
 
 
 class ResolveTrajFilterProfileTests(unittest.TestCase):
-    def test_auto_maps_wrist_like_camera_names_to_top95(self):
+    def test_auto_aliases_external_for_wrist_like_camera_names(self):
         self.assertEqual(
             resolve_traj_filter_profile("varied_camera_3", "auto"),
-            "wrist_manipulator_top95",
+            "external",
         )
         self.assertEqual(
             resolve_traj_filter_profile("hand_camera", "auto"),
-            "wrist_manipulator_top95",
+            "external",
         )
         self.assertEqual(
             resolve_traj_filter_profile("my_wrist_cam", "auto"),
-            "wrist_manipulator_top95",
+            "external",
         )
 
     def test_auto_maps_non_wrist_cameras_to_external(self):
@@ -303,6 +303,9 @@ class PressOneButtonCliSurfaceTests(unittest.TestCase):
     def test_num_iters_default_is_five(self):
         self.assertEqual(_CLI_DEFAULTS.get("--num_iters"), 5)
         self.assertIsNone(_CLI_DEFAULTS.get("--camera_num_iters"))
+
+    def test_traj_filter_profile_default_is_external(self):
+        self.assertEqual(_CLI_DEFAULTS.get("--traj_filter_profile"), "external")
 
     def test_support_grid_ratio_default_is_point_eight(self):
         self.assertEqual(_CLI_DEFAULTS.get("--support_grid_ratio"), 0.8)
