@@ -205,6 +205,20 @@ def parse_camera_names(camera_names: str) -> list[str]:
     return values
 
 
+def resolve_schedule_camera_names(
+    camera_names: list[str],
+    shared_schedule_camera_names: str | list[str] | None,
+) -> list[str]:
+    if shared_schedule_camera_names is None:
+        return list(camera_names)
+    if isinstance(shared_schedule_camera_names, str):
+        return parse_camera_names(shared_schedule_camera_names)
+    values = [str(item).strip() for item in shared_schedule_camera_names if str(item).strip()]
+    if not values:
+        raise ValueError("shared_schedule_camera_names must contain at least one camera name")
+    return values
+
+
 def parse_camera_int_overrides(
     raw: str | None,
     *,
@@ -308,6 +322,9 @@ def build_camera_task_metric_record(
         "camera_num_iters_overrides": dict(getattr(args, "camera_num_iters_overrides", {})),
         "depth_filter_workers": int(getattr(args, "depth_filter_workers", _DEFAULT_DEPTH_FILTER_WORKERS)),
         "traj_filter_profile": getattr(args, "traj_filter_profile", None),
+        "shared_schedule_camera_names": list(
+            getattr(args, "shared_schedule_camera_names", getattr(args, "camera_names", []))
+        ),
         "query_frame_schedule_path": (
             str(task.query_frame_schedule_path.resolve())
             if task.query_frame_schedule_path is not None
@@ -370,6 +387,9 @@ def build_camera_task_profile_record(
         "camera_num_iters_overrides": dict(getattr(args, "camera_num_iters_overrides", {})),
         "depth_filter_workers": int(getattr(args, "depth_filter_workers", _DEFAULT_DEPTH_FILTER_WORKERS)),
         "traj_filter_profile": getattr(args, "traj_filter_profile", None),
+        "shared_schedule_camera_names": list(
+            getattr(args, "shared_schedule_camera_names", getattr(args, "camera_names", []))
+        ),
         "query_frame_count": query_frame_count,
         "process_seconds": process_seconds,
         "save_seconds": save_seconds,
@@ -415,6 +435,9 @@ def build_batch_run_summary(
         "base_path": str(base_path.resolve()),
         "out_dir": str(out_dir.resolve()) if out_dir is not None else None,
         "camera_names": list(args.camera_names),
+        "shared_schedule_camera_names": list(
+            getattr(args, "shared_schedule_camera_names", getattr(args, "camera_names", []))
+        ),
         "gpu_ids": [int(gpu_id) for gpu_id in gpu_ids],
         "telemetry_gpu_ids": [int(gpu_id) for gpu_id in telemetry_gpu_ids],
         "host_name": host_name,
@@ -522,6 +545,16 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=",".join(DEFAULT_CAMERAS),
         help="Comma-separated camera names to process",
+    )
+    parser.add_argument(
+        "--shared_schedule_camera_names",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated camera names used only for building the shared "
+            "query-frame schedule. Use this to keep query frames aligned across split "
+            "batch submissions."
+        ),
     )
     parser.add_argument(
         "--episode_name",
@@ -766,6 +799,10 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     args.camera_names = parse_camera_names(args.camera_names)
+    args.shared_schedule_camera_names = resolve_schedule_camera_names(
+        args.camera_names,
+        args.shared_schedule_camera_names,
+    )
     args.camera_num_iters_overrides = parse_camera_int_overrides(
         args.camera_num_iters,
         option_name="--camera_num_iters",
@@ -1438,9 +1475,12 @@ def ensure_episode_query_frame_schedule(
 ) -> Path:
     geom_path = episode_dir / args.external_geom_name
     episode_fps = _read_episode_fps(geom_path, args.fallback_episode_fps)
+    schedule_camera_names = list(
+        getattr(args, "shared_schedule_camera_names", getattr(args, "camera_names", []))
+    )
 
     camera_raw_frame_counts: dict[str, int] = {}
-    for camera_name in args.camera_names:
+    for camera_name in schedule_camera_names:
         rgb_dir = episode_dir / "rgb" / camera_name
         depth_dir = episode_dir / "depth" / camera_name
         if not _has_files(rgb_dir, (".png", ".jpg", ".jpeg")):
@@ -1488,7 +1528,7 @@ def ensure_episode_query_frame_schedule(
     schedule_spec = {
         "version": _QUERY_FRAME_SCHEDULE_VERSION,
         "external_geom_name": args.external_geom_name,
-        "camera_names": list(args.camera_names),
+        "camera_names": schedule_camera_names,
         "episode_fps": float(episode_fps),
         "keyframes_per_sec_min": int(args.keyframes_per_sec_min),
         "keyframes_per_sec_max": int(args.keyframes_per_sec_max),

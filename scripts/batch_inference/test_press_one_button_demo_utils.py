@@ -33,8 +33,16 @@ find_valid_episodes = _FIND_VALID_EPISODES_NAMESPACE["find_valid_episodes"]
 _PARSE_ARGS_FUNC_AST = next(
     node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "parse_args"
 )
+_PARSE_CAMERA_NAMES_AST = next(
+    node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "parse_camera_names"
+)
 _PARSE_CAMERA_INT_OVERRIDES_AST = next(
     node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "parse_camera_int_overrides"
+)
+_RESOLVE_SCHEDULE_CAMERA_NAMES_AST = next(
+    node
+    for node in _SOURCE_AST.body
+    if isinstance(node, ast.FunctionDef) and node.name == "resolve_schedule_camera_names"
 )
 _RESOLVE_CAMERA_NUM_ITERS_AST = next(
     node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "resolve_camera_num_iters"
@@ -88,6 +96,8 @@ build_batch_run_summary = _TELEMETRY_GLOBALS["build_batch_run_summary"]
 
 _CAMERA_ARGS_MODULE = ast.Module(
     body=[
+        _PARSE_CAMERA_NAMES_AST,
+        _RESOLVE_SCHEDULE_CAMERA_NAMES_AST,
         _PARSE_CAMERA_INT_OVERRIDES_AST,
         _RESOLVE_FUNC_AST,
         _RESOLVE_CAMERA_NUM_ITERS_AST,
@@ -102,6 +112,7 @@ _CAMERA_ARGS_GLOBALS = {
 }
 exec(compile(_CAMERA_ARGS_MODULE, str(_SOURCE_PATH), "exec"), _CAMERA_ARGS_GLOBALS)
 parse_camera_int_overrides = _CAMERA_ARGS_GLOBALS["parse_camera_int_overrides"]
+resolve_schedule_camera_names = _CAMERA_ARGS_GLOBALS["resolve_schedule_camera_names"]
 resolve_camera_num_iters = _CAMERA_ARGS_GLOBALS["resolve_camera_num_iters"]
 build_camera_args = _CAMERA_ARGS_GLOBALS["build_camera_args"]
 
@@ -287,6 +298,7 @@ class PressOneButtonCliSurfaceTests(unittest.TestCase):
         self.assertIn("--hardware_telemetry_interval_sec", _CLI_FLAGS)
         self.assertIn("--depth_filter_workers", _CLI_FLAGS)
         self.assertIn("--camera_num_iters", _CLI_FLAGS)
+        self.assertIn("--shared_schedule_camera_names", _CLI_FLAGS)
 
     def test_num_iters_default_is_five(self):
         self.assertEqual(_CLI_DEFAULTS.get("--num_iters"), 5)
@@ -300,6 +312,23 @@ class PressOneButtonCliSurfaceTests(unittest.TestCase):
 
 
 class CameraNumItersOverrideTests(unittest.TestCase):
+    def test_resolve_schedule_camera_names_defaults_to_task_cameras(self):
+        resolved = resolve_schedule_camera_names(
+            ["varied_camera_3"],
+            None,
+        )
+        self.assertEqual(resolved, ["varied_camera_3"])
+
+    def test_resolve_schedule_camera_names_accepts_explicit_override(self):
+        resolved = resolve_schedule_camera_names(
+            ["varied_camera_3"],
+            "varied_camera_1,varied_camera_2,varied_camera_3",
+        )
+        self.assertEqual(
+            resolved,
+            ["varied_camera_1", "varied_camera_2", "varied_camera_3"],
+        )
+
     def test_parse_camera_int_overrides_accepts_sparse_subset(self):
         overrides = parse_camera_int_overrides(
             "varied_camera_1:4,varied_camera_3:5",
@@ -455,6 +484,7 @@ class BatchTelemetryRecordTests(unittest.TestCase):
             (),
             {
                 "camera_names": ["varied_camera_1", "varied_camera_3"],
+                "shared_schedule_camera_names": ["varied_camera_1", "varied_camera_2", "varied_camera_3"],
                 "workers_per_gpu": 4,
                 "collect_profile_stats": True,
                 "hardware_telemetry_interval_sec": 30.0,
@@ -493,6 +523,10 @@ class BatchTelemetryRecordTests(unittest.TestCase):
         )
 
         self.assertEqual(summary["camera_names"], ["varied_camera_1", "varied_camera_3"])
+        self.assertEqual(
+            summary["shared_schedule_camera_names"],
+            ["varied_camera_1", "varied_camera_2", "varied_camera_3"],
+        )
         self.assertEqual(summary["gpu_ids"], [0, 1, 2, 3])
         self.assertEqual(summary["telemetry_gpu_ids"], [0, 1, 2, 3])
         self.assertEqual(summary["host_name"], "worker-host")

@@ -165,6 +165,7 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 - `infer.py` still applies the same short-tail filter again when consuming either a shared schedule or the uniform-grid fallback, so stale manifests cannot reintroduce these frames
 - For retained tail samples with `segment_len < future_len`, `v2` output pads the saved time axis to `future_len` with `inf` and marks the valid prefix via `valid_steps`
 - Shared schedule manifests are written to `<episode_output>/_shared/query_frame_schedule_v3_<hash>.json`
+- When the same episode is split across multiple batch submissions, pass the same `--shared_schedule_camera_names` set to each submission to force identical query-frame schedules
 - `infer.py` consumes raw source-frame indices from the manifest, then maps them to the current local frame indices after stride/cap filtering
 
 **Multi-GPU Processing**:
