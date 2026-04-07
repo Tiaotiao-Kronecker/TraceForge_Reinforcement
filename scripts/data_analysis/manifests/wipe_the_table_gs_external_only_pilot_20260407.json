@@ -1,0 +1,6 @@
+{
+  "dataset_root": "/DATA/disk1/zoyo/mcap/wipe_the_table_gs",
+  "episodes": [
+    "00000"
+  ]
+}

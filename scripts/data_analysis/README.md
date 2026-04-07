@@ -19,6 +19,7 @@
 - `benchmark_num_iters_manifest.py`
   - 用 manifest 批量运行 `benchmark_num_iters_sweep.py`，适合维护固定测试基线 case 集
   - 当前提供 `manifests/press_one_button_demo_v5_pilot.json` 和 `manifests/press_one_button_demo_v5_median3.json`
+  - 也提供 `manifests/wipe_the_table_gs_external_only_pilot_20260407.json` 和 `manifests/wipe_the_table_gs_external_only_median3_20260407.json`
   - 汇总 per-episode runtime、跨 episode 聚合 runtime、以及 `prepare_depth_filter_points_to_normals_seconds` 为主的波动统计
 - `benchmark_wrist_filter_ablations.py`
   - 复用同一次 tracking 结果，对 wrist 过滤变体做 save-only 消融 benchmark
@@ -41,6 +42,10 @@
 
 ## 推荐入口
 
+- `wipe_the_table_gs` external-only pilot sweep：
+  - `python scripts/data_analysis/benchmark_num_iters_manifest.py --manifest scripts/data_analysis/manifests/wipe_the_table_gs_external_only_pilot_20260407.json --camera-names varied_camera_1,varied_camera_2 --num-iters-values 5,4,3 --baseline-num-iters 5 --support-grid-ratio 0 --warmup-runs 1 --benchmark-runs 1 --run-visual-verification`
+- `wipe_the_table_gs` external-only median3 baseline telemetry：
+  - `python scripts/data_analysis/benchmark_num_iters_manifest.py --manifest scripts/data_analysis/manifests/wipe_the_table_gs_external_only_median3_20260407.json --camera-names varied_camera_1,varied_camera_2 --num-iters-values 5 --baseline-num-iters 5 --support-grid-ratio 0 --warmup-runs 1 --benchmark-runs 3`
 - `press_one_button_demo_v5` pilot baseline + `num_iters=5,4,3,2,1`：
   - `python scripts/data_analysis/benchmark_num_iters_manifest.py --manifest scripts/data_analysis/manifests/press_one_button_demo_v5_pilot.json --camera-names varied_camera_1,varied_camera_2 --num-iters-values 5,4,3,2,1 --baseline-num-iters 5 --support-grid-ratio 0 --warmup-runs 1 --benchmark-runs 1 --run-visual-verification`
 - `press_one_button_demo_v5` median3 volatility scan：
