@@ -111,6 +111,7 @@ _CAMERA_ARGS_GLOBALS = {
     "copy": __import__("copy"),
 }
 exec(compile(_CAMERA_ARGS_MODULE, str(_SOURCE_PATH), "exec"), _CAMERA_ARGS_GLOBALS)
+parse_camera_names = _CAMERA_ARGS_GLOBALS["parse_camera_names"]
 parse_camera_int_overrides = _CAMERA_ARGS_GLOBALS["parse_camera_int_overrides"]
 resolve_schedule_camera_names = _CAMERA_ARGS_GLOBALS["resolve_schedule_camera_names"]
 resolve_camera_num_iters = _CAMERA_ARGS_GLOBALS["resolve_camera_num_iters"]
@@ -300,9 +301,12 @@ class PressOneButtonCliSurfaceTests(unittest.TestCase):
         self.assertIn("--camera_num_iters", _CLI_FLAGS)
         self.assertIn("--shared_schedule_camera_names", _CLI_FLAGS)
 
-    def test_num_iters_default_is_five(self):
-        self.assertEqual(_CLI_DEFAULTS.get("--num_iters"), 5)
+    def test_num_iters_default_is_three(self):
+        self.assertEqual(_CLI_DEFAULTS.get("--num_iters"), 3)
         self.assertIsNone(_CLI_DEFAULTS.get("--camera_num_iters"))
+
+    def test_camera_names_has_no_hardcoded_default(self):
+        self.assertIsNone(_CLI_DEFAULTS.get("--camera_names"))
 
     def test_traj_filter_profile_default_is_external(self):
         self.assertEqual(_CLI_DEFAULTS.get("--traj_filter_profile"), "external")
@@ -315,6 +319,12 @@ class PressOneButtonCliSurfaceTests(unittest.TestCase):
 
 
 class CameraNumItersOverrideTests(unittest.TestCase):
+    def test_parse_camera_names_requires_explicit_value(self):
+        with self.assertRaises(ValueError):
+            parse_camera_names(None, option_name="--camera_names")
+        with self.assertRaises(ValueError):
+            parse_camera_names("", option_name="--camera_names")
+
     def test_resolve_schedule_camera_names_defaults_to_task_cameras(self):
         resolved = resolve_schedule_camera_names(
             ["varied_camera_3"],

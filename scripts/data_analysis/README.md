@@ -42,6 +42,7 @@
 
 ## 推荐入口
 
+- 所有 benchmark 入口现在都要求显式传入 `--camera-names`，并且只会处理这些相机名；下面命令里的 `varied_camera_1,varied_camera_2` 只是当前数据集示例
 - `wipe_the_table_gs` external-only pilot sweep：
   - `python scripts/data_analysis/benchmark_num_iters_manifest.py --manifest scripts/data_analysis/manifests/wipe_the_table_gs_external_only_pilot_20260407.json --camera-names varied_camera_1,varied_camera_2 --num-iters-values 5,4,3 --baseline-num-iters 5 --support-grid-ratio 0 --warmup-runs 1 --benchmark-runs 1 --run-visual-verification`
 - `wipe_the_table_gs` external-only median3 baseline telemetry：

@@ -57,7 +57,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--baseline-root", type=Path, required=True)
     parser.add_argument("--variant-root", type=Path, required=True)
-    parser.add_argument("--camera-names", type=str, default="varied_camera_1,varied_camera_2")
+    parser.add_argument(
+        "--camera-names",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated camera names. Required. Only these cameras are compared "
+            "across the two output roots."
+        ),
+    )
     parser.add_argument("--baseline-label", type=str, default="iters_6")
     parser.add_argument("--variant-label", type=str, default="iters_5")
     parser.add_argument("--baseline-num-iters", type=int, default=6)
@@ -71,10 +79,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def parse_camera_names(raw: str) -> list[str]:
-    values = [item.strip() for item in raw.split(",") if item.strip()]
+def parse_camera_names(
+    raw: str | None,
+    *,
+    option_name: str = "--camera-names",
+) -> list[str]:
+    if raw is None:
+        raise ValueError(f"{option_name} is required and must contain at least one value")
+    values = [item.strip() for item in str(raw).split(",") if item.strip()]
     if not values:
-        raise ValueError("camera_names must contain at least one value")
+        raise ValueError(f"{option_name} must contain at least one value")
     return values
 
 

@@ -21,7 +21,6 @@ import numpy as np
 
 CURRENT_REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BASELINE_REF = "8f9060d"
-DEFAULT_CAMERAS = ("varied_camera_1", "varied_camera_2")
 QUERY_FRAME_SCHEDULE_VERSION = 1
 QUERY_FRAME_SHARED_DIRNAME = "_shared"
 RESULT_JSON_BASENAME = "benchmark_results.json"
@@ -38,7 +37,7 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark the depth-volatility optimization on two maintained external "
+            "Benchmark the depth-volatility optimization on user-specified external "
             "cameras, and compare the current repo against a baseline ref."
         )
     )
@@ -56,8 +55,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--camera-names",
         type=str,
-        default=",".join(DEFAULT_CAMERAS),
-        help="Comma-separated camera names. Defaults to two maintained external cameras.",
+        default=None,
+        help=(
+            "Comma-separated camera names. Required in orchestrator mode. Only these "
+            "cameras are scheduled, benchmarked, and compared."
+        ),
     )
     parser.add_argument(
         "--traj-filter-profile",
@@ -196,10 +198,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def parse_camera_names(camera_names: str) -> list[str]:
-    values = [item.strip() for item in camera_names.split(",") if item.strip()]
+def parse_camera_names(
+    camera_names: str | None,
+    *,
+    option_name: str = "--camera-names",
+) -> list[str]:
+    if camera_names is None:
+        raise ValueError(f"{option_name} is required and must contain at least one camera name")
+    values = [item.strip() for item in str(camera_names).split(",") if item.strip()]
     if not values:
-        raise ValueError("camera_names must contain at least one camera name")
+        raise ValueError(f"{option_name} must contain at least one camera name")
     return values
 
 

@@ -68,6 +68,7 @@ schedule manifest 的 direct `infer.py` 路径里参与 query-frame 采样。
 ```bash
 python scripts/batch_inference/batch_infer_press_one_button_demo.py \
   --base_path <dataset_root> \
+  --camera_names <camera_a,camera_b,...> \
   --keyframes_per_sec_min 2 \
   --keyframes_per_sec_max 3 \
   --skip_existing
@@ -83,6 +84,7 @@ the same per-episode camera outputs are written under
 ```bash
 python scripts/batch_inference/batch_infer_press_one_button_demo.py \
   --base_path <dataset_root> \
+  --camera_names <camera_a,camera_b,...> \
   --gpu_id 0,1,2,3 \
   --min_free_gpu_mem_gb 40 \
   --gpu_recovery_poll_sec 60 \
@@ -105,9 +107,11 @@ video segment, it is still dropped before schedule sampling. For the retained
 tail samples that still end before `future_len`, the maintained `v2` writer
 pads the time axis to `future_len` with `inf` and marks the valid prefix via
 `valid_steps` / `segment_frame_indices`.
-Its maintained defaults already cover `camera_names=varied_camera_1,2`,
-`depth_pose_method=external`, `external_geom_name=trajectory_valid.h5`,
-`fps=1`, `max_num_frames=512`, `future_len=32`, `num_iters=5`, `grid_size=80`,
+Batch and benchmark entrypoints no longer hardcode maintained camera names:
+pass `--camera_names` / `--camera-names` explicitly, and only those cameras are
+inferred or benchmarked. Other maintained defaults still cover
+`depth_pose_method=external`, `external_geom_name=trajectory_valid.h5`, `fps=1`,
+`max_num_frames=512`, `future_len=32`, `num_iters=3`, `grid_size=80`,
 `filter_level=standard`, and `traj_filter_profile=external`.
 `traj_filter_profile=auto` is retained as a compatibility alias and currently
 resolves to `external`. Wrist-oriented profiles remain available only when

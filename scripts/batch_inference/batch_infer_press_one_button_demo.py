@@ -8,13 +8,11 @@ Press-one-button demo 数据集批量推理脚本。
             lang.txt
             trajectory_valid.h5
             rgb/
-                varied_camera_1/*.png
-                varied_camera_2/*.png
-                varied_camera_3/*.png
+                <camera_name_a>/*.png
+                <camera_name_b>/*.png
             depth/
-                varied_camera_1/*.npy
-                varied_camera_2/*.npy
-                varied_camera_3/*.npy
+                <camera_name_a>/*.npy
+                <camera_name_b>/*.npy
 
 脚本设计参考：
 1. external-only TraceForge 推理与保存逻辑；
@@ -72,11 +70,6 @@ from utils.keyframe_schedule_utils import (
 )
 from utils.traceforge_artifact_utils import is_traceforge_output_complete
 
-
-DEFAULT_CAMERAS = [
-    "varied_camera_1",
-    "varied_camera_2",
-]
 
 _CUDA_LINALG_WARMUP_LOCK = threading.Lock()
 _CUDA_LINALG_WARMED_DEVICES: set[str] = set()
@@ -197,10 +190,16 @@ class BatchTelemetryWriter:
             _atomic_write_json(self.summary_path, payload)
 
 
-def parse_camera_names(camera_names: str) -> list[str]:
-    values = [item.strip() for item in camera_names.split(",") if item.strip()]
+def parse_camera_names(
+    camera_names: str | None,
+    *,
+    option_name: str = "--camera_names",
+) -> list[str]:
+    if camera_names is None:
+        raise ValueError(f"{option_name} is required and must contain at least one camera name")
+    values = [item.strip() for item in str(camera_names).split(",") if item.strip()]
     if not values:
-        raise ValueError("camera_names must contain at least one camera name")
+        raise ValueError(f"{option_name} must contain at least one camera name")
     return values
 
 
@@ -211,7 +210,10 @@ def resolve_schedule_camera_names(
     if shared_schedule_camera_names is None:
         return list(camera_names)
     if isinstance(shared_schedule_camera_names, str):
-        return parse_camera_names(shared_schedule_camera_names)
+        return parse_camera_names(
+            shared_schedule_camera_names,
+            option_name="--shared_schedule_camera_names",
+        )
     values = [str(item).strip() for item in shared_schedule_camera_names if str(item).strip()]
     if not values:
         raise ValueError("shared_schedule_camera_names must contain at least one camera name")
@@ -540,8 +542,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--camera_names",
         type=str,
-        default=",".join(DEFAULT_CAMERAS),
-        help="Comma-separated camera names to process",
+        default=None,
+        help=(
+            "Comma-separated camera names to process. Required. Only the cameras listed "
+            "here are inferred and saved."
+        ),
     )
     parser.add_argument(
         "--shared_schedule_camera_names",
@@ -550,7 +555,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional comma-separated camera names used only for building the shared "
             "query-frame schedule. Use this to keep query frames aligned across split "
-            "batch submissions."
+            "batch submissions without changing which cameras are actually inferred."
         ),
     )
     parser.add_argument(
@@ -616,14 +621,14 @@ def parse_args() -> argparse.Namespace:
         default="cuda",
         help="Single-GPU execution device. In --gpu_id mode each worker binds its own CUDA device automatically.",
     )
-    parser.add_argument("--num_iters", type=int, default=5)
+    parser.add_argument("--num_iters", type=int, default=3)
     parser.add_argument(
         "--camera_num_iters",
         type=str,
         default=None,
         help=(
             "Optional comma-separated camera:num_iters overrides, for example "
-            "varied_camera_1:4,varied_camera_2:4."
+            "varied_camera_1:3,varied_camera_2:3."
         ),
     )
     parser.add_argument("--fps", type=int, default=1)
@@ -795,7 +800,10 @@ def parse_args() -> argparse.Namespace:
         help="Depth change std threshold in meters (overrides filter_level default)",
     )
     args = parser.parse_args()
-    args.camera_names = parse_camera_names(args.camera_names)
+    args.camera_names = parse_camera_names(
+        args.camera_names,
+        option_name="--camera_names",
+    )
     args.shared_schedule_camera_names = resolve_schedule_camera_names(
         args.camera_names,
         args.shared_schedule_camera_names,

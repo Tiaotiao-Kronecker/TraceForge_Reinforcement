@@ -62,8 +62,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--camera-names",
         type=str,
-        default="varied_camera_1,varied_camera_2",
-        help="Comma-separated camera names. Defaults to two maintained external cameras.",
+        default=None,
+        help=(
+            "Comma-separated camera names. Required. Only these cameras are benchmarked "
+            "for every episode in the manifest."
+        ),
     )
     parser.add_argument(
         "--num-iters-values",

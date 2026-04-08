@@ -4,6 +4,8 @@ import numpy as np
 import cv2
 import mediapy as media
 import torch
+import contextlib
+import ctypes
 from PIL import Image
 import math
 import tqdm
@@ -14,6 +16,7 @@ from loguru import logger
 import json
 import sys
 import time
+import threading
 from pathlib import Path
 
 from utils.video_depth_pose_utils import DEFAULT_DEPTH_POSE_METHOD, video_depth_pose_dict
@@ -57,6 +60,10 @@ from utils.traj_filter_utils import (
     resolve_traj_filter_config,
 )
 from utils.keyframe_schedule_utils import map_query_source_indices_to_local
+try:
+    from threadpoolctl import threadpool_limits as _threadpool_limits
+except ImportError:
+    _threadpool_limits = None
 
 
 def _sync_device_if_needed(device: str | torch.device | None) -> None:
@@ -146,6 +153,149 @@ def _count_true(mask: np.ndarray | None) -> int:
 
 def _resolve_depth_filter_workers(args) -> int:
     return max(1, int(getattr(args, "depth_filter_workers", 8)))
+
+
+_NATIVE_THREAD_LIMIT_LOCK = threading.RLock()
+_NATIVE_THREAD_LIMITERS = None
+_NATIVE_THREAD_LIMIT_SYMBOLS = (
+    ("scipy_openblas_get_num_threads64_", "scipy_openblas_set_num_threads64_"),
+    ("scipy_openblas_get_num_threads_64_", "scipy_openblas_set_num_threads_64_"),
+    ("scipy_openblas_get_num_threads", "scipy_openblas_set_num_threads"),
+    ("scipy_openblas_get_num_threads_", "scipy_openblas_set_num_threads_"),
+    ("openblas_get_num_threads", "openblas_set_num_threads"),
+    ("goto_get_num_threads", "goto_set_num_threads"),
+    ("MKL_Get_Max_Threads", "MKL_Set_Num_Threads"),
+    ("omp_get_max_threads", "omp_set_num_threads"),
+)
+
+
+def _resolve_depth_filter_blas_threads(args) -> int | None:
+    configured_threads = int(getattr(args, "depth_filter_blas_threads", 1))
+    if configured_threads <= 0:
+        return None
+    return max(1, configured_threads)
+
+
+def _iter_loaded_native_thread_limiter_library_paths() -> list[str]:
+    maps_path = "/proc/self/maps"
+    if not os.path.isfile(maps_path):
+        return []
+
+    library_paths: list[str] = []
+    seen_paths: set[str] = set()
+    try:
+        with open(maps_path, "r", encoding="utf-8") as maps_handle:
+            for line in maps_handle:
+                fields = line.strip().split()
+                if not fields:
+                    continue
+                library_path = fields[-1]
+                if "/" not in library_path or ".so" not in library_path:
+                    continue
+                lowered_path = library_path.lower()
+                if not any(token in lowered_path for token in ("openblas", "mkl", "gomp", "iomp", "omp")):
+                    continue
+                if library_path in seen_paths:
+                    continue
+                seen_paths.add(library_path)
+                library_paths.append(library_path)
+    except OSError:
+        return []
+
+    return library_paths
+
+
+def _bind_native_thread_limiters(lib) -> list[tuple[object, object]]:
+    limiters: list[tuple[object, object]] = []
+    for getter_name, setter_name in _NATIVE_THREAD_LIMIT_SYMBOLS:
+        try:
+            get_threads = getattr(lib, getter_name)
+            set_threads = getattr(lib, setter_name)
+        except AttributeError:
+            continue
+        get_threads.argtypes = []
+        get_threads.restype = ctypes.c_int
+        set_threads.argtypes = [ctypes.c_int]
+        set_threads.restype = None
+        try:
+            if int(get_threads()) <= 0:
+                continue
+        except Exception:
+            continue
+        limiters.append((get_threads, set_threads))
+    return limiters
+
+
+def _discover_native_thread_limiters() -> list[tuple[object, object]]:
+    global _NATIVE_THREAD_LIMITERS
+    if _NATIVE_THREAD_LIMITERS is not None:
+        return _NATIVE_THREAD_LIMITERS
+
+    limiters: list[tuple[object, object]] = []
+    seen_symbols: set[tuple[int | None, int | None]] = set()
+    library_handles: list[object] = [ctypes.CDLL(None)]
+    for library_path in _iter_loaded_native_thread_limiter_library_paths():
+        try:
+            library_handles.append(ctypes.CDLL(library_path))
+        except OSError:
+            continue
+
+    for library_handle in library_handles:
+        for get_threads, set_threads in _bind_native_thread_limiters(library_handle):
+            symbol_key = (
+                ctypes.cast(get_threads, ctypes.c_void_p).value,
+                ctypes.cast(set_threads, ctypes.c_void_p).value,
+            )
+            if symbol_key in seen_symbols:
+                continue
+            seen_symbols.add(symbol_key)
+            limiters.append((get_threads, set_threads))
+
+    _NATIVE_THREAD_LIMITERS = limiters
+    return limiters
+
+
+def _apply_native_thread_limiters(limiters, num_threads):
+    previous_limits = []
+    target_threads = int(num_threads)
+    for get_threads, set_threads in limiters:
+        previous_threads = int(get_threads())
+        if previous_threads == target_threads:
+            continue
+        previous_limits.append((set_threads, previous_threads))
+        set_threads(target_threads)
+    return previous_limits
+
+
+def _restore_native_thread_limiters(previous_limits) -> None:
+    for set_threads, previous_threads in reversed(previous_limits):
+        if int(previous_threads) <= 0:
+            continue
+        set_threads(int(previous_threads))
+
+
+@contextlib.contextmanager
+def _limit_depth_filter_native_threads(num_threads: int | None):
+    if num_threads is None or int(num_threads) <= 0:
+        yield False
+        return
+
+    with _NATIVE_THREAD_LIMIT_LOCK:
+        if _threadpool_limits is not None:
+            with _threadpool_limits(limits=int(num_threads)):
+                yield True
+            return
+
+        limiters = _discover_native_thread_limiters()
+        if not limiters:
+            yield False
+            return
+
+        previous_limits = _apply_native_thread_limiters(limiters, int(num_threads))
+        try:
+            yield True
+        finally:
+            _restore_native_thread_limiters(previous_limits)
 
 
 SHORT_TAIL_SKIP_MAX_SEGMENT_LEN = 8
@@ -453,10 +603,12 @@ class _DepthFilterRuntime:
         *,
         profile_stats: dict[str, float] | None,
         max_workers: int = 8,
+        native_thread_limit: int | None = 1,
     ) -> None:
         self._depths = depths
         self._intrinsics = intrinsics
         self._profile_stats = profile_stats
+        self._native_thread_limit = native_thread_limit
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._filtered_depth_cache: dict[int, np.ndarray] = {}
         self._remaining_use_counts = _build_tracking_frame_use_counts(
@@ -519,91 +671,96 @@ class _DepthFilterRuntime:
         frame_indices = range(start_frame, end_frame)
         futures: list[tuple[int, Future[tuple[np.ndarray, dict[str, float]]]]] = []
         depth_filter_start = time.perf_counter()
+        _set_profile_stat(
+            self._profile_stats,
+            "prepare_depth_filter_blas_threads",
+            float(0 if self._native_thread_limit is None else self._native_thread_limit),
+        )
+        with _limit_depth_filter_native_threads(self._native_thread_limit):
+            for frame_idx in frame_indices:
+                cached_depth = self._filtered_depth_cache.get(frame_idx)
+                if cached_depth is not None:
+                    _accumulate_profile_stat(
+                        self._profile_stats,
+                        "prepare_depth_filter_cache_hit_frames",
+                        1.0,
+                    )
+                    continue
 
-        for frame_idx in frame_indices:
-            cached_depth = self._filtered_depth_cache.get(frame_idx)
-            if cached_depth is not None:
                 _accumulate_profile_stat(
                     self._profile_stats,
-                    "prepare_depth_filter_cache_hit_frames",
+                    "prepare_depth_filter_cache_miss_frames",
                     1.0,
                 )
-                continue
+                depth = np.asarray(self._depths[frame_idx], dtype=np.float32)
+                intrinsics = np.asarray(self._intrinsics[frame_idx], dtype=np.float32)
+                rays = self._get_rays(depth, intrinsics)
+                futures.append(
+                    (
+                        frame_idx,
+                        self._executor.submit(
+                            _filter_one_depth_profiled,
+                            depth,
+                            0.08,
+                            15,
+                            intrinsics,
+                            rays,
+                        ),
+                    )
+                )
 
-            _accumulate_profile_stat(
-                self._profile_stats,
-                "prepare_depth_filter_cache_miss_frames",
-                1.0,
-            )
-            depth = np.asarray(self._depths[frame_idx], dtype=np.float32)
-            intrinsics = np.asarray(self._intrinsics[frame_idx], dtype=np.float32)
-            rays = self._get_rays(depth, intrinsics)
-            futures.append(
-                (
-                    frame_idx,
-                    self._executor.submit(
-                        _filter_one_depth_profiled,
-                        depth,
-                        0.08,
-                        15,
-                        intrinsics,
-                        rays,
-                    ),
-                )
-            )
-
-        if futures:
-            future_wait_seconds = 0.0
-            for frame_idx, future in futures:
-                future_wait_start = time.perf_counter()
-                filtered_depth, worker_profile = future.result()
-                future_wait_seconds += time.perf_counter() - future_wait_start
-                self._filtered_depth_cache[frame_idx] = filtered_depth
+            if futures:
+                future_wait_seconds = 0.0
+                for frame_idx, future in futures:
+                    future_wait_start = time.perf_counter()
+                    filtered_depth, worker_profile = future.result()
+                    future_wait_seconds += time.perf_counter() - future_wait_start
+                    self._filtered_depth_cache[frame_idx] = filtered_depth
+                    _accumulate_profile_stat(
+                        self._profile_stats,
+                        "prepare_depth_filter_unique_frame_count",
+                        1.0,
+                    )
+                    _accumulate_profile_stat(
+                        self._profile_stats,
+                        "prepare_depth_filter_worker_total_seconds",
+                        float(worker_profile.get("total_seconds", 0.0)),
+                    )
+                    _accumulate_profile_stat(
+                        self._profile_stats,
+                        "prepare_depth_filter_ray_scale_seconds",
+                        float(worker_profile.get("ray_scale_seconds", 0.0)),
+                    )
+                    _accumulate_profile_stat(
+                        self._profile_stats,
+                        "prepare_depth_filter_points_to_normals_seconds",
+                        float(worker_profile.get("points_to_normals_seconds", 0.0)),
+                    )
+                    _accumulate_profile_stat(
+                        self._profile_stats,
+                        "prepare_depth_filter_edge_mask_seconds",
+                        float(worker_profile.get("edge_mask_seconds", 0.0)),
+                    )
+                    _accumulate_profile_stat(
+                        self._profile_stats,
+                        "prepare_depth_filter_distance_transform_seconds",
+                        float(worker_profile.get("distance_transform_seconds", 0.0)),
+                    )
+                    _accumulate_profile_stat(
+                        self._profile_stats,
+                        "prepare_depth_filter_fill_seconds",
+                        float(worker_profile.get("fill_seconds", 0.0)),
+                    )
                 _accumulate_profile_stat(
                     self._profile_stats,
-                    "prepare_depth_filter_unique_frame_count",
-                    1.0,
-                )
-                _accumulate_profile_stat(
-                    self._profile_stats,
-                    "prepare_depth_filter_worker_total_seconds",
-                    float(worker_profile.get("total_seconds", 0.0)),
-                )
-                _accumulate_profile_stat(
-                    self._profile_stats,
-                    "prepare_depth_filter_ray_scale_seconds",
-                    float(worker_profile.get("ray_scale_seconds", 0.0)),
-                )
-                _accumulate_profile_stat(
-                    self._profile_stats,
-                    "prepare_depth_filter_points_to_normals_seconds",
-                    float(worker_profile.get("points_to_normals_seconds", 0.0)),
-                )
-                _accumulate_profile_stat(
-                    self._profile_stats,
-                    "prepare_depth_filter_edge_mask_seconds",
-                    float(worker_profile.get("edge_mask_seconds", 0.0)),
+                    "prepare_depth_filter_future_wait_seconds",
+                    future_wait_seconds,
                 )
                 _accumulate_profile_stat(
                     self._profile_stats,
-                    "prepare_depth_filter_distance_transform_seconds",
-                    float(worker_profile.get("distance_transform_seconds", 0.0)),
+                    "prepare_depth_filter_seconds",
+                    time.perf_counter() - depth_filter_start,
                 )
-                _accumulate_profile_stat(
-                    self._profile_stats,
-                    "prepare_depth_filter_fill_seconds",
-                    float(worker_profile.get("fill_seconds", 0.0)),
-                )
-            _accumulate_profile_stat(
-                self._profile_stats,
-                "prepare_depth_filter_future_wait_seconds",
-                future_wait_seconds,
-            )
-            _accumulate_profile_stat(
-                self._profile_stats,
-                "prepare_depth_filter_seconds",
-                time.perf_counter() - depth_filter_start,
-            )
 
         stack_start = time.perf_counter()
         filtered_segment = np.stack(
@@ -682,7 +839,7 @@ def parse_args():
         help="Optional JSON manifest that stores shared raw source-frame query indices.",
     )
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--num_iters", type=int, default=5)
+    parser.add_argument("--num_iters", type=int, default=3)
     parser.add_argument(
         "--collect_profile_stats",
         action="store_true",
@@ -812,6 +969,15 @@ def parse_args():
         help="Thread count for filtered-depth precomputation inside _DepthFilterRuntime.",
     )
     parser.add_argument(
+        "--depth_filter_blas_threads",
+        type=int,
+        default=1,
+        help=(
+            "Best-effort native BLAS/OpenMP thread cap during filtered-depth precomputation. "
+            "Set 0 to keep the library defaults."
+        ),
+    )
+    parser.add_argument(
         "--filter_level",
         type=str,
         default="standard",
@@ -916,6 +1082,8 @@ def parse_args():
         parser.error("--support_grid_ratio must be >= 0.")
     if args.depth_filter_workers <= 0:
         parser.error("--depth_filter_workers must be >= 1.")
+    if args.depth_filter_blas_threads < 0:
+        parser.error("--depth_filter_blas_threads must be >= 0.")
     return args
 
 def retarget_trajectories(
@@ -2887,6 +3055,7 @@ def run_single_query_frame(
         [(start_frame, end_frame)],
         profile_stats=profile_stats,
         max_workers=_resolve_depth_filter_workers(args),
+        native_thread_limit=_resolve_depth_filter_blas_threads(args),
     ) as depth_filter_runtime:
         query_frame_result = _run_query_frame_core(
             scene_ctx=scene_ctx,
@@ -3183,6 +3352,7 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
         tracking_segments,
         profile_stats=profile_stats,
         max_workers=_resolve_depth_filter_workers(args),
+        native_thread_limit=_resolve_depth_filter_blas_threads(args),
     ) as depth_filter_runtime:
         for start_frame, _end_frame in tracking_segments:
             query_frame_results[int(start_frame)] = _run_query_frame_core(
@@ -3357,6 +3527,7 @@ def _collect_and_sort_frame_files(video_path, extensions):
 
 
 def load_video_and_mask(video_path, mask_dir=None, fps=1, max_num_frames=512, is_depth=False):
+    video_path = os.fspath(video_path)
     original_filenames = []
     source_frame_indices: list[int] = []
 
@@ -3364,6 +3535,10 @@ def load_video_and_mask(video_path, mask_dir=None, fps=1, max_num_frames=512, is
         # RGB 支持 jpg/jpeg/png；深度图通常为 png，统一用同一排序逻辑保证与 RGB 逐帧对齐
         exts = ["jpg", "jpeg", "png"] if not is_depth else ["npy", "png", "jpg", "jpeg"]
         img_files = _collect_and_sort_frame_files(video_path, exts)
+        if not img_files:
+            raise FileNotFoundError(
+                f"No frame files found under directory: {video_path}"
+            )
 
         # IMPORTANT: Subsample the file list BEFORE loading to save memory
         indexed_img_files = list(enumerate(img_files))
@@ -3414,6 +3589,8 @@ def load_video_and_mask(video_path, mask_dir=None, fps=1, max_num_frames=512, is
             video_tensor = video_tensor[:max_num_frames]
             original_filenames = original_filenames[:max_num_frames]
             source_frame_indices = source_frame_indices[:max_num_frames]
+    else:
+        raise FileNotFoundError(f"Unsupported or missing video/depth path: {video_path}")
 
     if not is_depth:
         video_tensor = video_tensor.permute(

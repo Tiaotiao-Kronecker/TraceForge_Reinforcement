@@ -865,7 +865,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--camera_names",
         type=str,
-        default=",".join(batch_infer.DEFAULT_CAMERAS),
+        default=None,
+        help=(
+            "Comma-separated camera names to repair. Required. Only these camera outputs "
+            "are scanned and repaired."
+        ),
     )
     parser.add_argument("--episode_name", type=str, default=None)
     parser.add_argument("--episode_names_file", type=str, default=None)
@@ -881,7 +885,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--external_geom_name", type=str, default="trajectory_valid.h5")
     parser.add_argument("--external_extr_mode", type=str, default="w2c", choices=["w2c", "c2w"])
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--num_iters", type=int, default=5)
+    parser.add_argument("--num_iters", type=int, default=3)
     parser.add_argument("--fps", type=int, default=1)
     parser.add_argument("--max_num_frames", type=int, default=512)
     parser.add_argument("--save_video", action="store_true", default=False)
@@ -935,7 +939,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--boundary_margin", type=int, default=None)
     parser.add_argument("--depth_change_threshold", type=float, default=None)
     args = parser.parse_args()
-    args.camera_names = batch_infer.parse_camera_names(args.camera_names)
+    args.camera_names = batch_infer.parse_camera_names(
+        args.camera_names,
+        option_name="--camera_names",
+    )
     if args.workers_per_gpu <= 0:
         raise ValueError("--workers_per_gpu must be >= 1")
     return args

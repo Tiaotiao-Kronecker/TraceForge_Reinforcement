@@ -73,6 +73,7 @@ python scripts/batch_inference/infer.py \
 ```bash
 python scripts/batch_inference/batch_infer_press_one_button_demo.py \
   --base_path <dataset_root> \
+  --camera_names <camera_a,camera_b,...> \
   --gpu_id 0,1,2,3 \
   --min_free_gpu_mem_gb 40 \
   --gpu_recovery_poll_sec 60 \
@@ -93,9 +94,10 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
 - button/sim episode 数据集
 - dynamic-only 多 GPU 常驻 worker 调度
 - 每个 episode 提供外部深度和 `trajectory_valid.h5`
-- 维护态默认值已经覆盖 `camera_names=varied_camera_1,2`、`depth_pose_method=external`、
-  `external_geom_name=trajectory_valid.h5`、`fps=1`、`max_num_frames=512`、
-  `future_len=32`、`grid_size=80`、`filter_level=standard`、`traj_filter_profile=external`
+- 必须显式传入 `--camera_names`；脚本只会推理这里列出的相机名，不再假设 `varied_camera_*`
+- 其他维护态默认值仍覆盖 `depth_pose_method=external`、`external_geom_name=trajectory_valid.h5`、
+  `fps=1`、`max_num_frames=512`、`future_len=32`、`grid_size=80`、
+  `filter_level=standard`、`traj_filter_profile=external`
 - `--collect_profile_stats` 会把每个 camera task 的 `profile_stats` / `save_profile_stats`
   额外落到 `_camera_task_profiles.jsonl`
 - `--hardware_telemetry_interval_sec > 0` 会周期记录 GPU/CPU/IO 指标到 `_hardware_telemetry.jsonl`
@@ -109,6 +111,7 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
 ```bash
 python scripts/batch_inference/batch_infer_press_one_button_demo.py \
   --base_path <dataset_root> \
+  --camera_names <camera_a,camera_b,...> \
   --keyframes_per_sec_min 2 \
   --keyframes_per_sec_max 3 \
   --skip_existing
@@ -118,7 +121,7 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
 
 - `batch_infer_press_one_button_demo.py` 会为每个 episode 生成一份共享 schedule：
   `<episode_output>/_shared/query_frame_schedule_v3_<hash>.json`
-- 三个相机都会消费同一份 schedule，因此 query frame 的 raw 帧序号天然对齐
+- 默认只有 `--camera_names` 里的相机会消费同一份 schedule；若需要跨批次固定更大的对齐集合，显式传 `--shared_schedule_camera_names`
 - schedule 里存的是 raw source frame index，`infer.py` 运行时再映射到当前
   `--fps` / `--max_num_frames` 对应的 local query frame
 - query frame 如果到加载后视频末尾的剩余帧数（含自身）`<= 8`，仍会在共享 schedule 采样前丢弃
