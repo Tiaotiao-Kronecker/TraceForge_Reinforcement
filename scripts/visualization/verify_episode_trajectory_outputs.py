@@ -21,8 +21,10 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import subprocess
 import sys
-from dataclasses import asdict, dataclass
+import tempfile
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import matplotlib
@@ -68,6 +70,15 @@ GIF_TRACK_SAMPLING_MODES = (
     GIF_TRACK_SAMPLING_TOP_MOTION,
     GIF_TRACK_SAMPLING_SPATIAL,
 )
+THREED_VIEW_PRESETS: dict[str, dict[str, float | str]] = {
+    "front": {"elev": 12.0, "azim": -90.0, "label": "front view"},
+    "side": {"elev": 12.0, "azim": 0.0, "label": "side view"},
+    "top": {"elev": 90.0, "azim": -90.0, "label": "top view"},
+    "iso": {"elev": 22.0, "azim": -58.0, "label": "isometric view"},
+}
+CAMERA_FIT_SCENE = "scene"
+CAMERA_FIT_TRAJECTORY = "trajectory"
+CAMERA_FIT_MODES = (CAMERA_FIT_SCENE, CAMERA_FIT_TRAJECTORY)
 
 
 @dataclass(frozen=True)
@@ -84,6 +95,8 @@ class CameraArtifact:
     gif_track_count: int
     gif_cloud_point_count: int
     animation_frame_count: int
+    multiview_3d_paths: dict[str, str] = field(default_factory=dict)
+    orbit_mp4_path: str | None = None
 
 
 def parse_csv_items(raw: str) -> list[str]:
@@ -104,6 +117,24 @@ def parse_query_frames(raw: str, num_cameras: int) -> list[int]:
             f"--query_frames length ({len(values)}) must match camera count ({num_cameras})."
         )
     return values
+
+
+def parse_view_presets(raw: str) -> list[str]:
+    presets = parse_csv_items(raw)
+    invalid = [name for name in presets if name not in THREED_VIEW_PRESETS]
+    if invalid:
+        raise ValueError(
+            f"Unsupported 3D view preset(s): {invalid}. "
+            f"Available presets: {sorted(THREED_VIEW_PRESETS)}"
+        )
+    return presets
+
+
+def parse_camera_fit_mode(raw: str) -> str:
+    mode = str(raw).strip().lower()
+    if mode not in CAMERA_FIT_MODES:
+        raise ValueError(f"Unsupported camera fit mode: {mode}. Available: {CAMERA_FIT_MODES}")
+    return mode
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -210,6 +241,65 @@ def build_parser() -> argparse.ArgumentParser:
         "--export_gifs",
         action="store_true",
         help="Also export per-camera 2D/3D GIFs. Disabled by default because 3D GIF generation is slow.",
+    )
+    parser.add_argument(
+        "--export_multiview_3d",
+        action="store_true",
+        help="Also export one 3D GIF per requested view preset (for example front/side/top).",
+    )
+    parser.add_argument(
+        "--multiview_presets",
+        type=str,
+        default="front,side,top",
+        help=f"Comma-separated 3D view presets. Available: {','.join(sorted(THREED_VIEW_PRESETS))}",
+    )
+    parser.add_argument(
+        "--export_orbit_mp4",
+        action="store_true",
+        help="Also export an orbiting 3D MP4 that rotates the camera while trajectories animate.",
+    )
+    parser.add_argument(
+        "--orbit_mp4_fps",
+        type=int,
+        default=10,
+        help="Orbit MP4 playback FPS.",
+    )
+    parser.add_argument(
+        "--orbit_mp4_dpi",
+        type=int,
+        default=110,
+        help="Raster DPI used for orbit MP4 frames.",
+    )
+    parser.add_argument(
+        "--orbit_elev",
+        type=float,
+        default=22.0,
+        help="Orbit MP4 elevation angle in degrees.",
+    )
+    parser.add_argument(
+        "--orbit_azim_start",
+        type=float,
+        default=-58.0,
+        help="Orbit MP4 starting azimuth angle in degrees.",
+    )
+    parser.add_argument(
+        "--orbit_revolutions",
+        type=float,
+        default=1.0,
+        help="Number of full horizontal revolutions across the whole MP4.",
+    )
+    parser.add_argument(
+        "--camera_fit_mode",
+        type=str,
+        default=CAMERA_FIT_SCENE,
+        choices=CAMERA_FIT_MODES,
+        help="3D camera framing mode: fit the whole scene or only the selected trajectories.",
+    )
+    parser.add_argument(
+        "--trajectory_fit_padding",
+        type=float,
+        default=1.35,
+        help="Extra radius multiplier when --camera_fit_mode=trajectory.",
     )
     parser.add_argument(
         "--render_mode",
@@ -470,6 +560,56 @@ def save_gif(output_path: Path, frames: list[Image.Image], fps: int) -> None:
     )
 
 
+def save_mp4(output_path: Path, frames: list[Image.Image], fps: int) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import imageio.v2 as imageio
+    except ImportError as exc:
+        if not frames:
+            raise RuntimeError("Cannot save empty MP4.")
+        with tempfile.TemporaryDirectory(prefix="traceforge_mp4_") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            for idx, frame in enumerate(frames):
+                frame_path = tmpdir_path / f"frame_{idx:05d}.png"
+                frame.convert("RGB").save(frame_path)
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-framerate",
+                str(max(fps, 1)),
+                "-i",
+                str(tmpdir_path / "frame_%05d.png"),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                str(output_path),
+            ]
+            try:
+                subprocess.run(cmd, check=True)
+            except FileNotFoundError as inner_exc:
+                raise ImportError(
+                    "Saving MP4 requires either imageio/imageio-ffmpeg or a system ffmpeg binary."
+                ) from inner_exc
+            except subprocess.CalledProcessError as inner_exc:
+                raise RuntimeError(f"ffmpeg failed while writing MP4: {inner_exc}") from inner_exc
+        return
+
+    with imageio.get_writer(
+        output_path,
+        fps=max(fps, 1),
+        codec="libx264",
+        quality=8,
+        pixelformat="yuv420p",
+        macro_block_size=1,
+        ffmpeg_log_level="error",
+    ) as writer:
+        for frame in frames:
+            writer.append_data(np.asarray(frame.convert("RGB"), dtype=np.uint8))
+
+
 def build_axis_limits(points: np.ndarray) -> tuple[np.ndarray, float]:
     finite = points[np.isfinite(points).all(axis=1)]
     if len(finite) == 0:
@@ -498,6 +638,30 @@ def sample_cloud_points(
     rng = np.random.default_rng(0)
     cloud_sel = rng.choice(len(cloud_points), max_cloud_points, replace=False)
     return cloud_points[cloud_sel], cloud_colors[cloud_sel]
+
+
+def get_view_preset(view_name: str) -> tuple[float, float, str]:
+    preset = THREED_VIEW_PRESETS[view_name]
+    return float(preset["elev"]), float(preset["azim"]), str(preset["label"])
+
+
+def resolve_3d_camera_bounds(
+    *,
+    cloud_points_plot: np.ndarray,
+    selected_traj_world: np.ndarray,
+    selected_traj_world_secondary: np.ndarray,
+    camera_fit_mode: str,
+    trajectory_fit_padding: float,
+) -> tuple[np.ndarray, float]:
+    traj_points = np.concatenate(
+        [selected_traj_world.reshape(-1, 3), selected_traj_world_secondary.reshape(-1, 3)],
+        axis=0,
+    )
+    if camera_fit_mode == CAMERA_FIT_TRAJECTORY:
+        center, radius = build_axis_limits(traj_points)
+        radius = max(float(radius) * max(float(trajectory_fit_padding), 1.0), 1e-3)
+        return center, radius
+    return build_axis_limits(np.concatenate([cloud_points_plot, traj_points], axis=0))
 
 
 def build_track_group_labels(
@@ -719,6 +883,54 @@ def _plot_3d_trajectories(
     return line_points
 
 
+def render_3d_frame(
+    *,
+    camera_name: str,
+    query_frame: int,
+    cloud_points_plot: np.ndarray,
+    cloud_colors_plot: np.ndarray,
+    selected_traj_world: np.ndarray,
+    selected_traj_world_secondary: np.ndarray,
+    track_colors: np.ndarray,
+    center: np.ndarray,
+    radius: float,
+    line_alpha: float,
+    line_width: float,
+    dpi: int,
+    elev: float,
+    azim: float,
+    title_suffix: str,
+    time_limit: int | None = None,
+) -> Image.Image:
+    fig = plt.figure(figsize=(8, 6), constrained_layout=True)
+    ax = fig.add_subplot(1, 1, 1, projection="3d")
+    ax.scatter(
+        cloud_points_plot[:, 0],
+        cloud_points_plot[:, 1],
+        cloud_points_plot[:, 2],
+        c=cloud_colors_plot,
+        s=0.4,
+        alpha=0.7,
+        linewidths=0.0,
+    )
+    _plot_3d_trajectories(
+        ax=ax,
+        traj_primary=selected_traj_world,
+        traj_secondary=selected_traj_world_secondary,
+        track_colors=track_colors,
+        line_alpha=line_alpha,
+        line_width=line_width,
+        time_limit=time_limit,
+    )
+    apply_axis_limits(ax, center, radius)
+    ax.set_title(f"{camera_name} | query frame {query_frame} | {title_suffix}")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_zlabel("z")
+    ax.view_init(elev=elev, azim=azim)
+    return figure_to_image(fig, dpi=dpi)
+
+
 def create_2d_gif(
     *,
     camera_name: str,
@@ -774,6 +986,8 @@ def create_3d_gif(
     line_width: float,
     gif_fps: int,
     gif_dpi: int,
+    camera_fit_mode: str,
+    trajectory_fit_padding: float,
 ) -> int:
     selected_traj_world = traj_world_primary[track_indices]
     selected_traj_world_secondary = traj_world_secondary[track_indices]
@@ -785,45 +999,170 @@ def create_3d_gif(
         max_cloud_points,
     )
 
-    traj_points = np.concatenate(
-        [selected_traj_world.reshape(-1, 3), selected_traj_world_secondary.reshape(-1, 3)],
-        axis=0,
-    )
-    center, radius = build_axis_limits(
-        np.concatenate([cloud_points_plot, traj_points], axis=0)
+    center, radius = resolve_3d_camera_bounds(
+        cloud_points_plot=cloud_points_plot,
+        selected_traj_world=selected_traj_world,
+        selected_traj_world_secondary=selected_traj_world_secondary,
+        camera_fit_mode=camera_fit_mode,
+        trajectory_fit_padding=trajectory_fit_padding,
     )
     frames: list[Image.Image] = []
 
     for t in range(num_frames):
-        fig = plt.figure(figsize=(8, 6), constrained_layout=True)
-        ax = fig.add_subplot(1, 1, 1, projection="3d")
-        ax.scatter(
-            cloud_points_plot[:, 0],
-            cloud_points_plot[:, 1],
-            cloud_points_plot[:, 2],
-            c=cloud_colors_plot,
-            s=0.4,
-            alpha=0.7,
-            linewidths=0.0,
+        frames.append(
+            render_3d_frame(
+                camera_name=camera_name,
+                query_frame=query_frame,
+                cloud_points_plot=cloud_points_plot,
+                cloud_colors_plot=cloud_colors_plot,
+                selected_traj_world=selected_traj_world,
+                selected_traj_world_secondary=selected_traj_world_secondary,
+                track_colors=track_colors,
+                center=center,
+                radius=radius,
+                line_alpha=line_alpha,
+                line_width=line_width,
+                dpi=gif_dpi,
+                elev=22.0,
+                azim=-58.0,
+                title_suffix=f"t={t} | world trajectories",
+                time_limit=t,
+            )
         )
-        _plot_3d_trajectories(
-            ax=ax,
-            traj_primary=selected_traj_world,
-            traj_secondary=selected_traj_world_secondary,
-            track_colors=track_colors,
-            line_alpha=line_alpha,
-            line_width=line_width,
-            time_limit=t,
-        )
-        apply_axis_limits(ax, center, radius)
-        ax.set_title(f"{camera_name} | query frame {query_frame} | t={t} | world trajectories")
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        ax.set_zlabel("z")
-        ax.view_init(elev=22, azim=-58)
-        frames.append(figure_to_image(fig, dpi=gif_dpi))
 
     save_gif(gif_path, frames, gif_fps)
+    return num_frames
+
+
+def create_3d_multiview_gifs(
+    *,
+    camera_name: str,
+    query_frame: int,
+    cloud_points: np.ndarray,
+    cloud_colors: np.ndarray,
+    traj_world_primary: np.ndarray,
+    traj_world_secondary: np.ndarray,
+    track_indices: np.ndarray,
+    output_dir: Path,
+    view_names: list[str],
+    max_cloud_points: int,
+    line_alpha: float,
+    line_width: float,
+    gif_fps: int,
+    gif_dpi: int,
+    camera_fit_mode: str,
+    trajectory_fit_padding: float,
+) -> dict[str, str]:
+    selected_traj_world = traj_world_primary[track_indices]
+    selected_traj_world_secondary = traj_world_secondary[track_indices]
+    track_colors = make_track_colors(len(track_indices))
+    num_frames = selected_traj_world.shape[1]
+    cloud_points_plot, cloud_colors_plot = sample_cloud_points(
+        cloud_points,
+        cloud_colors,
+        max_cloud_points,
+    )
+    center, radius = resolve_3d_camera_bounds(
+        cloud_points_plot=cloud_points_plot,
+        selected_traj_world=selected_traj_world,
+        selected_traj_world_secondary=selected_traj_world_secondary,
+        camera_fit_mode=camera_fit_mode,
+        trajectory_fit_padding=trajectory_fit_padding,
+    )
+
+    output_paths: dict[str, str] = {}
+    for view_name in view_names:
+        elev, azim, label = get_view_preset(view_name)
+        frames: list[Image.Image] = []
+        for t in range(num_frames):
+            frames.append(
+                render_3d_frame(
+                    camera_name=camera_name,
+                    query_frame=query_frame,
+                    cloud_points_plot=cloud_points_plot,
+                    cloud_colors_plot=cloud_colors_plot,
+                    selected_traj_world=selected_traj_world,
+                    selected_traj_world_secondary=selected_traj_world_secondary,
+                    track_colors=track_colors,
+                    center=center,
+                    radius=radius,
+                    line_alpha=line_alpha,
+                    line_width=line_width,
+                    dpi=gif_dpi,
+                    elev=elev,
+                    azim=azim,
+                    title_suffix=f"t={{t}} | {label}".format(t=t),
+                    time_limit=t,
+                )
+            )
+        gif_path = output_dir / f"{camera_name}_frame{query_frame:05d}_3d_{view_name}.gif"
+        save_gif(gif_path, frames, gif_fps)
+        output_paths[view_name] = str(gif_path)
+    return output_paths
+
+
+def create_3d_orbit_mp4(
+    *,
+    camera_name: str,
+    query_frame: int,
+    cloud_points: np.ndarray,
+    cloud_colors: np.ndarray,
+    traj_world_primary: np.ndarray,
+    traj_world_secondary: np.ndarray,
+    track_indices: np.ndarray,
+    output_path: Path,
+    max_cloud_points: int,
+    line_alpha: float,
+    line_width: float,
+    orbit_fps: int,
+    orbit_dpi: int,
+    orbit_elev: float,
+    orbit_azim_start: float,
+    orbit_revolutions: float,
+    camera_fit_mode: str,
+    trajectory_fit_padding: float,
+) -> int:
+    selected_traj_world = traj_world_primary[track_indices]
+    selected_traj_world_secondary = traj_world_secondary[track_indices]
+    track_colors = make_track_colors(len(track_indices))
+    num_frames = selected_traj_world.shape[1]
+    cloud_points_plot, cloud_colors_plot = sample_cloud_points(
+        cloud_points,
+        cloud_colors,
+        max_cloud_points,
+    )
+    center, radius = resolve_3d_camera_bounds(
+        cloud_points_plot=cloud_points_plot,
+        selected_traj_world=selected_traj_world,
+        selected_traj_world_secondary=selected_traj_world_secondary,
+        camera_fit_mode=camera_fit_mode,
+        trajectory_fit_padding=trajectory_fit_padding,
+    )
+    frames: list[Image.Image] = []
+    denom = max(num_frames - 1, 1)
+    for t in range(num_frames):
+        azim = orbit_azim_start + 360.0 * orbit_revolutions * (float(t) / float(denom))
+        frames.append(
+            render_3d_frame(
+                camera_name=camera_name,
+                query_frame=query_frame,
+                cloud_points_plot=cloud_points_plot,
+                cloud_colors_plot=cloud_colors_plot,
+                selected_traj_world=selected_traj_world,
+                selected_traj_world_secondary=selected_traj_world_secondary,
+                track_colors=track_colors,
+                center=center,
+                radius=radius,
+                line_alpha=line_alpha,
+                line_width=line_width,
+                dpi=orbit_dpi,
+                elev=orbit_elev,
+                azim=azim,
+                title_suffix=f"orbit | t={t}",
+                time_limit=t,
+            )
+        )
+    save_mp4(output_path, frames, orbit_fps)
     return num_frames
 
 
@@ -843,6 +1182,8 @@ def create_verification_figure(
     max_cloud_points: int,
     line_alpha: float,
     line_width: float,
+    camera_fit_mode: str,
+    trajectory_fit_padding: float,
 ) -> None:
     figure_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -883,7 +1224,7 @@ def create_verification_figure(
         alpha=0.8,
         linewidths=0.0,
     )
-    line_points = _plot_3d_trajectories(
+    _plot_3d_trajectories(
         ax=ax_3d,
         traj_primary=selected_traj_world,
         traj_secondary=selected_traj_world_secondary,
@@ -895,10 +1236,14 @@ def create_verification_figure(
     ax_3d.set_xlabel("x")
     ax_3d.set_ylabel("y")
     ax_3d.set_zlabel("z")
-    all_points = [cloud_points_plot]
-    for pts in line_points:
-        all_points.append(pts)
-    set_axes_equal(ax_3d, np.concatenate(all_points, axis=0))
+    center, radius = resolve_3d_camera_bounds(
+        cloud_points_plot=cloud_points_plot,
+        selected_traj_world=selected_traj_world,
+        selected_traj_world_secondary=selected_traj_world_secondary,
+        camera_fit_mode=camera_fit_mode,
+        trajectory_fit_padding=trajectory_fit_padding,
+    )
+    apply_axis_limits(ax_3d, center, radius)
     ax_3d.view_init(elev=22, azim=-58)
 
     fig.savefig(figure_path, dpi=180)
@@ -939,6 +1284,16 @@ def verify_camera(
     max_gif_tracks: int,
     max_gif_cloud_points: int,
     export_gifs: bool,
+    export_multiview_3d: bool,
+    multiview_presets: list[str],
+    export_orbit_mp4: bool,
+    orbit_mp4_fps: int,
+    orbit_mp4_dpi: int,
+    orbit_elev: float,
+    orbit_azim_start: float,
+    orbit_revolutions: float,
+    camera_fit_mode: str,
+    trajectory_fit_padding: float,
     render_mode: str,
     gif_track_sampling: str,
 ) -> CameraArtifact:
@@ -1040,9 +1395,13 @@ def verify_camera(
         max_cloud_points=max_cloud_points,
         line_alpha=line_alpha,
         line_width=line_width,
+        camera_fit_mode=camera_fit_mode,
+        trajectory_fit_padding=trajectory_fit_padding,
     )
     gif_2d_path_value: str | None = None
     gif_3d_path_value: str | None = None
+    multiview_3d_paths: dict[str, str] = {}
+    orbit_mp4_path_value: str | None = None
     gif_track_count = 0
     gif_cloud_point_count = 0
     frame_count_2d = 0
@@ -1060,6 +1419,8 @@ def verify_camera(
             line_width=line_width,
             gif_fps=gif_fps,
             gif_dpi=gif_dpi,
+            camera_fit_mode=camera_fit_mode,
+            trajectory_fit_padding=trajectory_fit_padding,
         )
         frame_count_3d = create_3d_gif(
             camera_name=camera_name,
@@ -1075,9 +1436,61 @@ def verify_camera(
             line_width=line_width,
             gif_fps=gif_fps,
             gif_dpi=gif_dpi,
+            camera_fit_mode=camera_fit_mode,
+            trajectory_fit_padding=trajectory_fit_padding,
         )
         gif_2d_path_value = str(gif_2d_path)
         gif_3d_path_value = str(gif_3d_path)
+        gif_track_count = int(len(gif_track_indices))
+        gif_cloud_point_count = gif_cloud_point_count_value
+    if export_multiview_3d:
+        multiview_3d_paths = create_3d_multiview_gifs(
+            camera_name=camera_name,
+            query_frame=query_frame,
+            cloud_points=cloud_points,
+            cloud_colors=cloud_colors,
+            traj_world_primary=traj_world,
+            traj_world_secondary=traj_world_secondary,
+            track_indices=gif_track_indices,
+            output_dir=camera_output_dir,
+            view_names=multiview_presets,
+            max_cloud_points=max_gif_cloud_points,
+            line_alpha=line_alpha,
+            line_width=line_width,
+            gif_fps=gif_fps,
+            gif_dpi=gif_dpi,
+            camera_fit_mode=camera_fit_mode,
+            trajectory_fit_padding=trajectory_fit_padding,
+        )
+        gif_track_count = int(len(gif_track_indices))
+        gif_cloud_point_count = gif_cloud_point_count_value
+        frame_count_3d = max(frame_count_3d, int(traj_world.shape[1]))
+    if export_orbit_mp4:
+        orbit_mp4_path = camera_output_dir / f"{camera_name}_frame{query_frame:05d}_3d_orbit.mp4"
+        frame_count_3d = max(
+            frame_count_3d,
+            create_3d_orbit_mp4(
+            camera_name=camera_name,
+            query_frame=query_frame,
+            cloud_points=cloud_points,
+            cloud_colors=cloud_colors,
+            traj_world_primary=traj_world,
+            traj_world_secondary=traj_world_secondary,
+            track_indices=gif_track_indices,
+            output_path=orbit_mp4_path,
+            max_cloud_points=max_gif_cloud_points,
+            line_alpha=line_alpha,
+            line_width=line_width,
+            orbit_fps=orbit_mp4_fps,
+            orbit_dpi=orbit_mp4_dpi,
+            orbit_elev=orbit_elev,
+            orbit_azim_start=orbit_azim_start,
+            orbit_revolutions=orbit_revolutions,
+            camera_fit_mode=camera_fit_mode,
+            trajectory_fit_padding=trajectory_fit_padding,
+            ),
+        )
+        orbit_mp4_path_value = str(orbit_mp4_path)
         gif_track_count = int(len(gif_track_indices))
         gif_cloud_point_count = gif_cloud_point_count_value
 
@@ -1093,7 +1506,9 @@ def verify_camera(
         visualized_track_count=int(len(track_indices)),
         gif_track_count=gif_track_count,
         gif_cloud_point_count=gif_cloud_point_count,
-        animation_frame_count=int(min(frame_count_2d, frame_count_3d)),
+        animation_frame_count=int(max(frame_count_2d, frame_count_3d)),
+        multiview_3d_paths=multiview_3d_paths,
+        orbit_mp4_path=orbit_mp4_path_value,
     )
 
 
@@ -1107,6 +1522,8 @@ def main() -> None:
 
     camera_names = parse_csv_items(args.camera_names)
     query_frames = parse_query_frames(args.query_frames, len(camera_names))
+    multiview_presets = parse_view_presets(args.multiview_presets)
+    camera_fit_mode = parse_camera_fit_mode(args.camera_fit_mode)
     output_root = (
         args.output_dir.resolve()
         if args.output_dir is not None
@@ -1134,6 +1551,16 @@ def main() -> None:
             max_gif_tracks=max(1, args.max_gif_tracks),
             max_gif_cloud_points=max(1, args.max_gif_cloud_points),
             export_gifs=bool(args.export_gifs),
+            export_multiview_3d=bool(args.export_multiview_3d),
+            multiview_presets=multiview_presets,
+            export_orbit_mp4=bool(args.export_orbit_mp4),
+            orbit_mp4_fps=max(1, args.orbit_mp4_fps),
+            orbit_mp4_dpi=max(60, args.orbit_mp4_dpi),
+            orbit_elev=float(args.orbit_elev),
+            orbit_azim_start=float(args.orbit_azim_start),
+            orbit_revolutions=float(args.orbit_revolutions),
+            camera_fit_mode=camera_fit_mode,
+            trajectory_fit_padding=max(1.0, float(args.trajectory_fit_padding)),
             render_mode=str(args.render_mode),
             gif_track_sampling=str(args.gif_track_sampling),
         )
@@ -1144,6 +1571,10 @@ def main() -> None:
         )
         if artifact.gif_2d_path is not None and artifact.gif_3d_path is not None:
             message += f" gif2d={artifact.gif_2d_path} gif3d={artifact.gif_3d_path}"
+        if artifact.multiview_3d_paths:
+            message += f" multiview3d={artifact.multiview_3d_paths}"
+        if artifact.orbit_mp4_path is not None:
+            message += f" orbit_mp4={artifact.orbit_mp4_path}"
         print(message)
 
     overview_path = output_root / "episode_verification_overview.png"
@@ -1154,6 +1585,16 @@ def main() -> None:
         "trajectory_dirname": args.trajectory_dirname,
         "output_dir": str(output_root),
         "export_gifs": bool(args.export_gifs),
+        "export_multiview_3d": bool(args.export_multiview_3d),
+        "multiview_presets": multiview_presets,
+        "export_orbit_mp4": bool(args.export_orbit_mp4),
+        "orbit_mp4_fps": int(args.orbit_mp4_fps),
+        "orbit_mp4_dpi": int(args.orbit_mp4_dpi),
+        "orbit_elev": float(args.orbit_elev),
+        "orbit_azim_start": float(args.orbit_azim_start),
+        "orbit_revolutions": float(args.orbit_revolutions),
+        "camera_fit_mode": camera_fit_mode,
+        "trajectory_fit_padding": max(1.0, float(args.trajectory_fit_padding)),
         "render_mode": str(args.render_mode),
         "gif_track_sampling": str(args.gif_track_sampling),
         "overview_path": str(overview_path),

@@ -146,6 +146,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Trajectory line width for the 2D/3D GIFs.",
     )
     parser.add_argument(
+        "--camera_fit_mode",
+        type=str,
+        default=verify.CAMERA_FIT_SCENE,
+        choices=verify.CAMERA_FIT_MODES,
+        help="3D panel camera framing mode.",
+    )
+    parser.add_argument(
+        "--trajectory_fit_padding",
+        type=float,
+        default=1.35,
+        help="Extra radius multiplier when --camera_fit_mode=trajectory.",
+    )
+    parser.add_argument(
         "--panel_height",
         type=int,
         default=DEFAULT_PANEL_HEIGHT,
@@ -426,6 +439,8 @@ def main() -> None:
             line_width=float(args.line_width),
             gif_fps=max(1, int(args.gif_fps)),
             gif_dpi=max(60, int(args.gif_dpi)),
+            camera_fit_mode=str(args.camera_fit_mode),
+            trajectory_fit_padding=max(1.0, float(args.trajectory_fit_padding)),
         )
         frame_count = compose_triptych_gif(
             rgb_gif_path=rgb_gif_path,
@@ -460,6 +475,8 @@ def main() -> None:
         "gif_fps": int(args.gif_fps),
         "gif_dpi": int(args.gif_dpi),
         "gif_track_sampling": str(args.gif_track_sampling),
+        "camera_fit_mode": str(args.camera_fit_mode),
+        "trajectory_fit_padding": max(1.0, float(args.trajectory_fit_padding)),
         "panel_height": int(args.panel_height),
         "artifacts": [asdict(item) for item in artifacts],
     }

@@ -86,6 +86,15 @@ def fade_track_colors(colors: np.ndarray, *, blend: float = 0.72) -> np.ndarray:
     return colors * (1.0 - blend) + blend
 
 
+def colors_to_uint8(colors: np.ndarray) -> np.ndarray:
+    colors = np.asarray(colors)
+    if colors.dtype == np.uint8:
+        return colors
+    if colors.size == 0:
+        return np.zeros(colors.shape, dtype=np.uint8)
+    return np.clip(colors * 255.0, 0, 255).astype(np.uint8)
+
+
 def compute_scene_bounds(point_sets: list[np.ndarray]) -> tuple[np.ndarray, float] | None:
     finite_sets: list[np.ndarray] = []
     for points in point_sets:
@@ -310,6 +319,17 @@ def main() -> None:
         help="将轨迹和 dense pointcloud 变换到查询帧相机坐标系",
     )
     parser.add_argument(
+        "--dense_playback_stride",
+        type=int,
+        default=0,
+        help="自动播放时密集点云每 N 帧刷新 1 次；0 表示按点数自动选择",
+    )
+    parser.add_argument(
+        "--preload_playback",
+        action="store_true",
+        help="启动时预加载各帧 pointcloud，播放时仅切换可见性；可显著降低播放卡顿，但启动更慢、更占浏览器内存",
+    )
+    parser.add_argument(
         "--render_mode",
         type=str,
         default=RENDER_MODE_SUPERVISION,
@@ -398,6 +418,8 @@ def main() -> None:
                 ones = np.ones((len(pts), 1), dtype=np.float32)
                 pts_h = np.hstack([pts.astype(np.float32), ones])
                 dense_per_frame[idx] = (query_w2c @ pts_h.T).T[:, :3].astype(np.float32)
+    if dense_colors_per_frame is not None:
+        dense_colors_per_frame = [colors_to_uint8(frame_colors) for frame_colors in dense_colors_per_frame]
 
     def resolve_render_masks(render_mode: str) -> tuple[np.ndarray, np.ndarray]:
         if render_mode == RENDER_MODE_SUPERVISION:
@@ -421,19 +443,55 @@ def main() -> None:
     )
     ghost_colors = fade_track_colors(colors)
     motion_order, _motion_scores = compute_motion_rank(traj_sub)
+    frame_point_cache: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
 
     logger.info(
         f"加载 {sample_path.name}: query_frame={query_frame_idx}, "
         f"layout={layout}, keypoints={n_total}->{n_show}, segment_len={n_valid}, render_mode={args.render_mode}"
     )
+    dense_point_count = 0
     if dense_per_frame is not None:
         mode = "dynamic" if len(dense_per_frame) > 1 else "static"
+        dense_point_count = len(dense_per_frame[0]) if dense_per_frame else 0
         logger.info(
             f"dense pointcloud: {mode}, frames={len(dense_per_frame)}, "
-            f"first_frame_points={len(dense_per_frame[0]) if dense_per_frame else 0}"
+            f"first_frame_points={dense_point_count}"
         )
     if use_legacy_main_dense:
         logger.info("legacy 主 NPZ dense 模式下，轨迹来自主 NPZ 原始帧对齐坐标")
+
+    resolved_dense_playback_stride = max(1, int(args.dense_playback_stride))
+    if args.dense_playback_stride <= 0:
+        resolved_dense_playback_stride = 1
+        if dense_per_frame is not None and len(dense_per_frame) > 1:
+            if dense_point_count >= 40000:
+                resolved_dense_playback_stride = 2
+            if dense_point_count >= 80000:
+                resolved_dense_playback_stride = 4
+    resolved_playback_keypoint_multiplier = 1
+    if n_total >= 4000:
+        resolved_playback_keypoint_multiplier = 2
+    if n_total >= 8000:
+        resolved_playback_keypoint_multiplier = 4
+    resolved_playback_frame_step = 1
+    if dense_point_count >= 40000 or n_total >= 4000:
+        resolved_playback_frame_step = 2
+    if dense_point_count >= 80000 or n_total >= 8000:
+        resolved_playback_frame_step = 4
+    if dense_per_frame is not None and len(dense_per_frame) > 1:
+        logger.info(
+            f"dense playback stride={resolved_dense_playback_stride} "
+            "(1 表示每帧刷新 dense，大于 1 可提升播放流畅度)"
+        )
+    if resolved_playback_keypoint_multiplier > 1 or resolved_playback_frame_step > 1:
+        logger.info(
+            "playback light mode: "
+            f"keypoint_stride_multiplier={resolved_playback_keypoint_multiplier}, "
+            f"frame_step={resolved_playback_frame_step}"
+        )
+    use_preload_playback = bool(args.preload_playback)
+    if use_preload_playback:
+        logger.info("preload playback 已启用：启动时预加载各帧 pointcloud，播放时仅切换可见性")
 
     server = viser.ViserServer(port=args.port)
     server.scene.set_up_direction("-y")
@@ -465,32 +523,35 @@ def main() -> None:
         )
 
     points_0, colors_0, ghost_points_0, ghost_colors_0 = get_points_at_time(0)
-    primary_point_cloud_handle = server.scene.add_point_cloud(
-        name="keypoints_primary",
-        points=points_0,
-        colors=(np.clip(colors_0 * 255.0, 0, 255)).astype(np.uint8),
-        point_size=0.03,
-        point_shape="rounded",
-        precision="float32",
-    )
-    secondary_point_cloud_handle = server.scene.add_point_cloud(
-        name="keypoints_secondary",
-        points=ghost_points_0,
-        colors=(np.clip(ghost_colors_0 * 255.0, 0, 255)).astype(np.uint8),
-        point_size=0.024,
-        point_shape="rounded",
-        precision="float32",
-    )
-
+    primary_point_cloud_handle = None
+    secondary_point_cloud_handle = None
     dense_point_cloud_handle = None
-    if dense_per_frame is not None:
-        dense_point_cloud_handle = server.scene.add_point_cloud(
-            name="dense_pointcloud",
-            points=dense_per_frame[0],
-            colors=dense_colors_per_frame[0].astype(np.float32),
-            point_size=0.015,
+    if not use_preload_playback:
+        primary_point_cloud_handle = server.scene.add_point_cloud(
+            name="keypoints_primary",
+            points=points_0,
+            colors=(np.clip(colors_0 * 255.0, 0, 255)).astype(np.uint8),
+            point_size=0.03,
             point_shape="rounded",
+            precision="float32",
         )
+        secondary_point_cloud_handle = server.scene.add_point_cloud(
+            name="keypoints_secondary",
+            points=ghost_points_0,
+            colors=(np.clip(ghost_colors_0 * 255.0, 0, 255)).astype(np.uint8),
+            point_size=0.024,
+            point_shape="rounded",
+            precision="float32",
+        )
+
+        if dense_per_frame is not None:
+            dense_point_cloud_handle = server.scene.add_point_cloud(
+                name="dense_pointcloud",
+                points=dense_per_frame[0],
+                colors=dense_colors_per_frame[0],
+                point_size=0.015,
+                point_shape="rounded",
+            )
 
     with server.gui.add_folder("3D Keypoint 动画"):
         gui_time = server.gui.add_slider(
@@ -502,6 +563,32 @@ def main() -> None:
         )
         gui_playing = server.gui.add_checkbox("播放", True)
         gui_fps = server.gui.add_slider("帧率", min=1, max=60, step=1, initial_value=10)
+        gui_light_playback = server.gui.add_checkbox("播放轻量模式", True)
+        gui_playback_keypoint_multiplier = server.gui.add_slider(
+            "播放时额外 Keypoint 步长",
+            min=1,
+            max=16,
+            step=1,
+            initial_value=resolved_playback_keypoint_multiplier,
+        )
+        gui_playback_frame_step = server.gui.add_slider(
+            "播放时间步长",
+            min=1,
+            max=min(8, max(2, n_valid)),
+            step=1,
+            initial_value=min(resolved_playback_frame_step, min(8, max(2, n_valid))),
+        )
+        gui_dense_playback_stride = (
+            server.gui.add_slider(
+                "播放时 dense 刷新步长",
+                min=1,
+                max=min(16, max(2, n_valid)),
+                step=1,
+                initial_value=resolved_dense_playback_stride,
+            )
+            if dense_per_frame is not None and len(dense_per_frame) > 1
+            else None
+        )
         gui_render_mode = server.gui.add_dropdown(
             "显示模式",
             RENDER_MODES,
@@ -540,175 +627,349 @@ def main() -> None:
 
     trail_handles = []
     trail_name_counter = [0]
+    last_dense_frame = [-1]
+    active_keypoint_stride = [stride]
+    preloaded_primary_handles = []
+    preloaded_secondary_handles = []
+    preloaded_dense_handles = []
+    last_visible_keypoint_frame = [-1]
+    last_visible_dense_handle = [-1]
+
+    def resolve_dense_frame_index(t: int, *, force_exact: bool = False) -> int:
+        if dense_per_frame is None or len(dense_per_frame) == 0:
+            return 0
+        if len(dense_per_frame) == 1:
+            return 0
+        if force_exact or not gui_playing.value or gui_dense_playback_stride is None:
+            return min(t, len(dense_per_frame) - 1)
+        stride_value = max(1, int(gui_dense_playback_stride.value))
+        return min((t // stride_value) * stride_value, len(dense_per_frame) - 1)
+
+    def resolve_active_keypoint_stride() -> int:
+        base_stride = max(1, int(gui_keypoint_stride.value))
+        if gui_playing.value and gui_light_playback.value:
+            base_stride *= max(1, int(gui_playback_keypoint_multiplier.value))
+        return min(base_stride, max(1, n_total))
+
+    def rebuild_frame_point_cache() -> None:
+        nonlocal frame_point_cache
+        frame_point_cache = [get_points_at_time(t) for t in range(max(n_valid, 1))]
+
+    def remove_handle(handle) -> None:
+        if handle is None:
+            return
+        try:
+            handle.remove()
+        except KeyError:
+            pass
+
+    def clear_handle_list(handles: list) -> None:
+        for handle in handles:
+            remove_handle(handle)
+        handles.clear()
+
+    def build_preloaded_keypoint_handles() -> None:
+        estimated_primary_points = sum(int(len(points_t)) for points_t, _, _, _ in frame_point_cache)
+        estimated_secondary_points = sum(int(len(ghost_points_t)) for _, _, ghost_points_t, _ in frame_point_cache)
+        logger.info(
+            "开始预加载 keypoint frames: "
+            f"frames={len(frame_point_cache)}, primary_points_total={estimated_primary_points}, "
+            f"secondary_points_total={estimated_secondary_points}"
+        )
+        total_primary_points = 0
+        total_secondary_points = 0
+        with server.atomic():
+            clear_handle_list(preloaded_primary_handles)
+            clear_handle_list(preloaded_secondary_handles)
+            for t, (points_t, colors_t, ghost_points_t, ghost_colors_t) in enumerate(frame_point_cache):
+                primary_handle = server.scene.add_point_cloud(
+                    name=f"keypoints_primary_preloaded_{t}",
+                    points=points_t,
+                    colors=colors_to_uint8(colors_t),
+                    point_size=gui_point_size.value,
+                    point_shape="rounded",
+                    precision="float32",
+                )
+                primary_handle.visible = False
+                secondary_handle = server.scene.add_point_cloud(
+                    name=f"keypoints_secondary_preloaded_{t}",
+                    points=ghost_points_t,
+                    colors=colors_to_uint8(ghost_colors_t),
+                    point_size=max(0.001, gui_point_size.value * 0.8),
+                    point_shape="rounded",
+                    precision="float32",
+                )
+                secondary_handle.visible = False
+                preloaded_primary_handles.append(primary_handle)
+                preloaded_secondary_handles.append(secondary_handle)
+                total_primary_points += int(len(points_t))
+                total_secondary_points += int(len(ghost_points_t))
+        last_visible_keypoint_frame[0] = -1
+        server.flush()
+        logger.info(
+            "preloaded keypoint frames: "
+            f"frames={len(frame_point_cache)}, primary_points_total={total_primary_points}, "
+            f"secondary_points_total={total_secondary_points}"
+        )
+
+    def build_preloaded_dense_handles() -> None:
+        if dense_per_frame is None or dense_colors_per_frame is None:
+            return
+        estimated_dense_points = sum(int(len(pts)) for pts in dense_per_frame)
+        logger.info(
+            "开始预加载 dense frames: "
+            f"frames={len(dense_per_frame)}, dense_points_total={estimated_dense_points}"
+        )
+        total_dense_points = 0
+        with server.atomic():
+            clear_handle_list(preloaded_dense_handles)
+            for dense_idx, (pts, cols) in enumerate(zip(dense_per_frame, dense_colors_per_frame)):
+                dense_handle = server.scene.add_point_cloud(
+                    name=f"dense_pointcloud_preloaded_{dense_idx}",
+                    points=pts,
+                    colors=cols,
+                    point_size=gui_dense_point_size.value if gui_dense_point_size is not None else 0.015,
+                    point_shape="rounded",
+                )
+                dense_handle.visible = False
+                preloaded_dense_handles.append(dense_handle)
+                total_dense_points += int(len(pts))
+        last_visible_dense_handle[0] = -1
+        server.flush()
+        logger.info(
+            "preloaded dense frames: "
+            f"frames={len(preloaded_dense_handles)}, dense_points_total={total_dense_points}"
+        )
 
     def rebuild_keypoint_pointcloud() -> None:
         nonlocal primary_point_cloud_handle, secondary_point_cloud_handle
-        try:
-            primary_point_cloud_handle.remove()
-        except KeyError:
-            pass
-        try:
-            secondary_point_cloud_handle.remove()
-        except KeyError:
-            pass
-        points_t, colors_t, ghost_points_t, ghost_colors_t = get_points_at_time(int(gui_time.value))
-        primary_point_cloud_handle = server.scene.add_point_cloud(
-            name="keypoints_primary",
-            points=points_t,
-            colors=(np.clip(colors_t * 255.0, 0, 255)).astype(np.uint8),
-            point_size=gui_point_size.value,
-            point_shape="rounded",
-            precision="float32",
-        )
-        secondary_point_cloud_handle = server.scene.add_point_cloud(
-            name="keypoints_secondary",
-            points=ghost_points_t,
-            colors=(np.clip(ghost_colors_t * 255.0, 0, 255)).astype(np.uint8),
-            point_size=max(0.001, gui_point_size.value * 0.8),
-            point_shape="rounded",
-            precision="float32",
-        )
+        if use_preload_playback:
+            build_preloaded_keypoint_handles()
+            update_display(force_dense_exact=True)
+            return
+        points_t, colors_t, ghost_points_t, ghost_colors_t = frame_point_cache[min(int(gui_time.value), max(n_valid - 1, 0))]
+        with server.atomic():
+            try:
+                primary_point_cloud_handle.remove()
+            except KeyError:
+                pass
+            try:
+                secondary_point_cloud_handle.remove()
+            except KeyError:
+                pass
+            primary_point_cloud_handle = server.scene.add_point_cloud(
+                name="keypoints_primary",
+                points=points_t,
+                colors=colors_to_uint8(colors_t),
+                point_size=gui_point_size.value,
+                point_shape="rounded",
+                precision="float32",
+            )
+            secondary_point_cloud_handle = server.scene.add_point_cloud(
+                name="keypoints_secondary",
+                points=ghost_points_t,
+                colors=colors_to_uint8(ghost_colors_t),
+                point_size=max(0.001, gui_point_size.value * 0.8),
+                point_shape="rounded",
+                precision="float32",
+            )
+        server.flush()
 
-    def apply_keypoint_stride() -> None:
+    def apply_keypoint_stride(*, force: bool = False) -> None:
         nonlocal traj_sub, render_primary_sub, render_secondary_sub, n_show, colors, ghost_colors, motion_order
-        current_stride = max(1, int(gui_keypoint_stride.value))
+        current_stride = resolve_active_keypoint_stride()
+        if not force and current_stride == active_keypoint_stride[0]:
+            return
         current_indices = np.arange(0, n_total, current_stride)
         traj_sub = traj_full[current_indices]
         current_primary_full, current_secondary_full = resolve_render_masks(str(gui_render_mode.value))
         render_primary_sub = current_primary_full[current_indices]
         render_secondary_sub = current_secondary_full[current_indices]
         n_show = len(current_indices)
+        active_keypoint_stride[0] = current_stride
         gui_keypoint_count.value = n_show
         color_seed = traj_sub[:, :1, :] if traj_sub.shape[1] > 0 else np.zeros((n_show, 1, 3), dtype=np.float32)
         colors = get_track_colors(color_seed)
         ghost_colors = fade_track_colors(colors)
         motion_order, _ = compute_motion_rank(traj_sub)
+        rebuild_frame_point_cache()
         rebuild_keypoint_pointcloud()
-        update_display()
-        update_trails()
+        update_display(force_dense_exact=True)
+        if gui_show_trails.value:
+            update_trails()
 
-    def update_display() -> None:
+    def update_display(*, force_dense_exact: bool = False) -> None:
         t = min(int(gui_time.value), max(n_valid - 1, 0))
-        points_t, colors_t, ghost_points_t, ghost_colors_t = get_points_at_time(t)
-        primary_point_cloud_handle.points = points_t
-        primary_point_cloud_handle.colors = (np.clip(colors_t * 255.0, 0, 255)).astype(np.uint8)
-        primary_point_cloud_handle.point_size = gui_point_size.value
-        primary_point_cloud_handle.visible = gui_show_keypoints.value
-        secondary_point_cloud_handle.points = ghost_points_t
-        secondary_point_cloud_handle.colors = (np.clip(ghost_colors_t * 255.0, 0, 255)).astype(np.uint8)
-        secondary_point_cloud_handle.point_size = max(0.001, gui_point_size.value * 0.8)
-        secondary_point_cloud_handle.visible = (
-            gui_show_keypoints.value
-            and str(gui_render_mode.value) == RENDER_MODE_HYBRID
-            and len(ghost_points_t) > 0
-        )
-        if dense_point_cloud_handle is None or dense_per_frame is None:
-            return
-
-        dense_idx = 0 if len(dense_per_frame) == 1 else t
-        dense_point_cloud_handle.points = dense_per_frame[dense_idx]
-        dense_point_cloud_handle.colors = dense_colors_per_frame[dense_idx].astype(np.float32)
-        if gui_dense_point_size is not None:
-            dense_point_cloud_handle.point_size = gui_dense_point_size.value
-        dense_point_cloud_handle.visible = gui_show_dense.value if gui_show_dense is not None else True
+        points_t, colors_t, ghost_points_t, ghost_colors_t = frame_point_cache[t]
+        with server.atomic():
+            if use_preload_playback:
+                current_keypoint_visible = gui_show_keypoints.value
+                current_secondary_visible = (
+                    current_keypoint_visible
+                    and str(gui_render_mode.value) == RENDER_MODE_HYBRID
+                    and len(ghost_points_t) > 0
+                )
+                if preloaded_primary_handles:
+                    prev_keypoint_frame = last_visible_keypoint_frame[0]
+                    if 0 <= prev_keypoint_frame < len(preloaded_primary_handles) and prev_keypoint_frame != t:
+                        preloaded_primary_handles[prev_keypoint_frame].visible = False
+                        preloaded_secondary_handles[prev_keypoint_frame].visible = False
+                    preloaded_primary_handles[t].visible = current_keypoint_visible
+                    preloaded_secondary_handles[t].visible = current_secondary_visible
+                    last_visible_keypoint_frame[0] = t
+                if preloaded_dense_handles and dense_per_frame is not None:
+                    dense_idx = resolve_dense_frame_index(t, force_exact=force_dense_exact)
+                    prev_dense_idx = last_visible_dense_handle[0]
+                    if 0 <= prev_dense_idx < len(preloaded_dense_handles) and prev_dense_idx != dense_idx:
+                        preloaded_dense_handles[prev_dense_idx].visible = False
+                    preloaded_dense_handles[dense_idx].visible = (
+                        gui_show_dense.value if gui_show_dense is not None else True
+                    )
+                    last_visible_dense_handle[0] = dense_idx
+            else:
+                primary_point_cloud_handle.points = points_t
+                primary_point_cloud_handle.colors = colors_to_uint8(colors_t)
+                primary_point_cloud_handle.point_size = gui_point_size.value
+                primary_point_cloud_handle.visible = gui_show_keypoints.value
+                secondary_point_cloud_handle.points = ghost_points_t
+                secondary_point_cloud_handle.colors = colors_to_uint8(ghost_colors_t)
+                secondary_point_cloud_handle.point_size = max(0.001, gui_point_size.value * 0.8)
+                secondary_point_cloud_handle.visible = (
+                    gui_show_keypoints.value
+                    and str(gui_render_mode.value) == RENDER_MODE_HYBRID
+                    and len(ghost_points_t) > 0
+                )
+                if dense_point_cloud_handle is not None and dense_per_frame is not None:
+                    dense_idx = resolve_dense_frame_index(t, force_exact=force_dense_exact)
+                    if dense_idx != last_dense_frame[0]:
+                        dense_point_cloud_handle.points = dense_per_frame[dense_idx]
+                        dense_point_cloud_handle.colors = dense_colors_per_frame[dense_idx]
+                        last_dense_frame[0] = dense_idx
+                    if gui_dense_point_size is not None:
+                        dense_point_cloud_handle.point_size = gui_dense_point_size.value
+                    dense_point_cloud_handle.visible = gui_show_dense.value if gui_show_dense is not None else True
+        server.flush()
 
     def update_trails() -> None:
-        for handle in trail_handles:
-            try:
-                handle.remove()
-            except KeyError:
-                pass
-        trail_handles.clear()
-        if not gui_show_trails.value:
-            return
-
-        t = int(gui_time.value)
-        t_end = n_valid - 1 if gui_trail_full.value else t
-        t_end = min(t_end, traj_sub.shape[1] - 1)
-        if t_end < 1:
-            return
-
-        if gui_trail_dynamic_only.value:
-            n_dynamic = max(10, int(max(n_show, 1) * gui_trail_dynamic_ratio.value))
-            draw_indices = motion_order[:n_dynamic]
-        else:
-            draw_indices = np.arange(n_show)
-
         primary_segs = []
         primary_cols = []
         secondary_segs = []
         secondary_cols = []
-        for i in draw_indices:
-            if i >= traj_sub.shape[0]:
-                continue
-            for j in range(t_end):
-                p0 = traj_sub[i, j, :]
-                p1 = traj_sub[i, j + 1, :]
-                if (
-                    render_primary_sub[i, j]
-                    and render_primary_sub[i, j + 1]
-                    and np.isfinite(p0).all()
-                    and np.isfinite(p1).all()
-                ):
-                    primary_segs.append([p0, p1])
-                    primary_cols.append([colors[i], colors[i]])
-                elif (
-                    str(gui_render_mode.value) == RENDER_MODE_HYBRID
-                    and render_secondary_sub[i, j]
-                    and render_secondary_sub[i, j + 1]
-                    and np.isfinite(p0).all()
-                    and np.isfinite(p1).all()
-                ):
-                    secondary_segs.append([p0, p1])
-                    secondary_cols.append([ghost_colors[i], ghost_colors[i]])
+        should_draw = bool(gui_show_trails.value)
+        if should_draw:
+            t = int(gui_time.value)
+            t_end = n_valid - 1 if gui_trail_full.value else t
+            t_end = min(t_end, traj_sub.shape[1] - 1)
+            if t_end >= 1:
+                if gui_trail_dynamic_only.value:
+                    n_dynamic = max(10, int(max(n_show, 1) * gui_trail_dynamic_ratio.value))
+                    draw_indices = motion_order[:n_dynamic]
+                else:
+                    draw_indices = np.arange(n_show)
 
-        if not primary_segs and not secondary_segs:
-            return
+                for i in draw_indices:
+                    if i >= traj_sub.shape[0]:
+                        continue
+                    for j in range(t_end):
+                        p0 = traj_sub[i, j, :]
+                        p1 = traj_sub[i, j + 1, :]
+                        if (
+                            render_primary_sub[i, j]
+                            and render_primary_sub[i, j + 1]
+                            and np.isfinite(p0).all()
+                            and np.isfinite(p1).all()
+                        ):
+                            primary_segs.append([p0, p1])
+                            primary_cols.append([colors[i], colors[i]])
+                        elif (
+                            str(gui_render_mode.value) == RENDER_MODE_HYBRID
+                            and render_secondary_sub[i, j]
+                            and render_secondary_sub[i, j + 1]
+                            and np.isfinite(p0).all()
+                            and np.isfinite(p1).all()
+                        ):
+                            secondary_segs.append([p0, p1])
+                            secondary_cols.append([ghost_colors[i], ghost_colors[i]])
+            else:
+                should_draw = False
+        if should_draw and not primary_segs and not secondary_segs:
+            should_draw = False
 
-        trail_name_counter[0] += 1
-        if secondary_segs:
-            ghost_trail_handle = server.scene.add_line_segments(
-                name=f"trails_secondary_{trail_name_counter[0]}",
-                points=np.asarray(secondary_segs, dtype=np.float32),
-                colors=np.asarray(secondary_cols, dtype=np.float32),
-                line_width=max(0.5, gui_trail_line_width.value * 0.8),
-            )
-            trail_handles.append(ghost_trail_handle)
-        if primary_segs:
-            trail_handle = server.scene.add_line_segments(
-                name=f"trails_primary_{trail_name_counter[0]}",
-                points=np.asarray(primary_segs, dtype=np.float32),
-                colors=np.asarray(primary_cols, dtype=np.float32),
-                line_width=gui_trail_line_width.value,
-            )
-            trail_handles.append(trail_handle)
+        with server.atomic():
+            for handle in trail_handles:
+                try:
+                    handle.remove()
+                except KeyError:
+                    pass
+            trail_handles.clear()
+            if should_draw:
+                trail_name_counter[0] += 1
+                if secondary_segs:
+                    ghost_trail_handle = server.scene.add_line_segments(
+                        name=f"trails_secondary_{trail_name_counter[0]}",
+                        points=np.asarray(secondary_segs, dtype=np.float32),
+                        colors=np.asarray(secondary_cols, dtype=np.float32),
+                        line_width=max(0.5, gui_trail_line_width.value * 0.8),
+                    )
+                    trail_handles.append(ghost_trail_handle)
+                if primary_segs:
+                    trail_handle = server.scene.add_line_segments(
+                        name=f"trails_primary_{trail_name_counter[0]}",
+                        points=np.asarray(primary_segs, dtype=np.float32),
+                        colors=np.asarray(primary_cols, dtype=np.float32),
+                        line_width=gui_trail_line_width.value,
+                    )
+                    trail_handles.append(trail_handle)
+        server.flush()
 
     @gui_time.on_update
     def _(_) -> None:
-        update_display()
-        update_trails()
+        update_display(force_dense_exact=not gui_playing.value)
+        if gui_show_trails.value:
+            update_trails()
 
     @gui_keypoint_stride.on_update
     def _(_) -> None:
-        apply_keypoint_stride()
+        apply_keypoint_stride(force=True)
 
     @gui_render_mode.on_update
     def _(_) -> None:
-        apply_keypoint_stride()
+        apply_keypoint_stride(force=True)
+
+    @gui_light_playback.on_update
+    def _(_) -> None:
+        apply_keypoint_stride(force=True)
+
+    @gui_playback_keypoint_multiplier.on_update
+    def _(_) -> None:
+        apply_keypoint_stride(force=True)
 
     @gui_point_size.on_update
     def _(_) -> None:
-        primary_point_cloud_handle.point_size = gui_point_size.value
-        secondary_point_cloud_handle.point_size = max(0.001, gui_point_size.value * 0.8)
+        with server.atomic():
+            if use_preload_playback:
+                for handle in preloaded_primary_handles:
+                    handle.point_size = gui_point_size.value
+                for handle in preloaded_secondary_handles:
+                    handle.point_size = max(0.001, gui_point_size.value * 0.8)
+            else:
+                primary_point_cloud_handle.point_size = gui_point_size.value
+                secondary_point_cloud_handle.point_size = max(0.001, gui_point_size.value * 0.8)
+        server.flush()
 
     @gui_show_keypoints.on_update
     def _(_) -> None:
-        primary_point_cloud_handle.visible = gui_show_keypoints.value
-        secondary_point_cloud_handle.visible = (
-            gui_show_keypoints.value
-            and str(gui_render_mode.value) == RENDER_MODE_HYBRID
-            and len(secondary_point_cloud_handle.points) > 0
-        )
+        if use_preload_playback:
+            update_display(force_dense_exact=not gui_playing.value)
+            return
+        with server.atomic():
+            primary_point_cloud_handle.visible = gui_show_keypoints.value
+            secondary_point_cloud_handle.visible = (
+                gui_show_keypoints.value
+                and str(gui_render_mode.value) == RENDER_MODE_HYBRID
+                and len(secondary_point_cloud_handle.points) > 0
+            )
+        server.flush()
 
     @gui_show_trails.on_update
     def _(_) -> None:
@@ -734,26 +995,73 @@ def main() -> None:
 
         @gui_dense_point_size.on_update
         def _(_) -> None:
-            if dense_point_cloud_handle is not None:
-                dense_point_cloud_handle.point_size = gui_dense_point_size.value
+            with server.atomic():
+                if use_preload_playback:
+                    for handle in preloaded_dense_handles:
+                        handle.point_size = gui_dense_point_size.value
+                elif dense_point_cloud_handle is not None:
+                    dense_point_cloud_handle.point_size = gui_dense_point_size.value
+            server.flush()
 
     if gui_show_dense is not None:
 
         @gui_show_dense.on_update
         def _(_) -> None:
-            if dense_point_cloud_handle is not None:
+            if use_preload_playback:
+                update_display(force_dense_exact=not gui_playing.value)
+            elif dense_point_cloud_handle is not None:
                 dense_point_cloud_handle.visible = gui_show_dense.value
+                server.flush()
 
-    update_display()
+    if gui_dense_playback_stride is not None:
+
+        @gui_dense_playback_stride.on_update
+        def _(_) -> None:
+            update_display(force_dense_exact=not gui_playing.value)
+
+    @gui_playing.on_update
+    def _(_) -> None:
+        apply_keypoint_stride(force=True)
+        if not gui_playing.value:
+            update_display(force_dense_exact=True)
+
+    rebuild_frame_point_cache()
+    if use_preload_playback:
+        build_preloaded_dense_handles()
+    apply_keypoint_stride(force=True)
+    update_display(force_dense_exact=True)
 
     logger.info(f"Viser 服务器: http://localhost:{args.port}")
     logger.info("使用滑块或勾选「播放」查看 3D keypoint 动画")
 
+    next_frame_deadline = time.perf_counter()
+    was_playing = False
+    prev_fps = max(1, int(gui_fps.value))
     try:
         while True:
-            if gui_playing.value and n_valid > 1:
-                gui_time.value = (int(gui_time.value) + 1) % n_valid
-            time.sleep(1.0 / max(1, gui_fps.value))
+            current_fps = max(1, int(gui_fps.value))
+            is_playing = bool(gui_playing.value) and n_valid > 1
+            now = time.perf_counter()
+            if not is_playing:
+                was_playing = False
+                prev_fps = current_fps
+                next_frame_deadline = now + 1.0 / current_fps
+                time.sleep(0.05)
+                continue
+            if not was_playing or current_fps != prev_fps:
+                next_frame_deadline = now
+            if now >= next_frame_deadline:
+                frame_step = 1
+                if gui_light_playback.value:
+                    frame_step = max(1, int(gui_playback_frame_step.value))
+                gui_time.value = (int(gui_time.value) + frame_step) % n_valid
+                next_frame_deadline += 1.0 / current_fps
+                if next_frame_deadline < now - 1.0 / current_fps:
+                    next_frame_deadline = now + 1.0 / current_fps
+            was_playing = True
+            prev_fps = current_fps
+            sleep_seconds = max(0.001, min(0.05, next_frame_deadline - time.perf_counter()))
+            time.sleep(sleep_seconds)
     except KeyboardInterrupt:
         logger.info("退出")
 
