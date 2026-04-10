@@ -9,6 +9,8 @@
 |------|------|
 | [traceforge_output_structure.md](traceforge_output_structure.md) | 当前输出布局、sample 字段和 `v2/legacy` 差异 |
 | [depth_scale_alignment_math.md](depth_scale_alignment_math.md) | 深度尺度对齐的数学背景 |
+| [traceforge_tracking_math.md](traceforge_tracking_math.md) | 当前底层 3D tracking / refinement / support query 机制的数学说明 |
+| [traceforge_outer_support_grid_summary.md](traceforge_outer_support_grid_summary.md) | 外层 `support_grid_ratio` 的采样、数量、重合与 tracker 作用结论 |
 | [sample_traceforge_dataset.md](sample_traceforge_dataset.md) | `sample_traceforge_dataset.py` 的当前适用范围与用法 |
 | [traj_filter_method_summary_2026-03-17.md](traj_filter_method_summary_2026-03-17.md) | 当前轨迹过滤 profile 和验证结论 |
 

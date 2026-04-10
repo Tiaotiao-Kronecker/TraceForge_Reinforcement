@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="520" viewBox="0 0 1400 520">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,3 L0,6 z" fill="#1f2937" />
+    </marker>
+    <style>
+      .box { fill: #f8fafc; stroke: #334155; stroke-width: 2; rx: 10; ry: 10; }
+      .soft { fill: #eef2ff; stroke: #4f46e5; stroke-width: 2; rx: 10; ry: 10; }
+      .accent { fill: #ecfeff; stroke: #0891b2; stroke-width: 2; rx: 10; ry: 10; }
+      .warn { fill: #fefce8; stroke: #ca8a04; stroke-width: 2; rx: 10; ry: 10; }
+      .title { font-family: Arial, sans-serif; font-size: 18px; font-weight: bold; fill: #111827; }
+      .text { font-family: Arial, sans-serif; font-size: 15px; fill: #111827; }
+      .small { font-family: Arial, sans-serif; font-size: 13px; fill: #374151; }
+      .arrow { stroke: #1f2937; stroke-width: 2.5; fill: none; marker-end: url(#arrow); }
+      .dash { stroke-dasharray: 7 6; }
+    </style>
+  </defs>
+
+  <text x="700" y="34" text-anchor="middle" class="title">TraceForge main queries + support queries: current tracking flow</text>
+
+  <rect x="40" y="70" width="250" height="88" class="soft" />
+  <text x="165" y="102" text-anchor="middle" class="title">Main grid keypoints</text>
+  <text x="165" y="128" text-anchor="middle" class="text">Q_main^2D = {(u_i, v_i)}</text>
+  <text x="165" y="148" text-anchor="middle" class="small">grid_size = G, count = G^2</text>
+
+  <rect x="40" y="200" width="250" height="96" class="warn" />
+  <text x="165" y="232" text-anchor="middle" class="title">Support grid points</text>
+  <text x="165" y="258" text-anchor="middle" class="text">Q_supp^2D from support_grid_ratio</text>
+  <text x="165" y="278" text-anchor="middle" class="small">G_s = round(rho G), keep only depth &gt; 0</text>
+
+  <rect x="360" y="70" width="270" height="88" class="box" />
+  <text x="495" y="102" text-anchor="middle" class="title">Lift to world queries</text>
+  <text x="495" y="128" text-anchor="middle" class="text">X^w = E_0^-1 ( d K_0^-1 [u,v,1]^T )</text>
+  <text x="495" y="148" text-anchor="middle" class="small">main queries use query-frame depth + camera</text>
+
+  <rect x="360" y="200" width="270" height="96" class="box" />
+  <text x="495" y="232" text-anchor="middle" class="title">Build support queries</text>
+  <text x="495" y="258" text-anchor="middle" class="text">same world-query format</text>
+  <text x="495" y="278" text-anchor="middle" class="small">(t=0, x^w, y^w, z^w)</text>
+
+  <rect x="700" y="126" width="250" height="110" class="accent" />
+  <text x="825" y="158" text-anchor="middle" class="title">Concatenate</text>
+  <text x="825" y="186" text-anchor="middle" class="text">Q_all = [Q_main, Q_supp]</text>
+  <text x="825" y="210" text-anchor="middle" class="small">inside tracker: same query type, same tensor</text>
+
+  <rect x="1020" y="72" width="320" height="220" class="soft" />
+  <text x="1180" y="104" text-anchor="middle" class="title">PointTracker3D</text>
+  <text x="1180" y="132" text-anchor="middle" class="text">seq_len = 16 sliding windows</text>
+  <text x="1180" y="160" text-anchor="middle" class="text">shared corr context from RGB features + 3D point clouds</text>
+  <text x="1180" y="188" text-anchor="middle" class="text">per-query reference KNN patch at query frame</text>
+  <text x="1180" y="216" text-anchor="middle" class="text">per-iteration current KNN patch at each frame</text>
+  <text x="1180" y="244" text-anchor="middle" class="text">UpdateFormer time+space attention</text>
+  <text x="1180" y="268" text-anchor="middle" class="small">support queries influence main queries via shared space attention</text>
+
+  <rect x="1020" y="340" width="320" height="82" class="box" />
+  <text x="1180" y="372" text-anchor="middle" class="title">Prediction for all queries</text>
+  <text x="1180" y="398" text-anchor="middle" class="text">coords, visibs for [main + support]</text>
+
+  <rect x="700" y="340" width="250" height="82" class="warn" />
+  <text x="825" y="372" text-anchor="middle" class="title">Slice off support</text>
+  <text x="825" y="398" text-anchor="middle" class="text">keep first N_q only</text>
+
+  <rect x="360" y="340" width="270" height="82" class="accent" />
+  <text x="495" y="372" text-anchor="middle" class="title">Project to query camera</text>
+  <text x="495" y="398" text-anchor="middle" class="text">save traj_uvz / traj_2d</text>
+
+  <rect x="40" y="340" width="250" height="82" class="soft" />
+  <text x="165" y="372" text-anchor="middle" class="title">Saved sample output</text>
+  <text x="165" y="398" text-anchor="middle" class="text">only main tracks are written</text>
+
+  <path d="M290 114 L360 114" class="arrow" />
+  <path d="M290 248 L360 248" class="arrow" />
+  <path d="M630 114 L700 156" class="arrow" />
+  <path d="M630 248 L700 206" class="arrow" />
+  <path d="M950 181 L1020 181" class="arrow" />
+  <path d="M1180 292 L1180 340" class="arrow" />
+  <path d="M1020 381 L950 381" class="arrow" />
+  <path d="M700 381 L630 381" class="arrow" />
+  <path d="M360 381 L290 381" class="arrow" />
+
+  <path d="M825 236 L825 322" class="arrow dash" />
+  <text x="842" y="286" class="small">same query order preserved</text>
+</svg>
