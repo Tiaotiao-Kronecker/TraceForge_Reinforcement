@@ -419,6 +419,7 @@ def build_batch_run_summary(
     args: argparse.Namespace,
     base_path: Path,
     out_dir: Path | None,
+    telemetry_out_dir: Path | None,
     gpu_ids: list[int],
     telemetry_gpu_ids: list[int],
     host_name: str | None,
@@ -433,6 +434,9 @@ def build_batch_run_summary(
     return {
         "base_path": str(base_path.resolve()),
         "out_dir": str(out_dir.resolve()) if out_dir is not None else None,
+        "telemetry_out_dir": (
+            str(telemetry_out_dir.resolve()) if telemetry_out_dir is not None else None
+        ),
         "camera_names": list(args.camera_names),
         "shared_schedule_camera_names": list(
             getattr(args, "shared_schedule_camera_names", getattr(args, "camera_names", []))
@@ -487,6 +491,15 @@ def parse_args() -> argparse.Namespace:
         help="Optional TraceForge output root. If omitted, write in-place under each episode.",
     )
     parser.add_argument(
+        "--telemetry_out_dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional telemetry root for _batch_run_summary.json and JSONL profiling files. "
+            "If omitted, telemetry follows --out_dir; if both are omitted, structured telemetry is disabled."
+        ),
+    )
+    parser.add_argument(
         "--trajectory_dirname",
         type=str,
         default="trajectory",
@@ -535,8 +548,8 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help=(
-            "If >0 and --out_dir is set, periodically record GPU/CPU/IO telemetry "
-            "into _hardware_telemetry.jsonl."
+            "If >0 and telemetry output is enabled via --out_dir or --telemetry_out_dir, "
+            "periodically record GPU/CPU/IO telemetry into _hardware_telemetry.jsonl."
         ),
     )
     parser.add_argument(
@@ -1317,13 +1330,28 @@ def warm_up_cuda_linalg(device: str) -> None:
         _CUDA_LINALG_WARMED_DEVICES.add(device)
 
 
+def _resolve_optional_root(raw_path: str | None) -> Path | None:
+    if raw_path is None:
+        return None
+    normalized = raw_path.strip()
+    if not normalized:
+        return None
+    return Path(normalized).resolve()
+
+
 def resolve_output_root(args: argparse.Namespace) -> Path | None:
-    if args.out_dir is None:
-        return None
-    out_dir = args.out_dir.strip()
-    if not out_dir:
-        return None
-    return Path(out_dir).resolve()
+    return _resolve_optional_root(args.out_dir)
+
+
+def resolve_telemetry_root(
+    args: argparse.Namespace,
+    *,
+    out_root: Path | None,
+) -> Path | None:
+    telemetry_root = _resolve_optional_root(getattr(args, "telemetry_out_dir", None))
+    if telemetry_root is not None:
+        return telemetry_root
+    return out_root
 
 
 def resolve_episode_output_dir(
@@ -1341,6 +1369,12 @@ def describe_output_target(args: argparse.Namespace, out_root: Path | None) -> s
     if out_root is not None:
         return str(out_root)
     return f"<episode>/{args.trajectory_dirname}"
+
+
+def describe_telemetry_target(telemetry_root: Path | None) -> str:
+    if telemetry_root is None:
+        return "<disabled>"
+    return str(telemetry_root)
 
 
 def _has_files(dir_path: Path, suffixes: tuple[str, ...]) -> bool:
@@ -2027,8 +2061,11 @@ def main() -> None:
     args = parse_args()
     base_path = Path(args.base_path).resolve()
     out_dir = resolve_output_root(args)
+    telemetry_out_dir = resolve_telemetry_root(args, out_root=out_dir)
     if out_dir is not None:
         out_dir.mkdir(parents=True, exist_ok=True)
+    if telemetry_out_dir is not None and telemetry_out_dir != out_dir:
+        telemetry_out_dir.mkdir(parents=True, exist_ok=True)
     gpu_ids = parse_gpu_ids(args.gpu_id)
     worker_slots = build_worker_slots(gpu_ids, workers_per_gpu=args.workers_per_gpu)
     probe_gpu_ids = list(dict.fromkeys(gpu_ids))
@@ -2097,6 +2134,7 @@ def main() -> None:
     logger.info("Press-one-button demo batch inference")
     logger.info(f"base_path={base_path}")
     logger.info(f"out_dir={describe_output_target(args, out_dir)}")
+    logger.info(f"telemetry_out_dir={describe_telemetry_target(telemetry_out_dir)}")
     logger.info(f"cameras={args.camera_names}")
     logger.info(
         f"episodes={len(episodes_for_run)}"
@@ -2189,9 +2227,9 @@ def main() -> None:
                     )
 
             mp_ctx = mp.get_context("spawn")
-            if out_dir is not None:
+            if telemetry_out_dir is not None:
                 telemetry_writer = BatchTelemetryWriter(
-                    out_dir,
+                    telemetry_out_dir,
                     enable_profile_records=args.collect_profile_stats,
                     enable_hardware_records=args.hardware_telemetry_interval_sec > 0.0,
                     lock=mp_ctx.Lock(),
@@ -2285,9 +2323,9 @@ def main() -> None:
                     f"Dynamic scheduler left {remaining_task_count} camera tasks unprocessed."
                 )
         else:
-            if out_dir is not None:
+            if telemetry_out_dir is not None:
                 telemetry_writer = BatchTelemetryWriter(
-                    out_dir,
+                    telemetry_out_dir,
                     enable_profile_records=args.collect_profile_stats,
                     enable_hardware_records=args.hardware_telemetry_interval_sec > 0.0,
                 )
@@ -2333,6 +2371,7 @@ def main() -> None:
                 args=args,
                 base_path=base_path,
                 out_dir=out_dir,
+                telemetry_out_dir=telemetry_out_dir,
                 gpu_ids=gpu_ids,
                 telemetry_gpu_ids=telemetry_gpu_ids,
                 host_name=host_name,

@@ -50,6 +50,7 @@ python scripts/batch_inference/infer.py \
 ```bash
 python scripts/batch_inference/batch_infer_press_one_button_demo.py \
     --base_path <dataset_base_path> \
+    --telemetry_out_dir <telemetry_root> \
     --gpu_id 0,1,2,3,4,5,6,7 \
     --min_free_gpu_mem_gb 40 \
     --gpu_recovery_poll_sec 60 \
@@ -159,6 +160,7 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 - Latest maintained external-only reference: `wipe_the_table_gs` median3 (`support_grid_ratio=0.8`, `varied_camera_1,varied_camera_2`, 2026-04-08) showed `num_iters=3` at about `1.52x` total-speedup vs `5`, with only mild systematic drift relative to `5` and no obvious extreme-case outliers; keep the maintained default throughput-first at `3`, while treating `num_iters=4` as the safer sanity-check fallback for new datasets or suspicious cases
 - Next throughput-optimization backlog should target tracker forward rather than depth-filter: first try removing unnecessary CUDA synchronizations when `collect_profile_stats=False`, then profile low-risk same-semantics candidates such as hoisting repeated ROI/support-query prep out of the hot path, evaluating `torch.compile` / CUDA graph / TF32 on the maintained external-only benchmark, and trimming avoidable `clone` / `permute` / temporary-tensor churn in the tracker wrapper
 - `batch_infer_press_one_button_demo.py` writes in-place to `<episode>/trajectory/<camera_name>/...` by default; passing `--out_dir` switches the root to `<out_dir>/<episode>/<camera_name>/...`
+- `--telemetry_out_dir` decouples structured telemetry from artifact output: when set, `_batch_run_summary.json` and JSONL telemetry files are written there even if artifacts are still written in-place
 - The true episode frame rate comes from `trajectory_valid.h5` root attr `fps`
 - `--fps` is only the load stride; default `1`
 - `--max_num_frames` is the post-stride frame cap; default `512`
@@ -178,8 +180,8 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 - Multi-GPU batch inference keeps a resident worker per GPU and schedules `episode/camera` tasks from a shared queue
 - `--gpu_id` should list the actual currently usable physical GPU indices; the list may be sparse if some cards are unavailable (for example `1,3,5,6`)
 - The shared query-frame schedule design keeps multi-camera keyframes aligned without breaking dynamic multi-GPU scheduling
-- `--collect_profile_stats` writes task-level `profile_stats` / `save_profile_stats` into `_camera_task_profiles.jsonl`
-- `--hardware_telemetry_interval_sec > 0` writes periodic GPU/CPU/IO samples into `_hardware_telemetry.jsonl`
+- `--collect_profile_stats` writes task-level `profile_stats` / `save_profile_stats` into `_camera_task_profiles.jsonl` under `--telemetry_out_dir` when provided, otherwise under `--out_dir`
+- `--hardware_telemetry_interval_sec > 0` writes periodic GPU/CPU/IO samples into `_hardware_telemetry.jsonl` under `--telemetry_out_dir` when provided, otherwise under `--out_dir`
 - `--depth_filter_workers` controls `_DepthFilterRuntime` thread count for filtered-depth precomputation
 
 **Keypoint Sampling**:
@@ -258,11 +260,12 @@ For button/sim episode outputs written in-place:
 If `--out_dir` is provided, the same per-episode structure is written under
 `<out_dir>/<episode_name>/` instead of `<episode_dir>/trajectory/`.
 
-When `batch_infer_press_one_button_demo.py` runs with `--out_dir`, the output
-root also stores batch telemetry files:
+Structured telemetry is written under `--telemetry_out_dir` when provided;
+otherwise it falls back to `--out_dir`. If neither is set, only stdout logging
+is available.
 
 ```
-<out_dir>/
+<telemetry_root>/
 ├── _batch_run_summary.json
 ├── _camera_task_metrics.jsonl
 ├── _camera_task_profiles.jsonl   # only when --collect_profile_stats
