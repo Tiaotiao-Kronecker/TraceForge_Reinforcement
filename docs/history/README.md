@@ -12,6 +12,7 @@
 ## 历史调查与修正
 
 - [external_only_speed_reassessment_2026-04-07.md](external_only_speed_reassessment_2026-04-07.md)
+- [tracker_precision_note_2026-04-12.md](tracker_precision_note_2026-04-12.md)
 - [support_grid_zero_resize320_grid160_rebenchmark_2026-04-10.md](support_grid_zero_resize320_grid160_rebenchmark_2026-04-10.md)
 - [wipe_the_table_gs_support_grid_sweep_2026-04-10.md](wipe_the_table_gs_support_grid_sweep_2026-04-10.md)
 - [wipe_the_table_gs_external_trajectory_triage_and_rebenchmark_2026-04-07.md](wipe_the_table_gs_external_trajectory_triage_and_rebenchmark_2026-04-07.md)
