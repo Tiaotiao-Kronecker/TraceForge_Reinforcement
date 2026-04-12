@@ -12,6 +12,8 @@
 ## 历史调查与修正
 
 - [external_only_speed_reassessment_2026-04-07.md](external_only_speed_reassessment_2026-04-07.md)
+- [support_grid_zero_resize320_grid160_rebenchmark_2026-04-10.md](support_grid_zero_resize320_grid160_rebenchmark_2026-04-10.md)
+- [wipe_the_table_gs_support_grid_sweep_2026-04-10.md](wipe_the_table_gs_support_grid_sweep_2026-04-10.md)
 - [wipe_the_table_gs_external_trajectory_triage_and_rebenchmark_2026-04-07.md](wipe_the_table_gs_external_trajectory_triage_and_rebenchmark_2026-04-07.md)
 - [camera_extrinsics_investigation_2026-03-12.md](camera_extrinsics_investigation_2026-03-12.md)
 - [camera_extrinsics_fix_validation_2026-03-12.md](camera_extrinsics_fix_validation_2026-03-12.md)

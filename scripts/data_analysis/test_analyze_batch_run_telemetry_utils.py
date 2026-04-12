@@ -2,6 +2,7 @@ import unittest
 
 from scripts.data_analysis.analyze_batch_run_telemetry import (
     summarize_profile_records,
+    summarize_run_collection,
     summarize_run_overview,
     summarize_task_groups,
 )
@@ -39,6 +40,90 @@ class BatchTelemetryOverviewTests(unittest.TestCase):
         self.assertAlmostEqual(overview["slot_seconds_per_query"], 12.0)
         self.assertAlmostEqual(overview["process_slot_seconds_per_query"], 11.7)
         self.assertAlmostEqual(overview["save_slot_seconds_per_query"], 0.3)
+
+    def test_summarize_run_collection_uses_launch_span_and_union_gpu_ids(self):
+        task_records_run_a = [
+            {
+                "status": "success",
+                "query_frame_count": 10,
+                "total_seconds": 120.0,
+                "process_seconds": 110.0,
+                "save_seconds": 10.0,
+                "started_at_unix": 1010.0,
+                "finished_at_unix": 1200.0,
+                "gpu_id": 0,
+                "worker_label": "GPU 0 slot 1/8",
+            },
+        ]
+        task_records_run_b = [
+            {
+                "status": "success",
+                "query_frame_count": 30,
+                "total_seconds": 300.0,
+                "process_seconds": 285.0,
+                "save_seconds": 15.0,
+                "started_at_unix": 1120.0,
+                "finished_at_unix": 1500.0,
+                "gpu_id": 2,
+                "worker_label": "GPU 2 slot 1/4",
+            },
+        ]
+
+        payload_a = {
+            "run_label": "wipe_the_table_gs",
+            "run_root": "/tmp/run_a",
+            "summary": {
+                "wall_clock_seconds": 190.0,
+                "telemetry_gpu_ids": [0, 1],
+                "worker_slot_count": 8,
+            },
+            "task_records": task_records_run_a,
+            "profile_records": [],
+            "hardware_records": [],
+            "launched_at_unix": 1000.0,
+            "finished_at_unix": 1200.0,
+            "overview": summarize_run_overview(
+                {
+                    "wall_clock_seconds": 190.0,
+                    "telemetry_gpu_ids": [0, 1],
+                    "worker_slot_count": 8,
+                },
+                task_records_run_a,
+            ),
+            "physical_gpu_ids": [0, 1],
+        }
+        payload_b = {
+            "run_label": "cup_on_coaster_gs",
+            "run_root": "/tmp/run_b",
+            "summary": {
+                "wall_clock_seconds": 380.0,
+                "telemetry_gpu_ids": [1, 2],
+                "worker_slot_count": 4,
+            },
+            "task_records": task_records_run_b,
+            "profile_records": [],
+            "hardware_records": [],
+            "launched_at_unix": 1100.0,
+            "finished_at_unix": 1500.0,
+            "overview": summarize_run_overview(
+                {
+                    "wall_clock_seconds": 380.0,
+                    "telemetry_gpu_ids": [1, 2],
+                    "worker_slot_count": 4,
+                },
+                task_records_run_b,
+            ),
+            "physical_gpu_ids": [1, 2],
+        }
+
+        collection = summarize_run_collection([payload_a, payload_b])
+
+        self.assertEqual(collection["overview"]["total_query_count"], 40)
+        self.assertEqual(collection["overview"]["physical_gpu_count"], 3)
+        self.assertEqual(collection["overview"]["worker_slot_count"], 12)
+        self.assertAlmostEqual(collection["overview"]["wall_clock_seconds"], 500.0)
+        self.assertAlmostEqual(collection["overview"]["cluster_seconds_per_query"], 12.5)
+        self.assertAlmostEqual(collection["overview"]["single_gpu_seconds_per_query"], 37.5)
 
 
 class BatchTelemetryGroupingTests(unittest.TestCase):

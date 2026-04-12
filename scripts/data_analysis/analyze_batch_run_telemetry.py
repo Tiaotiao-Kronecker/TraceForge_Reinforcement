@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import math
 import statistics
@@ -47,8 +48,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--run-root",
         type=Path,
+        action="append",
         required=True,
-        help="TraceForge batch output root that contains telemetry files.",
+        help="TraceForge batch output root that contains telemetry files. Pass multiple times to combine runs.",
     )
     parser.add_argument(
         "--output-json",
@@ -69,6 +71,12 @@ def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def load_json_if_exists(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    return load_json(path)
+
+
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
@@ -85,6 +93,79 @@ def safe_div(numerator: float, denominator: float) -> float | None:
     if denominator == 0:
         return None
     return float(numerator / denominator)
+
+
+def _resolve_launch_timestamp_unix(run_root: Path) -> float | None:
+    launched_at_path = run_root / "launched_at.txt"
+    if not launched_at_path.is_file():
+        return None
+    raw_value = launched_at_path.read_text(encoding="utf-8").strip()
+    if not raw_value:
+        return None
+    try:
+        return float(datetime.fromisoformat(raw_value).timestamp())
+    except ValueError:
+        try:
+            return float(raw_value)
+        except ValueError:
+            return None
+
+
+def _resolve_run_gpu_ids(
+    summary: dict[str, Any] | None,
+    task_records: list[dict[str, Any]],
+) -> list[int]:
+    if summary is not None:
+        summary_gpu_ids = summary.get("telemetry_gpu_ids") or summary.get("gpu_ids") or []
+        if summary_gpu_ids:
+            return [int(gpu_id) for gpu_id in summary_gpu_ids]
+    gpu_ids = sorted(
+        {
+            int(record["gpu_id"])
+            for record in task_records
+            if record.get("gpu_id") is not None
+        }
+    )
+    return gpu_ids
+
+
+def _resolve_worker_slot_count(
+    summary: dict[str, Any] | None,
+    task_records: list[dict[str, Any]],
+) -> int | None:
+    if summary is not None:
+        worker_slot_count_raw = summary.get("worker_slot_count")
+        if worker_slot_count_raw not in (None, 0):
+            return int(worker_slot_count_raw)
+    worker_labels = {
+        str(record["worker_label"])
+        for record in task_records
+        if record.get("worker_label")
+    }
+    if worker_labels:
+        return int(len(worker_labels))
+    return None
+
+
+def _resolve_wall_clock_seconds(
+    summary: dict[str, Any] | None,
+    task_records: list[dict[str, Any]],
+) -> float:
+    if summary is not None and summary.get("wall_clock_seconds") is not None:
+        return float(summary.get("wall_clock_seconds") or 0.0)
+    started_at_values = [
+        float(record["started_at_unix"])
+        for record in task_records
+        if record.get("started_at_unix") is not None
+    ]
+    finished_at_values = [
+        float(record["finished_at_unix"])
+        for record in task_records
+        if record.get("finished_at_unix") is not None
+    ]
+    if started_at_values and finished_at_values:
+        return max(0.0, max(finished_at_values) - min(started_at_values))
+    return 0.0
 
 
 def percentile(values: list[float], q: float) -> float | None:
@@ -109,15 +190,15 @@ def is_timing_profile_key(key: str, *, profile_keys: tuple[str, ...]) -> bool:
 
 
 def summarize_run_overview(
-    summary: dict[str, Any],
+    summary: dict[str, Any] | None,
     task_records: list[dict[str, Any]],
 ) -> dict[str, Any]:
     success_records = [record for record in task_records if record.get("status") == "success"]
     total_query_count = int(
         sum(int(record.get("query_frame_count") or 0) for record in success_records)
     )
-    wall_clock_seconds = float(summary.get("wall_clock_seconds") or 0.0)
-    telemetry_gpu_ids = summary.get("telemetry_gpu_ids") or summary.get("gpu_ids") or []
+    wall_clock_seconds = _resolve_wall_clock_seconds(summary, task_records)
+    telemetry_gpu_ids = _resolve_run_gpu_ids(summary, task_records)
     physical_gpu_count = len(telemetry_gpu_ids)
     if physical_gpu_count <= 0 and total_query_count > 0:
         physical_gpu_count = 1
@@ -132,7 +213,7 @@ def summarize_run_overview(
         sum(float(record.get("save_seconds") or 0.0) for record in success_records)
     )
 
-    worker_slot_count_raw = summary.get("worker_slot_count")
+    worker_slot_count = _resolve_worker_slot_count(summary, task_records)
     return {
         "task_count": int(len(task_records)),
         "success_task_count": int(len(success_records)),
@@ -140,11 +221,7 @@ def summarize_run_overview(
         "total_query_count": total_query_count,
         "wall_clock_seconds": wall_clock_seconds,
         "physical_gpu_count": int(physical_gpu_count),
-        "worker_slot_count": (
-            int(worker_slot_count_raw)
-            if worker_slot_count_raw not in (None, 0)
-            else None
-        ),
+        "worker_slot_count": worker_slot_count,
         "cluster_seconds_per_query": safe_div(wall_clock_seconds, float(total_query_count)),
         "single_gpu_seconds_per_query": safe_div(
             wall_clock_seconds * float(physical_gpu_count),
@@ -374,6 +451,156 @@ def format_table(rows: list[dict[str, Any]], columns: list[tuple[str, str]]) -> 
     return "\n".join(lines)
 
 
+def load_run_payload(run_root: Path) -> dict[str, Any]:
+    summary = load_json_if_exists(run_root / SUMMARY_BASENAME)
+    task_records = load_jsonl(run_root / TASK_METRICS_BASENAME)
+    profile_records = load_jsonl(run_root / TASK_PROFILES_BASENAME)
+    hardware_records = load_jsonl(run_root / HARDWARE_TELEMETRY_BASENAME)
+    base_path = None if summary is None else summary.get("base_path")
+    run_label = Path(str(base_path)).name if base_path else run_root.name
+    launched_at_unix = _resolve_launch_timestamp_unix(run_root)
+    finished_at_unix = max(
+        (
+            float(record["finished_at_unix"])
+            for record in task_records
+            if record.get("finished_at_unix") is not None
+        ),
+        default=None,
+    )
+    return {
+        "run_root": str(run_root.resolve()),
+        "run_label": run_label,
+        "summary": summary,
+        "task_records": task_records,
+        "profile_records": profile_records,
+        "hardware_records": hardware_records,
+        "launched_at_unix": launched_at_unix,
+        "finished_at_unix": finished_at_unix,
+        "overview": summarize_run_overview(summary, task_records),
+        "physical_gpu_ids": _resolve_run_gpu_ids(summary, task_records),
+    }
+
+
+def summarize_run_collection(run_payloads: list[dict[str, Any]]) -> dict[str, Any]:
+    task_records = [
+        record
+        for payload in run_payloads
+        for record in payload["task_records"]
+    ]
+    profile_records = [
+        record
+        for payload in run_payloads
+        for record in payload["profile_records"]
+    ]
+    hardware_records = [
+        record
+        for payload in run_payloads
+        for record in payload["hardware_records"]
+    ]
+
+    launched_at_candidates = [
+        float(payload["launched_at_unix"])
+        for payload in run_payloads
+        if payload.get("launched_at_unix") is not None
+    ]
+    if not launched_at_candidates:
+        launched_at_candidates = [
+            float(record["started_at_unix"])
+            for record in task_records
+            if record.get("started_at_unix") is not None
+        ]
+    finished_at_candidates = [
+        float(record["finished_at_unix"])
+        for record in task_records
+        if record.get("finished_at_unix") is not None
+    ]
+    wall_clock_seconds = 0.0
+    if launched_at_candidates and finished_at_candidates:
+        wall_clock_seconds = max(0.0, max(finished_at_candidates) - min(launched_at_candidates))
+
+    physical_gpu_ids = sorted(
+        {
+            int(gpu_id)
+            for payload in run_payloads
+            for gpu_id in payload.get("physical_gpu_ids", [])
+        }
+    )
+    total_query_count = int(
+        sum(
+            int(record.get("query_frame_count") or 0)
+            for record in task_records
+            if record.get("status") == "success"
+        )
+    )
+    total_task_seconds = float(
+        sum(
+            float(record.get("total_seconds") or 0.0)
+            for record in task_records
+            if record.get("status") == "success"
+        )
+    )
+    total_process_seconds = float(
+        sum(
+            float(record.get("process_seconds") or 0.0)
+            for record in task_records
+            if record.get("status") == "success"
+        )
+    )
+    total_save_seconds = float(
+        sum(
+            float(record.get("save_seconds") or 0.0)
+            for record in task_records
+            if record.get("status") == "success"
+        )
+    )
+    worker_slot_counts = [
+        payload["overview"]["worker_slot_count"]
+        for payload in run_payloads
+        if payload["overview"].get("worker_slot_count") is not None
+    ]
+    run_overview = []
+    for payload in run_payloads:
+        row = dict(payload["overview"])
+        row["run_label"] = payload["run_label"]
+        row["run_root"] = payload["run_root"]
+        run_overview.append(row)
+
+    return {
+        "run_payloads": run_payloads,
+        "task_records": task_records,
+        "profile_records": profile_records,
+        "hardware_records": hardware_records,
+        "overview": {
+            "task_count": int(sum(payload["overview"]["task_count"] for payload in run_payloads)),
+            "success_task_count": int(
+                sum(payload["overview"]["success_task_count"] for payload in run_payloads)
+            ),
+            "failed_task_count": int(
+                sum(payload["overview"]["failed_task_count"] for payload in run_payloads)
+            ),
+            "total_query_count": total_query_count,
+            "wall_clock_seconds": float(wall_clock_seconds),
+            "physical_gpu_count": int(len(physical_gpu_ids)),
+            "worker_slot_count": int(sum(worker_slot_counts)) if worker_slot_counts else None,
+            "cluster_seconds_per_query": safe_div(wall_clock_seconds, float(total_query_count)),
+            "single_gpu_seconds_per_query": safe_div(
+                wall_clock_seconds * float(len(physical_gpu_ids)),
+                float(total_query_count),
+            ),
+            "slot_seconds_per_query": safe_div(total_task_seconds, float(total_query_count)),
+            "process_slot_seconds_per_query": safe_div(
+                total_process_seconds,
+                float(total_query_count),
+            ),
+            "save_slot_seconds_per_query": safe_div(total_save_seconds, float(total_query_count)),
+        },
+        "run_overview": sorted(
+            run_overview,
+            key=lambda row: row["run_label"],
+        ),
+    }
+
+
 def build_markdown_report(analysis: dict[str, Any]) -> str:
     overview = analysis["overview"]
     sections = [
@@ -465,6 +692,27 @@ def build_markdown_report(analysis: dict[str, Any]) -> str:
         ),
     ]
 
+    if analysis.get("run_overview"):
+        sections.extend(
+            [
+                "",
+                "## Run Overview",
+                "",
+                format_table(
+                    analysis["run_overview"],
+                    [
+                        ("Run", "run_label"),
+                        ("Queries", "total_query_count"),
+                        ("Wall(s)", "wall_clock_seconds"),
+                        ("GPUs", "physical_gpu_count"),
+                        ("Slots", "worker_slot_count"),
+                        ("SingleGPU/query", "single_gpu_seconds_per_query"),
+                        ("Root", "run_root"),
+                    ],
+                ),
+            ]
+        )
+
     if analysis["process_profile"]:
         sections.extend(
             [
@@ -543,14 +791,19 @@ def build_markdown_report(analysis: dict[str, Any]) -> str:
     return "\n".join(sections) + "\n"
 
 
-def build_analysis(run_root: Path) -> dict[str, Any]:
-    summary = load_json(run_root / SUMMARY_BASENAME)
-    task_records = load_jsonl(run_root / TASK_METRICS_BASENAME)
-    profile_records = load_jsonl(run_root / TASK_PROFILES_BASENAME)
-    hardware_records = load_jsonl(run_root / HARDWARE_TELEMETRY_BASENAME)
+def build_analysis(run_roots: list[Path]) -> dict[str, Any]:
+    resolved_run_roots = [run_root.resolve() for run_root in run_roots]
+    run_payloads = [load_run_payload(run_root) for run_root in resolved_run_roots]
+    collection = summarize_run_collection(run_payloads)
+    task_records = collection["task_records"]
+    profile_records = collection["profile_records"]
+    hardware_records = collection["hardware_records"]
     return {
-        "summary": summary,
-        "overview": summarize_run_overview(summary, task_records),
+        "run_roots": [str(run_root) for run_root in resolved_run_roots],
+        "run_payloads": run_payloads,
+        "summary": run_payloads[0]["summary"] if len(run_payloads) == 1 else None,
+        "overview": collection["overview"],
+        "run_overview": collection["run_overview"] if len(run_payloads) > 1 else [],
         "by_camera": summarize_task_groups(task_records, group_fields=("camera_name",)),
         "by_camera_profile": summarize_task_groups(
             task_records,
@@ -574,8 +827,7 @@ def build_analysis(run_root: Path) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
-    run_root = args.run_root.resolve()
-    analysis = build_analysis(run_root)
+    analysis = build_analysis(args.run_root)
     report = build_markdown_report(analysis)
     print(report, end="")
 

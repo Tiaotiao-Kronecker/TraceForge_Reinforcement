@@ -111,6 +111,8 @@ class InferCliSurfaceTests(unittest.TestCase):
         self.assertIn("--collect_profile_stats", _CLI_FLAGS)
         self.assertIn("--depth_filter_workers", _CLI_FLAGS)
         self.assertIn("--depth_filter_blas_threads", _CLI_FLAGS)
+        self.assertIn("--resize_width", _CLI_FLAGS)
+        self.assertIn("--resize_height", _CLI_FLAGS)
 
     def test_num_iters_default_is_three(self):
         self.assertEqual(_CLI_DEFAULTS.get("--num_iters"), 3)

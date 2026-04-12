@@ -13,6 +13,9 @@
 - `benchmark_inference_variants.py`
   - 对比当前工作树内多种 inference 配置的端到端耗时与保存结果差异
   - 支持共享 query-frame schedule、process breakdown、dense 轨迹差异统计、以及可选验证图导出
+- `aggregate_inference_variants_manifest.py`
+  - 聚合多个 `benchmark_inference_variants.py` 的 per-episode summary
+  - 当前用于 `support_grid_ratio` sweep 这类需要先单集运行、再跨 episode 汇总的实验
 - `benchmark_num_iters_sweep.py`
   - 对比 tracker `num_iters` 变体的端到端耗时与保存结果差异
   - 默认跑 `6,5,4`，并固定 `support_grid_ratio=0`，输出 process/save/profile 汇总、定量轨迹差异、可选验证图，以及可直接运行的 3D 动画命令
@@ -47,6 +50,8 @@
   - `python scripts/data_analysis/benchmark_num_iters_manifest.py --manifest scripts/data_analysis/manifests/wipe_the_table_gs_external_only_pilot_20260407.json --camera-names varied_camera_1,varied_camera_2 --num-iters-values 5,4,3 --baseline-num-iters 5 --support-grid-ratio 0 --warmup-runs 1 --benchmark-runs 1 --run-visual-verification`
 - `wipe_the_table_gs` external-only median3 baseline telemetry：
   - `python scripts/data_analysis/benchmark_num_iters_manifest.py --manifest scripts/data_analysis/manifests/wipe_the_table_gs_external_only_median3_20260407.json --camera-names varied_camera_1,varied_camera_2 --num-iters-values 5 --baseline-num-iters 5 --support-grid-ratio 0 --warmup-runs 1 --benchmark-runs 3`
+- `wipe_the_table_gs` external-only median3 support-grid 汇总：
+  - `python scripts/data_analysis/aggregate_inference_variants_manifest.py --manifest scripts/data_analysis/manifests/wipe_the_table_gs_external_only_median3_20260407.json --episode-output-root /DATA/disk3/tmp/wipe_support_sweep_20260410 --output-root /DATA/disk3/tmp/wipe_support_sweep_20260410/aggregate`
 - `press_one_button_demo_v5` pilot baseline + `num_iters=5,4,3,2,1`：
   - `python scripts/data_analysis/benchmark_num_iters_manifest.py --manifest scripts/data_analysis/manifests/press_one_button_demo_v5_pilot.json --camera-names varied_camera_1,varied_camera_2 --num-iters-values 5,4,3,2,1 --baseline-num-iters 5 --support-grid-ratio 0 --warmup-runs 1 --benchmark-runs 1 --run-visual-verification`
 - `press_one_button_demo_v5` median3 volatility scan：

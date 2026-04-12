@@ -302,6 +302,10 @@ def build_camera_task_metric_record(
     status: str,
     retryable_cuda_error: bool,
     error_message: str | None,
+    original_frame_height: int | None = None,
+    original_frame_width: int | None = None,
+    processing_frame_height: int | None = None,
+    processing_frame_width: int | None = None,
 ) -> dict[str, Any]:
     total_seconds = None
     if process_seconds is not None and save_seconds is not None:
@@ -321,6 +325,21 @@ def build_camera_task_metric_record(
         "camera_num_iters_overrides": dict(getattr(args, "camera_num_iters_overrides", {})),
         "depth_filter_workers": int(getattr(args, "depth_filter_workers", _DEFAULT_DEPTH_FILTER_WORKERS)),
         "traj_filter_profile": getattr(args, "traj_filter_profile", None),
+        "resize_enabled": bool(getattr(args, "processing_resize_hw", None) is not None),
+        "resize_width": getattr(args, "resize_width", None),
+        "resize_height": getattr(args, "resize_height", None),
+        "original_frame_height": (
+            int(original_frame_height) if original_frame_height is not None else None
+        ),
+        "original_frame_width": (
+            int(original_frame_width) if original_frame_width is not None else None
+        ),
+        "processing_frame_height": (
+            int(processing_frame_height) if processing_frame_height is not None else None
+        ),
+        "processing_frame_width": (
+            int(processing_frame_width) if processing_frame_width is not None else None
+        ),
         "shared_schedule_camera_names": list(
             getattr(args, "shared_schedule_camera_names", getattr(args, "camera_names", []))
         ),
@@ -366,6 +385,10 @@ def build_camera_task_profile_record(
     save_profile_stats: dict[str, float] | None,
     per_query_save_seconds: dict[int, float] | None,
     scene_finalize_overhead_seconds: float | None,
+    original_frame_height: int | None = None,
+    original_frame_width: int | None = None,
+    processing_frame_height: int | None = None,
+    processing_frame_width: int | None = None,
 ) -> dict[str, Any]:
     normalized_per_query_save_seconds = {
         str(int(query_frame_idx)): float(seconds)
@@ -386,6 +409,21 @@ def build_camera_task_profile_record(
         "camera_num_iters_overrides": dict(getattr(args, "camera_num_iters_overrides", {})),
         "depth_filter_workers": int(getattr(args, "depth_filter_workers", _DEFAULT_DEPTH_FILTER_WORKERS)),
         "traj_filter_profile": getattr(args, "traj_filter_profile", None),
+        "resize_enabled": bool(getattr(args, "processing_resize_hw", None) is not None),
+        "resize_width": getattr(args, "resize_width", None),
+        "resize_height": getattr(args, "resize_height", None),
+        "original_frame_height": (
+            int(original_frame_height) if original_frame_height is not None else None
+        ),
+        "original_frame_width": (
+            int(original_frame_width) if original_frame_width is not None else None
+        ),
+        "processing_frame_height": (
+            int(processing_frame_height) if processing_frame_height is not None else None
+        ),
+        "processing_frame_width": (
+            int(processing_frame_width) if processing_frame_width is not None else None
+        ),
         "shared_schedule_camera_names": list(
             getattr(args, "shared_schedule_camera_names", getattr(args, "camera_names", []))
         ),
@@ -419,7 +457,6 @@ def build_batch_run_summary(
     args: argparse.Namespace,
     base_path: Path,
     out_dir: Path | None,
-    telemetry_out_dir: Path | None,
     gpu_ids: list[int],
     telemetry_gpu_ids: list[int],
     host_name: str | None,
@@ -430,6 +467,7 @@ def build_batch_run_summary(
     total_camera_success: int,
     total_camera_fail: int,
     wall_clock_seconds: float,
+    telemetry_out_dir: Path | None = None,
 ) -> dict[str, Any]:
     return {
         "base_path": str(base_path.resolve()),
@@ -467,6 +505,9 @@ def build_batch_run_summary(
         "future_len": int(args.future_len),
         "grid_size": int(args.grid_size),
         "support_grid_ratio": float(args.support_grid_ratio),
+        "resize_enabled": bool(getattr(args, "processing_resize_hw", None) is not None),
+        "resize_width": getattr(args, "resize_width", None),
+        "resize_height": getattr(args, "resize_height", None),
         "filter_level": args.filter_level,
         "traj_filter_profile": args.traj_filter_profile,
         "external_geom_name": args.external_geom_name,
@@ -646,6 +687,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fps", type=int, default=1)
     parser.add_argument("--max_num_frames", type=int, default=512)
+    parser.add_argument(
+        "--resize_width",
+        type=int,
+        default=None,
+        help="Optional processing width override for experiments. Defaults to the source width.",
+    )
+    parser.add_argument(
+        "--resize_height",
+        type=int,
+        default=None,
+        help="Optional processing height override for experiments. Defaults to the source height.",
+    )
     parser.add_argument("--save_video", action="store_true", default=False)
     parser.add_argument(
         "--output_layout",
@@ -825,6 +878,7 @@ def parse_args() -> argparse.Namespace:
         args.camera_num_iters,
         option_name="--camera_num_iters",
     )
+    args.processing_resize_hw = infer._resolve_processing_resize_hw(args)
 
     if args.fps <= 0:
         raise ValueError("--fps must be >= 1 for shared per-second keyframe sampling.")
@@ -852,6 +906,17 @@ def parse_args() -> argparse.Namespace:
             "--camera_num_iters contains cameras outside --camera_names: "
             + ",".join(unknown_override_cameras)
         )
+    if args.processing_resize_hw is not None:
+        if args.scene_storage_mode == "source_ref":
+            raise ValueError(
+                "Resize experiments require --scene_storage_mode cache; source_ref would still point at "
+                "the full-resolution inputs."
+            )
+        if args.out_dir is None:
+            raise ValueError(
+                "Resize experiments require an explicit --out_dir so the resized artifacts do not overwrite "
+                "in-place trajectory outputs."
+            )
 
     return args
 
@@ -1725,6 +1790,10 @@ def save_result(
         depth_source_path=str(episode_dir / "depth" / camera_name),
         source_frame_indices=result["source_frame_indices"],
         query_frame_metadata=result.get("query_frame_metadata"),
+        original_frame_height=result.get("original_frame_height"),
+        original_frame_width=result.get("original_frame_width"),
+        processing_frame_height=result.get("processing_frame_height"),
+        processing_frame_width=result.get("processing_frame_width"),
     )
 
 
@@ -1815,6 +1884,26 @@ def run_camera_task(
                     status=status,
                     retryable_cuda_error=retryable_cuda_error,
                     error_message=error_message,
+                    original_frame_height=(
+                        result.get("original_frame_height")
+                        if isinstance(result, dict)
+                        else None
+                    ),
+                    original_frame_width=(
+                        result.get("original_frame_width")
+                        if isinstance(result, dict)
+                        else None
+                    ),
+                    processing_frame_height=(
+                        result.get("processing_frame_height")
+                        if isinstance(result, dict)
+                        else None
+                    ),
+                    processing_frame_width=(
+                        result.get("processing_frame_width")
+                        if isinstance(result, dict)
+                        else None
+                    ),
                 )
             )
             if bool(getattr(camera_args, "collect_profile_stats", False)):
@@ -1853,6 +1942,26 @@ def run_camera_task(
                         scene_finalize_overhead_seconds=(
                             save_artifacts.get("scene_finalize_overhead_seconds")
                             if isinstance(save_artifacts, dict)
+                            else None
+                        ),
+                        original_frame_height=(
+                            result.get("original_frame_height")
+                            if isinstance(result, dict)
+                            else None
+                        ),
+                        original_frame_width=(
+                            result.get("original_frame_width")
+                            if isinstance(result, dict)
+                            else None
+                        ),
+                        processing_frame_height=(
+                            result.get("processing_frame_height")
+                            if isinstance(result, dict)
+                            else None
+                        ),
+                        processing_frame_width=(
+                            result.get("processing_frame_width")
+                            if isinstance(result, dict)
                             else None
                         ),
                     )

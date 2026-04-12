@@ -4,6 +4,7 @@ import numpy as np
 import cv2
 import mediapy as media
 import torch
+import torch.nn.functional as F
 import contextlib
 import ctypes
 from PIL import Image
@@ -36,7 +37,7 @@ from utils.traceforge_artifact_utils import (
 from datasets.data_ops import _build_depth_filter_rays, _filter_one_depth_profiled
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Tuple
-from utils.inference_utils import load_model, inference
+from utils.inference_utils import load_model, inference, resize_depth_bilinear
 from utils.threed_utils import (
     project_tracks_3d_to_2d,
     project_tracks_3d_to_3d,
@@ -153,6 +154,95 @@ def _count_true(mask: np.ndarray | None) -> int:
 
 def _resolve_depth_filter_workers(args) -> int:
     return max(1, int(getattr(args, "depth_filter_workers", 8)))
+
+
+def _resolve_processing_resize_hw(args) -> tuple[int, int] | None:
+    resize_width = getattr(args, "resize_width", None)
+    resize_height = getattr(args, "resize_height", None)
+    if resize_width is None and resize_height is None:
+        return None
+    if resize_width is None or resize_height is None:
+        raise ValueError("--resize_width and --resize_height must be provided together.")
+
+    resize_width = int(resize_width)
+    resize_height = int(resize_height)
+    if resize_width <= 1 or resize_height <= 1:
+        raise ValueError("--resize_width and --resize_height must both be > 1.")
+    return resize_height, resize_width
+
+
+def _resize_intrinsics_to_hw(
+    intrinsics: np.ndarray,
+    *,
+    original_hw: tuple[int, int],
+    target_hw: tuple[int, int],
+) -> np.ndarray:
+    resized_intrinsics = np.asarray(intrinsics, dtype=np.float32).copy()
+    original_h, original_w = original_hw
+    target_h, target_w = target_hw
+
+    scale_x = float(target_w - 1) / float(max(1, original_w - 1))
+    scale_y = float(target_h - 1) / float(max(1, original_h - 1))
+    resized_intrinsics[:, 0, :] *= scale_x
+    resized_intrinsics[:, 1, :] *= scale_y
+    return resized_intrinsics
+
+
+def _resize_scene_inputs(
+    *,
+    video_ten: torch.Tensor,
+    depth_npy: np.ndarray,
+    depth_conf_npy: np.ndarray,
+    intrs_npy: np.ndarray,
+    target_hw: tuple[int, int],
+) -> tuple[torch.Tensor, np.ndarray, np.ndarray, np.ndarray]:
+    original_hw = (int(video_ten.shape[-2]), int(video_ten.shape[-1]))
+    if target_hw == original_hw:
+        return (
+            video_ten,
+            np.asarray(depth_npy, dtype=np.float32),
+            np.asarray(depth_conf_npy, dtype=np.float32),
+            np.asarray(intrs_npy, dtype=np.float32),
+        )
+
+    target_h, target_w = target_hw
+    resized_video = F.interpolate(
+        video_ten,
+        size=(target_h, target_w),
+        mode="bilinear",
+        align_corners=False,
+        antialias=True,
+    ).clamp(0.0, 1.0)
+    resized_depths = np.stack(
+        [
+            resize_depth_bilinear(np.asarray(depth_frame, dtype=np.float32), (target_w, target_h))
+            for depth_frame in np.asarray(depth_npy, dtype=np.float32)
+        ],
+        axis=0,
+    ).astype(np.float32, copy=False)
+    resized_depth_conf = (resized_depths > 0).astype(np.float32, copy=False)
+    resized_intrinsics = _resize_intrinsics_to_hw(
+        intrs_npy,
+        original_hw=original_hw,
+        target_hw=target_hw,
+    )
+    return resized_video, resized_depths, resized_depth_conf, resized_intrinsics
+
+
+def _append_frame_resolution_metadata(
+    sample_data: dict[str, np.ndarray],
+    *,
+    original_frame_height: int | None,
+    original_frame_width: int | None,
+    processing_frame_height: int | None,
+    processing_frame_width: int | None,
+) -> None:
+    if original_frame_height is not None and original_frame_width is not None:
+        sample_data["original_frame_height"] = np.array([int(original_frame_height)], dtype=np.int32)
+        sample_data["original_frame_width"] = np.array([int(original_frame_width)], dtype=np.int32)
+    if processing_frame_height is not None and processing_frame_width is not None:
+        sample_data["processing_frame_height"] = np.array([int(processing_frame_height)], dtype=np.int32)
+        sample_data["processing_frame_width"] = np.array([int(processing_frame_width)], dtype=np.int32)
 
 
 _NATIVE_THREAD_LIMIT_LOCK = threading.RLock()
@@ -855,6 +945,18 @@ def parse_args():
         help="Optional output video name override. If set, output folder/file names use this value.",
     )
     parser.add_argument("--max_num_frames", type=int, default=512)
+    parser.add_argument(
+        "--resize_width",
+        type=int,
+        default=None,
+        help="Optional processing width override for experiments. Defaults to the source width.",
+    )
+    parser.add_argument(
+        "--resize_height",
+        type=int,
+        default=None,
+        help="Optional processing height override for experiments. Defaults to the source height.",
+    )
     parser.add_argument("--save_video", action="store_true", default=False)
     parser.add_argument(
         "--output_layout",
@@ -1084,6 +1186,19 @@ def parse_args():
         parser.error("--depth_filter_workers must be >= 1.")
     if args.depth_filter_blas_threads < 0:
         parser.error("--depth_filter_blas_threads must be >= 0.")
+    try:
+        args.processing_resize_hw = _resolve_processing_resize_hw(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if (
+        args.processing_resize_hw is not None
+        and args.output_layout == V2_LAYOUT
+        and args.scene_storage_mode == SCENE_STORAGE_SOURCE_REF
+    ):
+        parser.error(
+            "Resize experiments require --scene_storage_mode cache when using v2 output; "
+            "source_ref would still point at the full-resolution inputs."
+        )
     return args
 
 def retarget_trajectories(
@@ -1537,6 +1652,10 @@ def prepare_query_frame_sample_bundle(
         "dense_keypoints": dense_keypoints.astype(np.float32, copy=False),
         "tracked_query_indices": tracked_query_indices.astype(np.int32, copy=False),
         "support_grid_size": frame_data.get("support_grid_size"),
+        "original_frame_H": frame_data.get("original_frame_H"),
+        "original_frame_W": frame_data.get("original_frame_W"),
+        "processing_frame_H": frame_data.get("processing_frame_H"),
+        "processing_frame_W": frame_data.get("processing_frame_W"),
         "prefilter_result": frame_data.get("prefilter_result"),
         "visibs": visibs_np,
         "query_frame_img": query_frame_img,
@@ -1789,12 +1908,20 @@ def build_v2_sample_data(
     }
     if prepared_bundle.get("support_grid_size") is not None:
         sample_data["support_grid_size"] = np.array([int(prepared_bundle["support_grid_size"])], dtype=np.int32)
+    _append_frame_resolution_metadata(
+        sample_data,
+        original_frame_height=prepared_bundle.get("original_frame_H"),
+        original_frame_width=prepared_bundle.get("original_frame_W"),
+        processing_frame_height=prepared_bundle.get("processing_frame_H"),
+        processing_frame_width=prepared_bundle.get("processing_frame_W"),
+    )
     if "visibility" in sample_payload:
         sample_data["visibility"] = sample_payload["visibility"]
     sample_data = _pad_v2_sample_data_to_future_len(sample_data=sample_data, future_len=future_len)
 
     return {
         "sample_data": sample_data,
+        "sample_payload": sample_payload,
         "traj_filter_result": bundle["traj_filter_result"],
     }
 
@@ -2046,6 +2173,13 @@ def save_single_query_frame_legacy(
     }
     if prepared_bundle.get("support_grid_size") is not None:
         sample_data["support_grid_size"] = np.array([int(prepared_bundle["support_grid_size"])], dtype=np.int32)
+    _append_frame_resolution_metadata(
+        sample_data,
+        original_frame_height=prepared_bundle.get("original_frame_H"),
+        original_frame_width=prepared_bundle.get("original_frame_W"),
+        processing_frame_height=prepared_bundle.get("processing_frame_H"),
+        processing_frame_width=prepared_bundle.get("processing_frame_W"),
+    )
     if "visibility" in sample_payload:
         sample_data["visibility"] = sample_payload["visibility"]
 
@@ -2104,6 +2238,7 @@ def save_single_query_frame_v2(
         save_profile_stats=save_profile_stats,
     )
     sample_data = built_sample["sample_data"]
+    sample_payload = built_sample["sample_payload"]
     traj_filter_result = built_sample["traj_filter_result"]
 
     sample_write_start = time.perf_counter()
@@ -2146,6 +2281,10 @@ def save_structured_data(
     depth_source_path: str | None = None,
     source_frame_indices=None,
     query_frame_metadata: dict[str, object] | None = None,
+    original_frame_height: int | None = None,
+    original_frame_width: int | None = None,
+    processing_frame_height: int | None = None,
+    processing_frame_width: int | None = None,
 ):
     """Save TraceForge inference artifacts."""
     del intrinsics, extrinsics, query_points_per_frame
@@ -2156,6 +2295,11 @@ def save_structured_data(
         if filter_args is not None
         else DEFAULT_SCENE_STORAGE_MODE
     )
+    processing_resize_hw = None
+    if filter_args is not None:
+        processing_resize_hw = getattr(filter_args, "processing_resize_hw", None)
+        if processing_resize_hw is None:
+            processing_resize_hw = _resolve_processing_resize_hw(filter_args)
     video_output_dir = Path(output_dir) / video_name
     video_output_dir.mkdir(parents=True, exist_ok=True)
     save_profile_stats = {} if bool(getattr(filter_args, "collect_profile_stats", False)) else None
@@ -2193,6 +2337,15 @@ def save_structured_data(
             "scene_storage_mode='source_ref' currently requires --depth_pose_method external. "
             "Use --scene_storage_mode cache for non-external geometry pipelines."
         )
+    if (
+        layout == V2_LAYOUT
+        and scene_storage_mode == SCENE_STORAGE_SOURCE_REF
+        and processing_resize_hw is not None
+    ):
+        raise ValueError(
+            "scene_storage_mode='source_ref' cannot be used together with resize experiments; "
+            "use --scene_storage_mode cache so the saved scene matches the resized processing inputs."
+        )
 
     logger.info(f"Saving {len(query_frame_results)} query frame results using layout={layout}")
     filter_config = resolve_traj_filter_config(filter_args)
@@ -2217,6 +2370,22 @@ def save_structured_data(
         frame_count = int(full_video_shape[0])
         frame_height = int(full_video_shape[2])
         frame_width = int(full_video_shape[3])
+        resolved_processing_frame_height = (
+            int(processing_frame_height) if processing_frame_height is not None else frame_height
+        )
+        resolved_processing_frame_width = (
+            int(processing_frame_width) if processing_frame_width is not None else frame_width
+        )
+        resolved_original_frame_height = (
+            int(original_frame_height)
+            if original_frame_height is not None
+            else resolved_processing_frame_height
+        )
+        resolved_original_frame_width = (
+            int(original_frame_width)
+            if original_frame_width is not None
+            else resolved_processing_frame_width
+        )
         full_video_uint8 = None
         if scene_storage_mode == SCENE_STORAGE_CACHE:
             scene_video_uint8_start = time.perf_counter()
@@ -2341,6 +2510,10 @@ def save_structured_data(
                 "frame_count": frame_count,
                 "height": frame_height,
                 "width": frame_width,
+                "original_height": resolved_original_frame_height,
+                "original_width": resolved_original_frame_width,
+                "processing_height": resolved_processing_frame_height,
+                "processing_width": resolved_processing_frame_width,
                 "extrinsics_mode": "w2c",
                 "frame_drop_rate": frame_drop_rate,
                 "future_len": int(future_len),
@@ -2434,6 +2607,26 @@ def save_structured_data(
         )
     else:
         full_depths_np = None
+    resolved_processing_frame_height = (
+        int(processing_frame_height)
+        if processing_frame_height is not None
+        else int(_tensor_to_numpy(video_tensor).shape[-2])
+    )
+    resolved_processing_frame_width = (
+        int(processing_frame_width)
+        if processing_frame_width is not None
+        else int(_tensor_to_numpy(video_tensor).shape[-1])
+    )
+    resolved_original_frame_height = (
+        int(original_frame_height)
+        if original_frame_height is not None
+        else resolved_processing_frame_height
+    )
+    resolved_original_frame_width = (
+        int(original_frame_width)
+        if original_frame_width is not None
+        else resolved_processing_frame_width
+    )
     prepare_bundles_start = time.perf_counter()
     prepared_bundles = _prepare_query_frame_sample_bundles(
         query_frame_results=query_frame_results,
@@ -2520,6 +2713,10 @@ def save_structured_data(
         "intrinsics": _tensor_to_numpy(full_intrinsics if full_intrinsics is not None else intrinsics),
         "height": int(_tensor_to_numpy(video_tensor).shape[-2]),
         "width": int(_tensor_to_numpy(video_tensor).shape[-1]),
+        "original_height": int(resolved_original_frame_height),
+        "original_width": int(resolved_original_frame_width),
+        "processing_height": int(resolved_processing_frame_height),
+        "processing_width": int(resolved_processing_frame_width),
         "depths": _tensor_to_numpy(depths).astype(np.float16),
         "visibs": _tensor_to_numpy(visibs)[..., None],
     }
@@ -2749,6 +2946,31 @@ def load_scene_context(video_path, depth_path, args, model_depth_pose):
     else:
         depth_conf_npy = np.asarray(depth_conf).squeeze()
 
+    original_frame_H = int(video_ten.shape[-2])
+    original_frame_W = int(video_ten.shape[-1])
+    processing_resize_hw = getattr(args, "processing_resize_hw", None)
+    if processing_resize_hw is None:
+        processing_resize_hw = _resolve_processing_resize_hw(args)
+        setattr(args, "processing_resize_hw", processing_resize_hw)
+    if processing_resize_hw is not None:
+        resize_start = time.perf_counter()
+        video_ten, depth_npy, depth_conf_npy, intrs_npy = _resize_scene_inputs(
+            video_ten=video_ten,
+            depth_npy=depth_npy,
+            depth_conf_npy=depth_conf_npy,
+            intrs_npy=intrs_npy,
+            target_hw=processing_resize_hw,
+        )
+        _accumulate_profile_stat(
+            profile_stats,
+            "resize_scene_inputs_seconds",
+            time.perf_counter() - resize_start,
+        )
+        logger.info(
+            f"[{os.path.basename(video_path)}] resized processing inputs "
+            f"{original_frame_W}x{original_frame_H} -> {processing_resize_hw[1]}x{processing_resize_hw[0]}"
+        )
+
     # 恢复外部几何（避免影响后续视频处理）
     if _original_extrs is not None:
         model_depth_pose.external_extrs = _original_extrs
@@ -2837,6 +3059,10 @@ def load_scene_context(video_path, depth_path, args, model_depth_pose):
         "video_length": int(video_length),
         "frame_H": int(frame_H),
         "frame_W": int(frame_W),
+        "original_frame_H": int(original_frame_H),
+        "original_frame_W": int(original_frame_W),
+        "processing_frame_H": int(frame_H),
+        "processing_frame_W": int(frame_W),
         "dense_query_keypoints": dense_query_keypoints.astype(np.float32, copy=False),
         "query_frames": [int(frame_idx) for frame_idx in query_frames],
         "query_points_per_frame": query_points_per_frame,
@@ -3002,6 +3228,10 @@ def _run_query_frame_core(
             "depths_segment": depths_cpu,
             "intrinsics_segment": intrinsics_cpu,
             "extrinsics_segment": extrinsics_cpu,
+            "original_frame_H": int(scene_ctx["original_frame_H"]),
+            "original_frame_W": int(scene_ctx["original_frame_W"]),
+            "processing_frame_H": int(scene_ctx["processing_frame_H"]),
+            "processing_frame_W": int(scene_ctx["processing_frame_W"]),
             "dense_keypoints": dense_query_keypoints.astype(np.float32, copy=False),
             "tracked_query_indices": tracked_query_indices.astype(np.int32, copy=False),
             "prefilter_result": prefilter_result,
@@ -3118,6 +3348,10 @@ def save_source_ref_v2_query_results(
     frame_count: int,
     frame_height: int,
     frame_width: int,
+    original_frame_height: int | None = None,
+    original_frame_width: int | None = None,
+    processing_frame_height: int | None = None,
+    processing_frame_width: int | None = None,
 ):
     scene_storage_mode = (
         getattr(filter_args, "scene_storage_mode", DEFAULT_SCENE_STORAGE_MODE)
@@ -3131,6 +3365,11 @@ def save_source_ref_v2_query_results(
         raise ValueError("save_source_ref_v2_query_results only supports source_ref scene storage")
     if query_frame_results is None:
         raise ValueError("query_frame_results is required")
+    if getattr(filter_args, "processing_resize_hw", None) is not None:
+        raise ValueError(
+            "save_source_ref_v2_query_results does not support resize experiments; "
+            "use scene_storage_mode=cache so the saved scene matches the resized inputs."
+        )
 
     video_output_dir = Path(output_dir) / video_name
     video_output_dir.mkdir(parents=True, exist_ok=True)
@@ -3229,6 +3468,10 @@ def save_source_ref_v2_query_results(
             "frame_count": int(frame_count),
             "height": int(frame_height),
             "width": int(frame_width),
+            "original_height": int(original_frame_height or frame_height),
+            "original_width": int(original_frame_width or frame_width),
+            "processing_height": int(processing_frame_height or frame_height),
+            "processing_width": int(processing_frame_width or frame_width),
             "extrinsics_mode": "w2c",
             "frame_drop_rate": None
             if query_frame_metadata.get("query_frame_sampling_mode") != "uniform_grid"
@@ -3437,6 +3680,10 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
             scene_ctx["query_frame_metadata"].get("skipped_short_tail_query_frame_source_indices", []) or []
         ),
         "depth_conf": scene_ctx["depth_conf"],
+        "original_frame_height": int(scene_ctx["original_frame_H"]),
+        "original_frame_width": int(scene_ctx["original_frame_W"]),
+        "processing_frame_height": int(scene_ctx["processing_frame_H"]),
+        "processing_frame_width": int(scene_ctx["processing_frame_W"]),
         "query_frame_results": query_frame_results,
         "full_intrinsics": np.asarray(scene_ctx["intrs_npy"], dtype=np.float32),
         "full_extrinsics": np.asarray(scene_ctx["extrs_npy"], dtype=np.float32),
@@ -3807,6 +4054,10 @@ if __name__ == "__main__":
                 depth_source_path=depth_path,
                 source_frame_indices=result["source_frame_indices"],
                 query_frame_metadata=result.get("query_frame_metadata"),
+                original_frame_height=result.get("original_frame_height"),
+                original_frame_width=result.get("original_frame_width"),
+                processing_frame_height=result.get("processing_frame_height"),
+                processing_frame_width=result.get("processing_frame_width"),
             )
 
         except Exception as e:

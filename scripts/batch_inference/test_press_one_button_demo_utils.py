@@ -300,6 +300,8 @@ class PressOneButtonCliSurfaceTests(unittest.TestCase):
         self.assertIn("--depth_filter_workers", _CLI_FLAGS)
         self.assertIn("--camera_num_iters", _CLI_FLAGS)
         self.assertIn("--shared_schedule_camera_names", _CLI_FLAGS)
+        self.assertIn("--resize_width", _CLI_FLAGS)
+        self.assertIn("--resize_height", _CLI_FLAGS)
 
     def test_num_iters_default_is_three(self):
         self.assertEqual(_CLI_DEFAULTS.get("--num_iters"), 3)
@@ -407,6 +409,9 @@ class BatchTelemetryRecordTests(unittest.TestCase):
                 "camera_num_iters_overrides": {"varied_camera_1": 4},
                 "depth_filter_workers": 12,
                 "traj_filter_profile": "external",
+                "processing_resize_hw": (180, 320),
+                "resize_width": 320,
+                "resize_height": 180,
             },
         )()
 
@@ -426,6 +431,10 @@ class BatchTelemetryRecordTests(unittest.TestCase):
             status="success",
             retryable_cuda_error=False,
             error_message=None,
+            original_frame_height=360,
+            original_frame_width=640,
+            processing_frame_height=180,
+            processing_frame_width=320,
         )
 
         self.assertEqual(record["episode_name"], "episode_00001_green")
@@ -435,6 +444,11 @@ class BatchTelemetryRecordTests(unittest.TestCase):
         self.assertEqual(record["depth_filter_workers"], 12)
         self.assertEqual(record["worker_label"], "GPU 0 slot 1/4")
         self.assertEqual(record["query_frame_count"], 10)
+        self.assertTrue(record["resize_enabled"])
+        self.assertEqual(record["resize_width"], 320)
+        self.assertEqual(record["resize_height"], 180)
+        self.assertEqual(record["original_frame_height"], 360)
+        self.assertEqual(record["processing_frame_width"], 320)
         self.assertAlmostEqual(record["process_seconds_per_query"], 5.0)
         self.assertAlmostEqual(record["save_seconds_per_query"], 0.2)
         self.assertAlmostEqual(record["total_seconds_per_query"], 5.2)
@@ -458,6 +472,9 @@ class BatchTelemetryRecordTests(unittest.TestCase):
                 "camera_num_iters_overrides": {"varied_camera_1": 4},
                 "depth_filter_workers": 8,
                 "traj_filter_profile": "external",
+                "processing_resize_hw": (180, 320),
+                "resize_width": 320,
+                "resize_height": 180,
             },
         )()
 
@@ -481,6 +498,10 @@ class BatchTelemetryRecordTests(unittest.TestCase):
             save_profile_stats={"sample_write_seconds": 1.0},
             per_query_save_seconds={7: 0.5, 9: 0.7},
             scene_finalize_overhead_seconds=0.3,
+            original_frame_height=360,
+            original_frame_width=640,
+            processing_frame_height=180,
+            processing_frame_width=320,
         )
 
         self.assertEqual(record["worker_label"], "GPU 0 slot 1/2")
@@ -490,6 +511,8 @@ class BatchTelemetryRecordTests(unittest.TestCase):
         self.assertEqual(record["save_profile_stats"]["sample_write_seconds"], 1.0)
         self.assertEqual(record["per_query_save_seconds"], {"7": 0.5, "9": 0.7})
         self.assertAlmostEqual(record["scene_finalize_overhead_seconds"], 0.3)
+        self.assertTrue(record["resize_enabled"])
+        self.assertEqual(record["processing_frame_height"], 180)
 
     def test_build_batch_run_summary_preserves_fixed_keyframe_config(self):
         args = type(
@@ -512,6 +535,9 @@ class BatchTelemetryRecordTests(unittest.TestCase):
                 "future_len": 32,
                 "grid_size": 80,
                 "support_grid_ratio": 0.8,
+                "processing_resize_hw": (180, 320),
+                "resize_width": 320,
+                "resize_height": 180,
                 "filter_level": "standard",
                 "traj_filter_profile": "auto",
                 "external_geom_name": "trajectory_valid.h5",
@@ -554,6 +580,9 @@ class BatchTelemetryRecordTests(unittest.TestCase):
         self.assertEqual(summary["keyframes_per_sec_min"], 5)
         self.assertEqual(summary["keyframes_per_sec_max"], 5)
         self.assertAlmostEqual(summary["support_grid_ratio"], 0.8)
+        self.assertTrue(summary["resize_enabled"])
+        self.assertEqual(summary["resize_width"], 320)
+        self.assertEqual(summary["resize_height"], 180)
         self.assertAlmostEqual(summary["wall_clock_seconds"], 1234.5)
 
 
