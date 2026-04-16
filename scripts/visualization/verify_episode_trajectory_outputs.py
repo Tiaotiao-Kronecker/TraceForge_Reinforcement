@@ -1419,8 +1419,6 @@ def verify_camera(
             line_width=line_width,
             gif_fps=gif_fps,
             gif_dpi=gif_dpi,
-            camera_fit_mode=camera_fit_mode,
-            trajectory_fit_padding=trajectory_fit_padding,
         )
         frame_count_3d = create_3d_gif(
             camera_name=camera_name,
