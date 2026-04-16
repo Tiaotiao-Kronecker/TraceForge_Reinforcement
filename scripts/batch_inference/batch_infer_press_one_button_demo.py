@@ -504,6 +504,8 @@ def build_batch_run_summary(
         "max_num_frames": int(args.max_num_frames),
         "future_len": int(args.future_len),
         "grid_size": int(args.grid_size),
+        "grid_width": getattr(args, "grid_width", None),
+        "grid_height": getattr(args, "grid_height", None),
         "support_grid_ratio": float(args.support_grid_ratio),
         "resize_enabled": bool(getattr(args, "processing_resize_hw", None) is not None),
         "resize_width": getattr(args, "resize_width", None),
@@ -760,6 +762,18 @@ def parse_args() -> argparse.Namespace:
         help="Grid size per query frame; 80 means 6400 points",
     )
     parser.add_argument(
+        "--grid_width",
+        type=int,
+        default=None,
+        help="Optional rectangular query-grid width override. Requires --grid_height.",
+    )
+    parser.add_argument(
+        "--grid_height",
+        type=int,
+        default=None,
+        help="Optional rectangular query-grid height override. Requires --grid_width.",
+    )
+    parser.add_argument(
         "--query_prefilter_mode",
         type=str,
         default="off",
@@ -879,6 +893,7 @@ def parse_args() -> argparse.Namespace:
         option_name="--camera_num_iters",
     )
     args.processing_resize_hw = infer._resolve_processing_resize_hw(args)
+    args.query_grid_hw = infer._resolve_query_grid_hw(args)
 
     if args.fps <= 0:
         raise ValueError("--fps must be >= 1 for shared per-second keyframe sampling.")
@@ -2274,6 +2289,7 @@ def main() -> None:
     logger.info(
         f"keyframes_per_sec={args.keyframes_per_sec_min}~{args.keyframes_per_sec_max}, "
         f"future_len={args.future_len}, grid_size={args.grid_size}, "
+        f"grid_hw={getattr(args, 'query_grid_hw', None)}, "
         f"query_prefilter={args.query_prefilter_mode}, support_grid_ratio={args.support_grid_ratio}, "
         f"load_stride={args.fps}, depth_filter_workers={args.depth_filter_workers}"
     )

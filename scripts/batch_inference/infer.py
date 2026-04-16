@@ -171,6 +171,21 @@ def _resolve_processing_resize_hw(args) -> tuple[int, int] | None:
     return resize_height, resize_width
 
 
+def _resolve_query_grid_hw(args) -> tuple[int, int] | None:
+    grid_width = getattr(args, "grid_width", None)
+    grid_height = getattr(args, "grid_height", None)
+    if grid_width is None and grid_height is None:
+        return None
+    if grid_width is None or grid_height is None:
+        raise ValueError("--grid_width and --grid_height must be provided together.")
+
+    grid_width = int(grid_width)
+    grid_height = int(grid_height)
+    if grid_width <= 0 or grid_height <= 0:
+        raise ValueError("--grid_width and --grid_height must both be > 0.")
+    return grid_height, grid_width
+
+
 def _resize_intrinsics_to_hw(
     intrinsics: np.ndarray,
     *,
@@ -1037,6 +1052,18 @@ def parse_args():
         help="Grid size for uniform keypoint sampling (grid_size x grid_size points per frame). Default is 20 (400 points).",
     )
     parser.add_argument(
+        "--grid_width",
+        type=int,
+        default=None,
+        help="Optional rectangular query-grid width override. Requires --grid_height.",
+    )
+    parser.add_argument(
+        "--grid_height",
+        type=int,
+        default=None,
+        help="Optional rectangular query-grid height override. Requires --grid_width.",
+    )
+    parser.add_argument(
         "--query_prefilter_mode",
         type=str,
         default=DEFAULT_QUERY_PREFILTER_MODE,
@@ -1188,6 +1215,7 @@ def parse_args():
         parser.error("--depth_filter_blas_threads must be >= 0.")
     try:
         args.processing_resize_hw = _resolve_processing_resize_hw(args)
+        args.query_grid_hw = _resolve_query_grid_hw(args)
     except ValueError as exc:
         parser.error(str(exc))
     if (
@@ -1354,9 +1382,21 @@ def _tensor_frame_to_uint8_hwc(frame_tensor):
     return frame_np.transpose(1, 2, 0)
 
 
-def _build_grid_keypoints(frame_h: int, frame_w: int, grid_size: int) -> np.ndarray:
-    y_coords = np.linspace(0, frame_h - 1, grid_size)
-    x_coords = np.linspace(0, frame_w - 1, grid_size)
+def _build_grid_keypoints(
+    frame_h: int,
+    frame_w: int,
+    grid_size: int,
+    *,
+    grid_hw: tuple[int, int] | None = None,
+) -> np.ndarray:
+    if grid_hw is None:
+        grid_h = int(grid_size)
+        grid_w = int(grid_size)
+    else:
+        grid_h = int(grid_hw[0])
+        grid_w = int(grid_hw[1])
+    y_coords = np.linspace(0, frame_h - 1, grid_h)
+    x_coords = np.linspace(0, frame_w - 1, grid_w)
     xx, yy = np.meshgrid(x_coords, y_coords)
     return np.stack([xx.flatten(), yy.flatten()], axis=1).astype(np.float32)
 
@@ -2987,7 +3027,12 @@ def load_scene_context(video_path, depth_path, args, model_depth_pose):
     source_frame_indices = np.asarray(source_frame_indices, dtype=np.int32).reshape(-1)[:video_length]
 
     frame_H, frame_W = video_ten.shape[-2:]
-    dense_query_keypoints = _build_grid_keypoints(frame_H, frame_W, args.grid_size)
+    dense_query_keypoints = _build_grid_keypoints(
+        frame_H,
+        frame_W,
+        args.grid_size,
+        grid_hw=getattr(args, "query_grid_hw", None),
+    )
     query_prefilter_mode = str(getattr(args, "query_prefilter_mode", DEFAULT_QUERY_PREFILTER_MODE))
     query_prefilter_rank_keep_ratio = float(
         getattr(
