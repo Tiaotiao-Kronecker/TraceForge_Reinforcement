@@ -405,9 +405,6 @@ def main() -> None:
     else:
         supervision_full = np.asarray(supervision_full, dtype=bool) & finite_full
     stride = max(1, args.keypoint_stride)
-    if n_total > 500 and stride > 1:
-        stride = 1
-        logger.info(f"Keypoints 总数 {n_total} > 500，默认 stride 设为 1 以显示全部")
 
     if args.normalize_camera:
         traj_full = normalize_to_first_frame(traj_full, query_w2c)
