@@ -8,7 +8,7 @@ import logging
 from einops import rearrange, repeat
 import torch.nn as nn
 
-from utils.common_utils import batch_project, ensure_float32, cast_float32
+from utils.common_utils import batch_project
 from ..utils.layers import build_mlp
 from ..utils.cotracker_utils import posenc, bilinear_sampler, get_support_points
 from models.utils.cotracker_blocks import Attention, CrossAttnBlock, AttnBlock
@@ -355,7 +355,6 @@ class KNNCorrFeature4D_Optimized(nn.Module):
         assert ctx.verify_shared()
         return ctx
     
-    @ensure_float32(allow_cast=False)
     def prepare_window(self, *, shared_ctx: CorrContext, feats: torch.Tensor, pcds: torch.Tensor, queries: torch.Tensor, camera_locs: torch.Tensor, projector: Callable[[torch.Tensor], torch.Tensor]) -> CorrContext:
         ctx = shared_ctx.copy()
         assert ctx.verify_shared()
@@ -364,6 +363,10 @@ class KNNCorrFeature4D_Optimized(nn.Module):
 
         B, T = feats.shape[:2]
         N = queries.shape[1]
+
+        pcds = pcds.to(dtype=torch.float32)
+        queries = queries.to(dtype=torch.float32)
+        camera_locs = camera_locs.to(dtype=torch.float32)
 
         ctx.pcd_pyramid, ctx.feat_pyramid = self._build_pyramid(pcds, feats) # type: ignore
         assert ctx.feat_pyramid is not None and ctx.pcd_pyramid is not None and ctx.query_support_ti_pyramid is not None
@@ -376,7 +379,8 @@ class KNNCorrFeature4D_Optimized(nn.Module):
 
         query_times = queries[..., 0].long()
 
-        query_coords_2d_raw = projector(queries)[..., :2]
+        with torch.autocast("cuda", enabled=False):
+            query_coords_2d_raw = projector(queries)[..., :2]
         for i in range(len(ctx.feat_pyramid)):
             query_coords_2d = query_coords_2d_raw.clone()
             query_coords_2d[..., 0] *= ctx.feat_pyramid[i].shape[-1] / self.image_size[-1]
@@ -392,34 +396,36 @@ class KNNCorrFeature4D_Optimized(nn.Module):
             h, w = pcds.shape[-2:]
 
             interpolated_feats = rearrange(bilinear_sampler(
-                rearrange(feats, 'b t c h w -> b c t h w'), 
+                rearrange(feats, 'b t c h w -> b c t h w'),
                 rearrange(query_txy, 'b n c -> b n 1 1 c')
             ), 'b c n 1 1 -> b n c')
-            
-            projected_pcds = rearrange(ctx.projector(
-                torch.cat(
-                    [ 
-                        repeat(torch.arange(T, device=pcds.device, dtype=pcds.dtype), 't -> b (t h w) 1', b=B, h=h, w=w), 
-                        rearrange(pcds, 'b t c h w -> b (t h w) c', b=B),
-                    ], 
-                    dim=-1
-                )
-            ), 'b (t h w) c -> b t h w c', b=B, t=T, h=h, w=w)
+
+            with torch.autocast("cuda", enabled=False):
+                projected_pcds = rearrange(ctx.projector(
+                    torch.cat(
+                        [
+                            repeat(torch.arange(T, device=pcds.device, dtype=pcds.dtype), 't -> b (t h w) 1', b=B, h=h, w=w),
+                            rearrange(pcds, 'b t c h w -> b (t h w) c', b=B),
+                        ],
+                        dim=-1
+                    )
+                ), 'b (t h w) c -> b t h w c', b=B, t=T, h=h, w=w)
             pcds_depth = projected_pcds[..., -1:]
             ctx.depth_pyramid.append(pcds_depth)
 
-            # bilinear_sampler treats the coordinates as (x, y). 
+            # bilinear_sampler treats the coordinates as (x, y).
             # So we need to flip the coordinates to (i, t)
             support_features = rearrange(bilinear_sampler(
-                rearrange(feats, 'b t c h w -> b c t (h w)'), 
+                rearrange(feats, 'b t c h w -> b c t (h w)'),
                 rearrange(ctx.query_support_ti_pyramid[i].flip(-1), 'b n k c -> b (n k) 1 c'),
                 mode="nearest"
             ), 'b c (n k) 1 -> b n k c', n=N)
-            support_coords = rearrange(bilinear_sampler(
-                rearrange(pcds, 'b t c h w -> b c t (h w)'), 
-                rearrange(ctx.query_support_ti_pyramid[i].flip(-1), 'b n k c -> b (n k) 1 c'),
-                mode="nearest"
-            ), 'b c (n k) 1 -> b n k c', n=N)
+            with torch.autocast("cuda", enabled=False):
+                support_coords = rearrange(bilinear_sampler(
+                    rearrange(pcds, 'b t c h w -> b c t (h w)'),
+                    rearrange(ctx.query_support_ti_pyramid[i].flip(-1), 'b n k c -> b (n k) 1 c'),
+                    mode="nearest"
+                ), 'b c (n k) 1 -> b n k c', n=N)
 
             # add the query point itself as the first support point
             support_coords = torch.cat([
@@ -433,13 +439,14 @@ class KNNCorrFeature4D_Optimized(nn.Module):
 
             if self.use_local_pos_input:
                 # this only works when all queries are at t=0
-                support_coords_ = rearrange(support_coords, 'b n k c -> b (n k) c')
-                support_coords_ = torch.cat([
-                    support_coords_.new_zeros(B, support_coords_.shape[1], 1),
-                    support_coords_,
-                ], dim=-1)
-                projected_coords = ctx.projector(support_coords_)
-                support_depths = rearrange(projected_coords[..., -1:], 'b (n k) 1 -> b n k 1', b=B, n=N)
+                with torch.autocast("cuda", enabled=False):
+                    support_coords_ = rearrange(support_coords, 'b n k c -> b (n k) c')
+                    support_coords_ = torch.cat([
+                        support_coords_.new_zeros(B, support_coords_.shape[1], 1),
+                        support_coords_,
+                    ], dim=-1)
+                    projected_coords = ctx.projector(support_coords_)
+                    support_depths = rearrange(projected_coords[..., -1:], 'b (n k) 1 -> b n k 1', b=B, n=N)
                 
                 mean_depths = pcds_depth.mean(dim=(2, 3, 4))
                 std_depths = pcds_depth.std(dim=(2, 3, 4))
@@ -463,21 +470,22 @@ class KNNCorrFeature4D_Optimized(nn.Module):
         assert ctx.verify_window()
         return ctx
     
-    @cast_float32()
     def forward_level(self, ctx: Box, curr_coords: torch.Tensor, level: int, curr_knn_idx: torch.Tensor) -> torch.Tensor:
         B, T, feature_dim, H, W = ctx.feat_pyramid[level].shape
         num_points = ctx.query_feat_pyramid[level].shape[-2]
 
+        map_pcds = rearrange(ctx.pcd_pyramid[level], 'b t c h w -> (b t) (h w) c')
+        map_feats = rearrange(ctx.feat_pyramid[level], 'b t c h w -> (b t) (h w) c')
+        curr_coords = rearrange(curr_coords, 'b t n c -> (b t) n c').to(dtype=torch.float32)
+        query_support_feats = ctx.query_support_feat_pyramid[level] # (B, num_points, k_neighbors, C)
+        query_support_offsets = ctx.query_support_offset_pyramid[level] # (B, num_points, k_neighbors, 3 or 4)
+
+        if map_feats.dtype != torch.float32:
+            query_support_feats = query_support_feats.to(dtype=map_feats.dtype)
+        map_feats = self.in_norm(map_feats)
+        query_support_feats = self.in_norm(query_support_feats)
+
         with torch.autocast("cuda", enabled=False):
-            map_pcds = rearrange(ctx.pcd_pyramid[level], 'b t c h w -> (b t) (h w) c')
-            map_feats = rearrange(ctx.feat_pyramid[level], 'b t c h w -> (b t) (h w) c')
-            curr_coords = rearrange(curr_coords, 'b t n c -> (b t) n c')
-            query_support_feats = ctx.query_support_feat_pyramid[level] # (B, num_points, k_neighbors, C)
-            query_support_offsets = ctx.query_support_offset_pyramid[level] # (B, num_points, k_neighbors, 3 or 4)
-
-            map_feats = self.in_norm(map_feats)
-            query_support_feats = self.in_norm(query_support_feats)
-
             if self.use_local_pos_input:
                 hw = map_pcds.shape[1]
                 map_pcds_ = torch.cat([
@@ -506,12 +514,26 @@ class KNNCorrFeature4D_Optimized(nn.Module):
 
                 map_pcds_with_depth = torch.cat([map_pcds, rearrange(map_pcds_depth, 'b t hw 1 -> (b t) hw 1')], dim=-1)
                 curr_coords_with_depth = torch.cat([curr_coords, rearrange(curr_coords_depth, 'b t n 1 -> (b t) n 1')], dim=-1)
-
-                neighbor_features, neighbor_coords_with_depth = self.gather_neighbors(map_coords=map_pcds_with_depth, map_feats=map_feats, knn_idx=curr_knn_idx) # (B*T, num_points, k_neighbors, C)
-                neighbor_offset = neighbor_coords_with_depth - rearrange(curr_coords_with_depth, 'b n c -> b n 1 c') # (B*T, num_points, k_neighbors, C)
             else:
-                neighbor_features, neighbor_coords = self.gather_neighbors(map_coords=map_pcds, map_feats=map_feats, knn_idx=curr_knn_idx) # (B*T, num_points, k_neighbors, C)
-                neighbor_offset = neighbor_coords - rearrange(curr_coords, 'b n c -> b n 1 c') # (B*T, num_points, k_neighbors, C)
+                map_pcds_with_depth = None
+                curr_coords_with_depth = None
+                neighbor_coords_with_depth = None
+                neighbor_coords = None
+
+        if self.use_local_pos_input:
+            neighbor_features, neighbor_coords_with_depth = self.gather_neighbors(
+                map_coords=map_pcds_with_depth, # type: ignore[arg-type]
+                map_feats=map_feats,
+                knn_idx=curr_knn_idx,
+            )
+            neighbor_offset = neighbor_coords_with_depth - rearrange(curr_coords_with_depth, 'b n c -> b n 1 c') # type: ignore[arg-type]
+        else:
+            neighbor_features, neighbor_coords = self.gather_neighbors(
+                map_coords=map_pcds,
+                map_feats=map_feats,
+                knn_idx=curr_knn_idx,
+            )
+            neighbor_offset = neighbor_coords - rearrange(curr_coords, 'b n c -> b n 1 c')
 
         module_index = 0 if self.share_weights_across_levels else level
         posenc_mlp = self.posenc_mlps[module_index]
@@ -539,7 +561,6 @@ class KNNCorrFeature4D_Optimized(nn.Module):
 
         return output
 
-    @cast_float32()
     def forward(self, ctx: Box, curr_coords: torch.Tensor, max_points_per_chunk: Optional[int] = 384) -> torch.Tensor:
         num_points = curr_coords.shape[2]
         if not torch.is_grad_enabled() and max_points_per_chunk is not None:
@@ -556,7 +577,7 @@ class KNNCorrFeature4D_Optimized(nn.Module):
             knn_inputs: List[KNNQueryInput] = []
             for i in range(self.corr_levels):
                 map_pcds = rearrange(ctx.pcd_pyramid[i], 'b t c h w -> (b t) (h w) c')
-                curr_coords_ = rearrange(curr_coords, 'b t n c -> (b t) n c')
+                curr_coords_ = rearrange(curr_coords, 'b t n c -> (b t) n c').to(dtype=torch.float32)
                 hw = map_pcds.shape[-2]
                 assert hw >= self.k_neighbors
 

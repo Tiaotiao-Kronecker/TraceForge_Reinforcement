@@ -6,6 +6,7 @@ import numpy as np
 
 from utils.traj_filter_utils import (
     DEFAULT_QUERY_PREFILTER_MODE,
+    QUERY_PREFILTER_MODE_EXTERNAL_DEPTH_STATIC_V1,
     QUERY_PREFILTER_MODE_PROFILE_AWARE_STATIC_V1,
     MASK_REASON_MANIPULATOR_CLUSTER_FAIL,
     MASK_REASON_MANIPULATOR_DEPTH_FAIL,
@@ -221,6 +222,36 @@ class QueryDepthQualityMaskTests(unittest.TestCase):
         )
 
         np.testing.assert_array_equal(mask, np.array([False]))
+
+
+class QueryPrefilterTests(unittest.TestCase):
+    def test_external_depth_static_v1_rejects_bad_depth_seed_with_filter_level_none(self):
+        keypoints = np.array(
+            [
+                [4.0, 4.0],
+                [12.0, 12.0],
+            ],
+            dtype=np.float32,
+        )
+        query_depth = np.ones((24, 24), dtype=np.float32)
+        query_depth[4, 4] = 0.0
+
+        result = build_query_prefilter_result(
+            keypoints,
+            query_depth,
+            filter_args=_make_filter_args(
+                filter_level="none",
+                traj_filter_profile="external",
+                query_prefilter_mode=QUERY_PREFILTER_MODE_EXTERNAL_DEPTH_STATIC_V1,
+            ),
+            query_prefilter_mode=QUERY_PREFILTER_MODE_EXTERNAL_DEPTH_STATIC_V1,
+        )
+
+        np.testing.assert_array_equal(result["prefilter_mask"], np.array([False, True]))
+        np.testing.assert_array_equal(result["query_depth_quality_mask"], np.array([False, True]))
+        self.assertNotEqual(int(result["reason_bits"][0] & MASK_REASON_QUERY_DEPTH_FAIL), 0)
+        self.assertEqual(int(result["reason_bits"][1] & MASK_REASON_QUERY_DEPTH_FAIL), 0)
+        self.assertEqual(result["query_border_dist_px"].shape, (2,))
 
 
 class TailTruncationTests(unittest.TestCase):

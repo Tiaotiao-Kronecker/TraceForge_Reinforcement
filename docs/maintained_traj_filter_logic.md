@@ -16,7 +16,7 @@
 当前维护态推理链路是 external-only：
 
 - `depth_pose_method=external`
-- `filter_level=standard`
+- `filter_level=none`
 - `traj_filter_profile=external`
 
 `traj_filter_profile=auto` 仍被接受，但现在只作为兼容别名保留，并且也会解析到 `external`。
@@ -32,12 +32,13 @@
 - `wrist`、`wrist_manipulator_top95`、`wrist_pick_place` 和 `wrist_pick_place_no_heatmap` 都仍然存在，但都不再属于维护态默认映射
 - `external_manipulator`、`external_manipulator_v2`、`wrist_manipulator` 都需要显式指定
 - `query_prefilter_mode` 默认是 `off`，不属于默认轨迹过滤主链
+- `support_grid_ratio` 维护态默认是 `0.0`，也就是默认不追加外层 support points；它影响 tracker 前向负载，但不改变这里描述的轨迹过滤逻辑
 
 ## 2. 共享基础过滤框架
 
 ### 2.1 filter level 默认阈值
 
-`filter_level` 决定共享基础过滤参数。当前维护态默认是 `standard`。
+`filter_level` 决定共享基础过滤参数。当前维护态默认是 `none`。
 
 | level | min_valid_frames | boundary_margin | visibility_threshold | depth_smoothness | depth_change_threshold |
 | --- | ---: | ---: | ---: | --- | ---: |
@@ -687,11 +688,22 @@ final_mask = wrist_seed_mask
 ### 6.3 wrist-like 专用调试量
 
 - `traj_wrist_seed_mask`
+- `traj_base_mask`
+- `traj_query_depth_quality_mask`
+- `traj_query_depth_keep_mask`
+- `traj_supervision_support_mask`
 - `traj_query_depth_rank`
 - `traj_query_depth_edge_mask`
 - `traj_query_depth_patch_valid_ratio`
 - `traj_query_depth_patch_std`
 - `traj_query_depth_edge_risk_mask`
+- `traj_query_source_bits`
+- `traj_query_sampler_score`
+- `traj_query_risk_bits`
+- `traj_query_low_texture_score`
+- `traj_query_specular_score`
+- `traj_query_depth_edge_score`
+- `traj_query_border_dist_px`
 - `traj_motion_extent`
 - `traj_motion_step_median`
 - `traj_motion_extent_all_valid`
@@ -699,7 +711,15 @@ final_mask = wrist_seed_mask
 - `traj_manipulator_candidate_mask`
 - `traj_manipulator_cluster_id`
 - `traj_manipulator_component_size`
+- `traj_near_depth_mask`
+- `traj_motion_mask`
+- `traj_cluster_mask`
+- `traj_pre_top95_mask`
 - `traj_manipulator_cluster_fallback_used`
+- `traj_stereo_compare_frame_count`
+- `traj_stereo_depth_consistency_ratio`
+- `traj_stereo_patch_error`
+- `traj_stereo_consistency_mask`
 
 其中 `wrist_pick_place` 还会额外写出 object 分支调试量：
 
@@ -710,17 +730,16 @@ final_mask = wrist_seed_mask
 - `traj_pick_place_depth_guard_mask`
 - `traj_pick_place_object_mask`
 
-需要特别注意的是，下面这些中间 mask 目前只在运行时统计和 profile 计数里使用，并不会写入 sample NPZ：
+这些中间 mask 现在也会直接写进 sample NPZ，因此可以离线做 per-query diagnostic breakdown，不需要再复现 `build_traj_filter_result()`：
 
 - `traj_base_mask`
+- `traj_query_depth_quality_mask`
 - `traj_query_depth_keep_mask`
 - `traj_supervision_support_mask`
 - `traj_near_depth_mask`
 - `traj_motion_mask`
 - `traj_cluster_mask`
 - `traj_pre_top95_mask`
-
-如果要定位这些中间阶段，需要看运行时 profile 统计或直接复现 `build_traj_filter_result()`。
 
 ## 7. 非默认但仍在维护的分支
 
@@ -1103,3 +1122,201 @@ final_mask = local_keep_mask | delayed_contact_rescue_mask
 - `push_pull` 需要的是“机械臂主体 + 小型接触件 + articulation 区域”
 
 三者的目标对象并不相同，不适合继续共用同一个 wrist 默认收缩逻辑。
+
+## 9. Egocentric Stereo 现状与改进建议
+
+这一节专门记录 `stereo_left` / `stereo_right` 一类第一人称双目操作视频上的当前判断，避免后续继续把它们简单等同于 `external` 视角或“只保 manipulator 主体”的场景。
+
+### 9.1 当前判断
+
+对于当前接入的 `stereo_left` 数据，主要问题不是“明显未矫正的 fisheye 畸变”，而是：
+
+- 第一人称自运动带来的强全局视角变化
+- 由深度差引起的明显视差
+- 反光、透明、低纹理和遮挡区域上的伪稳定轨迹
+
+结合数据检查，`stereo_left` / `stereo_right` 可以暂时按“已 rectified 到足以近似 pinhole”的输入看待，因此现阶段不建议先对它再次做额外去畸变。对这一类数据，优先级更高的问题是 query 点怎么选、track 怎么验，而不是先把相机模型做得更复杂。
+
+### 9.2 当前模型已经处理了什么，没处理什么
+
+当前推理链路并不是纯 2D tracker：
+
+- query 点会先用 query 时刻的深度和相机位姿 lift 到世界坐标
+- 模型前向同时接收 `rgb/depth/intrinsics/extrinsics`
+- 跟踪过程中会持续把 3D 点重新投影回各帧 2D
+
+这意味着：
+
+- 相机自运动
+- 不同深度导致的不同像素速度
+
+并不是完全没被建模。
+
+但当前链路仍有很强的 learned 2D tracking 成分，所以一旦局部外观本身不可靠，几何信息也不能完全救回结果。对 egocentric kitchen / tabletop 场景，最典型的失败来源通常是：
+
+- 反光和透明区域
+- 大块低纹理平面
+- 接触边界和遮挡
+- 交互物体本身不是大连通主体，但会短时和手共同运动
+
+另外，当前 BA 和相机模型并没有完整显式建模真实 fisheye 畸变；内部主要仍按 `SIMPLE_PINHOLE` 工作，只保留了非常有限的简化相机模型选项。因此在已经基本 rectified 的 `stereo_left` 上，这不是第一优先级；如果将来切到更强畸变的 `fisheye_cam*`，再把相机模型问题提到更高优先级。
+
+### 9.3 `support_grid_ratio` 不是主矛盾
+
+`support_grid_ratio` 只决定模型前向时是否额外补一层 support queries，用来帮助跟踪；它不是最终保留下来的主输出轨迹集合。当前维护态默认已经把它设为 `0.0`，也就是先关闭 support points，再单独评估是否需要额外上下文。
+
+因此：
+
+- 调 `support_grid_ratio` 不是当前最关键的杆
+- 直接增大 `grid_size` 确实可能提升召回
+- 但如果不同时加强 prefilter / postfilter，也会同步放大伪轨迹数量
+
+对 egocentric 数据，更高 ROI 的顺序通常是：
+
+1. 先改 query seed 的空间分布
+2. 再加更强的 post-track validity 检查
+3. 最后再把 `grid_size` 往上抬
+
+### 9.4 “内容感知撒点”指的是帧内空间选点，不是改 query frame 时间规则
+
+这里必须明确区分两层：
+
+- query frame scheduling：时间上选哪几帧作为 query frame
+- query seed selection：在每个已选 query frame 内，具体在哪些区域种 keypoint
+
+当前 dense query 的默认做法是：
+
+1. 先按现有规则决定 query frame
+2. 然后在每个 query frame 上按规则网格均匀撒点
+3. 最后再进入跟踪和过滤
+
+因此这里说的“内容感知撒点”，不是去改第 1 步，而是去改第 2 步。
+
+更具体地说，egocentric manipulation 上的 query seed 更适合改成“两阶段”：
+
+1. 先做 relevance-first 的候选区域定义与采样
+2. 再为每个已采样 query 点附带 risk flags，作为后验诊断和质量解释信号
+
+这里的第一目标应是“更多覆盖我们真正关心的部分”，而不是“优先避开所有高风险区域”。对这类数据，更合理的候选区域通常包括：
+
+- 人手 / 前臂附近
+- 机械臂或工具主体附近
+- 与手或工具发生接触、邻近或短时共运动的交互物体
+- 必要的少量背景上下文区域
+
+在这个前提下，低纹理、反光、depth-edge、视野边缘等信号更适合承担下面这些角色：
+
+- 作为逐采样点的风险标记，而不是先验一票否决
+- 帮助解释后续哪些轨迹更容易失败、失败原因可能是什么
+- 在需要时作为后续 validity score 或 debug ranking 的辅助特征
+
+也就是说，风险不是 query selection 的第一准则；它更像 relevance-aware sampling 之后附带的 trackability prior / diagnostics。
+
+现有 `build_query_prefilter_result()` 只看 query frame 静态信号，而且对 `external*` profile 基本是 no-op。要把这件事真正做起来，需要把它从“风险优先的硬过滤”扩展成“relevance-first query sampler + per-query diagnostics”，并让它能够访问：
+
+- query RGB
+- query depth
+- 若可用则加入 hand / manipulator / object interaction cue
+
+建议至少给每个 query 点保留下面这些布尔或 bit flags，便于后续追查轨迹质量问题：
+
+- `low_texture_flag`
+- `specular_or_reflection_flag`
+- `depth_edge_risk_flag`
+- `image_border_risk_flag`
+
+这些 flag 不应默认直接杀掉该 query 点，而应随 sample 一起保存，供：
+
+- 后续轨迹失败归因
+- 可视化时高亮高风险 query
+- 后续 validity 分支或调参分析使用
+
+### 9.5 stereo consistency 最适合放在 track 完成后的过滤阶段
+
+对 egocentric stereo，stereo consistency 很值得加，但最高 ROI 的插入点不是模型最前面，而是：
+
+- 单目左视角 track 已经生成之后
+- 最终 `traj_valid_mask` 决定之前
+
+也就是作为 `build_traj_filter_result()` 里的另一条 validity 分支，与现有的几何、深度一致性、temporal consistency 并列。
+
+建议的最小版本可以是：
+
+1. 用左目的 `traj_uvz` 和双目几何把轨迹 lift / reproject 到右目
+2. 检查右目对应位置的 depth 是否一致
+3. 检查右目局部 patch 与左目重投影结果是否明显冲突
+4. 把不一致程度作为新的轨迹打分或 mask reason
+
+如果这一版有效，再考虑更重的版本，例如：
+
+- 左右双向都跑 tracker，再做 left-right agreement
+- 在 query prefilter 阶段也加入 stereo cue，提前减少明显不可靠的 seed
+
+但实现优先级上，先做 post-track stereo filter 更稳、更便于调参。
+
+### 9.6 Egocentric 数据不应直接复用 `external_manipulator_v2`
+
+`external_manipulator_v2` 的目标仍然是“从 external seed 收缩到 manipulator 主体附近”，它并不天然适合第一人称人手-物体交互场景。
+
+对 egocentric manipulation，更合理的目标应是：
+
+- 保住手/前臂附近可信轨迹
+- 同时保住被交互的物体，而不是只保操作者身体部分
+
+因此更建议新增显式 profile，例如 `egocentric_object_interaction_v1`，其逻辑应更接近：
+
+```text
+egocentric_seed
+    -> manipulator branch
+    -> object-near-manipulator branch
+
+final_mask = manipulator_mask | interaction_object_mask
+```
+
+其中 object branch 不应强依赖“最大连通团”或“只保最近深度主体”，而应更多依赖：
+
+- 与手部或 manipulator reference 的 3D 距离
+- 接触后的短时共运动
+- stereo consistency
+- 必要时的 delayed-contact rescue
+
+### 9.7 mocap 最适合先做评估和调参闭环，再考虑专门训练新 tracker
+
+对于这类数据，mocap 很适合先拿来做评估和调参，而不是直接当成 dense point tracking 的完整真值。
+
+短期更务实的顺序是：
+
+1. 先用 mocap 建一套 egocentric 评估集
+2. 指标重点看：
+   - 手附近轨迹召回
+   - 接触物体轨迹召回
+   - 远背景伪轨迹率
+   - 短时共运动正确率
+3. 基于这套指标去调：
+   - query prefilter
+   - egocentric interaction profile
+   - stereo consistency
+
+如果做到这一步后，仍然发现主瓶颈来自 tracker 本体对 egocentric 视角的不适应，再考虑训练或微调专门的 tracker。
+
+换句话说：
+
+- “训练一个专门网络”是可能的中期方向
+- “先把评估闭环和过滤逻辑建立起来”是更高 ROI 的近期方向
+
+### 9.8 推荐落地顺序
+
+面向当前 `stereo_left` / `stereo_right`，推荐按下面顺序推进：
+
+1. 新增 `egocentric_object_interaction_v1`，不要沿用“只保 manipulator 主体”的 external 分支语义
+2. 把 query prefilter 扩展到 egocentric / external，但目标应是 relevance-first 的 query sampler：先保手、manipulator、交互物体，并为每个采样点附加 query RGB/depth 风险 flags 供后续诊断
+3. 在 track 完成后加入 stereo consistency 过滤
+4. 在上述三项稳定后，再增大 `grid_size`
+5. 用 mocap 建评估与调参闭环
+6. 若仍明显受限，再考虑训练或微调专门的 egocentric tracker
+
+这一路线的核心原则是：
+
+- 先减少“明显不该种的点”
+- 再减少“明显不该保的轨迹”
+- 最后再追求更高召回

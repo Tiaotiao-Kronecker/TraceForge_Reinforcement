@@ -21,6 +21,7 @@ import threading
 from pathlib import Path
 
 from utils.video_depth_pose_utils import DEFAULT_DEPTH_POSE_METHOD, video_depth_pose_dict
+from utils.video_depth_pose_utils import _load_external_geom
 from utils.traceforge_artifact_utils import (
     DEFAULT_SCENE_STORAGE_MODE,
     LEGACY_LAYOUT,
@@ -45,6 +46,7 @@ from utils.threed_utils import (
 from utils.traj_filter_utils import (
     DEFAULT_QUERY_PREFILTER_MODE,
     DEFAULT_QUERY_PREFILTER_WRIST_RANK_KEEP_RATIO,
+    QUERY_PREFILTER_MODE_EXTERNAL_DEPTH_STATIC_V1,
     QUERY_PREFILTER_MODE_OFF,
     TRAJ_FILTER_ABLATION_MODE_NONE,
     TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_CLUSTER,
@@ -52,6 +54,8 @@ from utils.traj_filter_utils import (
     TRAJ_FILTER_ABLATION_MODE_WRIST_NO_MANIPULATOR_MOTION,
     TRAJ_FILTER_ABLATION_MODE_WRIST_NO_QUERY_EDGE,
     TRAJ_FILTER_ABLATION_MODE_WRIST_SEED_TOP95,
+    TRAJ_FILTER_PROFILE_EGOCENTRIC_OBJECT_INTERACTION_V1,
+    TRAJ_FILTER_PROFILE_EXTERNAL,
     TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE,
     build_traj_filter_result,
     build_query_prefilter_result,
@@ -60,11 +64,65 @@ from utils.traj_filter_utils import (
     prepare_temporal_depth_consistency_context,
     resolve_traj_filter_config,
 )
+from utils.query_sampling_utils import (
+    DEFAULT_QUERY_ACTIVITY_FRAMES,
+    DEFAULT_QUERY_CANDIDATE_GRID_FACTOR,
+    QUERY_SAMPLER_MODE_AUTO,
+    QUERY_SAMPLER_MODE_GRID,
+    QUERY_SAMPLER_MODE_RELEVANCE_V1,
+    build_relevance_first_query_sampler_result,
+    resolve_candidate_grid_size,
+    resolve_query_sampler_mode,
+)
+from utils.query_fixed_view_depth_gate_utils import (
+    DEFAULT_FIXED_VIEW_DEPTH_GATE_DEPTH_THRESHOLD_M,
+    DEFAULT_FIXED_VIEW_DEPTH_GATE_UV_THRESHOLD_PX,
+    compute_query_fixed_view_depth_gate,
+)
+from utils.query_visibility_gate_utils import compute_query_visibility_gate
+from utils.query_visibility_gate_utils import DEFAULT_QUERY_VISIBILITY_GATE_NEAR_DEPTH_EXEMPT_THRESHOLD_M
+from utils.traj_uvd_gate_utils import (
+    DEFAULT_TRAJ_UVD_GATE_DEPTH_STD_THRESHOLD_M,
+    DEFAULT_TRAJ_UVD_GATE_MAX_DEPTH_THRESHOLD_M,
+    DEFAULT_TRAJ_UVD_GATE_NEAR_DEPTH_EXEMPT_THRESHOLD_M,
+    DEFAULT_TRAJ_UVD_GATE_NEAR_DEPTH_RELAXED_STD_THRESHOLD_M,
+    DEFAULT_TRAJ_UVD_GATE_NEAR_DEPTH_THRESHOLD_M,
+    DEFAULT_TRAJ_UVD_GATE_UV_MEAN_THRESHOLD_PX,
+    compute_traj_uvd_motion_gate,
+)
 from utils.keyframe_schedule_utils import map_query_source_indices_to_local
+from utils.extrinsics_utils import normalize_extrinsics_to_w2c
+from utils.external_wobble_diagnostics import (
+    DEFAULT_DENSE_DEPTH_STABILIZATION_MIN_SUPPORT,
+    DEFAULT_DENSE_DEPTH_STABILIZATION_RADIUS,
+    DEFAULT_DEPTH_MEDIAN_MIN_SUPPORT,
+    DEFAULT_DEPTH_MEDIAN_REPROJ_TOL_PX,
+    build_query_anchor_bundle_from_keypoints,
+    estimate_temporal_median_world_points,
+    stabilize_depth_frames_temporal_median_reproject,
+)
+
 try:
     from threadpoolctl import threadpool_limits as _threadpool_limits
 except ImportError:
     _threadpool_limits = None
+
+DEFAULT_GRID_BORDER_TRIM_LEFT = 30
+DEFAULT_GRID_BORDER_TRIM_RIGHT = 30
+DEFAULT_GRID_BORDER_TRIM_TOP = 30
+DEFAULT_GRID_BORDER_TRIM_BOTTOM = 10
+QUERY_DEPTH_STABILIZATION_MODE_OFF = "off"
+QUERY_DEPTH_STABILIZATION_MODE_TEMPORAL_MEDIAN_WORLD_V1 = "temporal_median_world_v1"
+QUERY_VISIBILITY_GATE_MODE_OFF = "off"
+QUERY_VISIBILITY_GATE_MODE_ALL_FUTURE_V1 = "all_future_v1"
+QUERY_FIXED_VIEW_DEPTH_GATE_MODE_OFF = "off"
+QUERY_FIXED_VIEW_DEPTH_GATE_MODE_FIRST_FRAME_UVD_V1 = "first_frame_uvd_v1"
+TRAJ_UVD_GATE_MODE_OFF = "off"
+TRAJ_UVD_GATE_MODE_DELTA_UV_DEPTH_V1 = "delta_uv_depth_v1"
+DENSE_DEPTH_STABILIZATION_MODE_OFF = "off"
+DENSE_DEPTH_STABILIZATION_MODE_TEMPORAL_MEDIAN_REPROJECT_V1 = "temporal_median_reproject_v1"
+DEFAULT_QUERY_DEPTH_STABILIZATION_MIN_QUERY_DEPTH_M = 0.01
+DEFAULT_QUERY_DEPTH_STABILIZATION_MIN_BORDER_DIST_PX = 0.0
 
 
 def _sync_device_if_needed(device: str | torch.device | None) -> None:
@@ -93,6 +151,15 @@ def _set_profile_stat(
     if profile_stats is None:
         return
     profile_stats[key] = float(value)
+
+
+def _normalize_source_ref_path(path: str | os.PathLike[str] | None) -> str | None:
+    if path is None:
+        return None
+    path_str = os.fspath(path)
+    if not path_str:
+        return None
+    return str(Path(path_str).resolve())
 
 
 def _get_profile_stat(
@@ -570,6 +637,8 @@ def _build_sample_filter_debug_record(
         dtype=np.float32,
     )
     stage_counts = {
+        "query_visibility": _count_true(sample_payload.get("traj_query_visibility_reliable_mask")),
+        "query_fixed_view_depth": _count_true(sample_payload.get("traj_query_fixed_view_depth_consistency_mask")),
         "base_mask": _count_true(traj_filter_result.get("traj_base_mask")),
         "query_depth_quality": _count_true(traj_filter_result.get("traj_query_depth_quality_mask")),
         "query_depth_keep": _count_true(traj_filter_result.get("traj_query_depth_keep_mask")),
@@ -580,6 +649,7 @@ def _build_sample_filter_debug_record(
         "motion": _count_true(traj_filter_result.get("traj_motion_mask")),
         "cluster": _count_true(traj_filter_result.get("traj_cluster_mask")),
         "pre_top95": _count_true(traj_filter_result.get("traj_pre_top95_mask")),
+        "traj_uvd_gate": _count_true(sample_payload.get("traj_uvd_gate_reliable_mask")),
         "final": _count_true(traj_filter_result.get("traj_valid_mask")),
     }
     return {
@@ -946,6 +1016,18 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num_iters", type=int, default=3)
     parser.add_argument(
+        "--tracker_precision_mode",
+        type=str,
+        default="fp32",
+        choices=["fp32", "autocast_bf16", "deep_bf16", "bf16"],
+        help=(
+            "Tracker precision path. fp32 keeps the full tracker in float32; "
+            "autocast_bf16 keeps fp32 weights but runs eligible kernels under bf16 autocast; "
+            "deep_bf16 keeps geometry/state updates in fp32 while moving the encoder/corr/update feature path deeper into bf16. "
+            "Legacy alias bf16 maps to autocast_bf16."
+        ),
+    )
+    parser.add_argument(
         "--collect_profile_stats",
         action="store_true",
         default=False,
@@ -1064,16 +1146,42 @@ def parse_args():
         help="Optional rectangular query-grid height override. Requires --grid_width.",
     )
     parser.add_argument(
+        "--query_sampler_mode",
+        type=str,
+        default="grid",
+        choices=[
+            QUERY_SAMPLER_MODE_AUTO,
+            QUERY_SAMPLER_MODE_GRID,
+            QUERY_SAMPLER_MODE_RELEVANCE_V1,
+        ],
+        help=(
+            "Query sampler mode. grid keeps uniform query seeds; auto keeps legacy grid sampling "
+            "for existing profiles and enables relevance_first_v1 for egocentric_object_interaction_v1."
+        ),
+    )
+    parser.add_argument(
+        "--query_candidate_grid_factor",
+        type=float,
+        default=DEFAULT_QUERY_CANDIDATE_GRID_FACTOR,
+        help=(
+            "Candidate-grid factor relative to grid_size when relevance_first_v1 sampling is used. "
+            "The final sampled query count remains grid_size x grid_size."
+        ),
+    )
+    parser.add_argument(
         "--query_prefilter_mode",
         type=str,
         default=DEFAULT_QUERY_PREFILTER_MODE,
         choices=[
             QUERY_PREFILTER_MODE_OFF,
             "profile_aware_static_v1",
+            "external_depth_static_v1",
         ],
         help=(
             "Optional static query prefilter before tracking. "
-            "profile_aware_static_v1 only applies aggressive prefiltering to wrist-like profiles."
+            "profile_aware_static_v1 only applies aggressive prefiltering to wrist-like profiles. "
+            "external_depth_static_v1 is an experimental external-camera seed-depth gate that can run "
+            "even when filter_level=none."
         ),
     )
     parser.add_argument(
@@ -1086,9 +1194,181 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--query_visibility_gate_mode",
+        type=str,
+        default="all_future_v1",
+        choices=["off", "all_future_v1"],
+        help=(
+            "Optional geometric future-visibility gate before tracking. "
+            "all_future_v1 lifts each query seed into world coordinates and drops seeds that later leave "
+            "the valid projected view in any future frame."
+        ),
+    )
+    parser.add_argument(
+        "--query_visibility_gate_min_border_dist_px",
+        type=float,
+        default=0.0,
+        help="Minimum projected border distance required by the future-visibility gate in every future frame.",
+    )
+    parser.add_argument(
+        "--query_visibility_gate_near_depth_exempt_threshold_m",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional near-depth cutoff in meters for the future-visibility gate. "
+            "Queries shallower than this bypass the all-future in-view requirement."
+        ),
+    )
+    parser.add_argument(
+        "--query_fixed_view_depth_gate_mode",
+        type=str,
+        default="first_frame_uvd_v1",
+        choices=["off", "first_frame_uvd_v1"],
+        help=(
+            "Optional fixed-view temporal depth gate before tracking. "
+            "first_frame_uvd_v1 keeps per-query uvd in the first-frame camera and drops seeds whose "
+            "reprojected uv stays within a pixel while depth changes by more than the configured threshold."
+        ),
+    )
+    parser.add_argument(
+        "--query_fixed_view_depth_gate_uv_threshold_px",
+        type=float,
+        default=1.0,
+        help="Maximum first-frame reprojection drift in pixels considered uv-stable for the fixed-view depth gate.",
+    )
+    parser.add_argument(
+        "--query_fixed_view_depth_gate_depth_threshold_m",
+        type=float,
+        default=0.10,
+        help="Minimum first-frame depth delta in meters treated as anomalous by the fixed-view depth gate.",
+    )
+    parser.add_argument(
+        "--traj_uvd_gate_mode",
+        type=str,
+        default="delta_uv_depth_v1",
+        choices=["off", "delta_uv_depth_v1"],
+        help=(
+            "Optional post-track traj_uvz gate. "
+            "delta_uv_depth_v1 removes tracks whose average uv motion stays small while depth-step std spikes, "
+            "and also removes tracks that stay beyond the configured max depth."
+        ),
+    )
+    parser.add_argument(
+        "--traj_uvd_gate_uv_mean_threshold_px",
+        type=float,
+        default=3.0,
+        help="Maximum mean per-step uv motion treated as near-static by the traj_uvd gate.",
+    )
+    parser.add_argument(
+        "--traj_uvd_gate_depth_std_threshold_m",
+        type=float,
+        default=0.01,
+        help="Minimum std of per-step absolute depth change treated as anomalous by the traj_uvd gate.",
+    )
+    parser.add_argument(
+        "--traj_uvd_gate_max_depth_threshold_m",
+        type=float,
+        default=1.5,
+        help="Tracks whose max traj depth exceeds this threshold are removed by the traj_uvd gate.",
+    )
+    parser.add_argument(
+        "--traj_uvd_gate_near_depth_threshold_m",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional near-depth cutoff in meters. "
+            "If > 0, tracks whose max traj depth stays below this value can use a relaxed depth-std threshold."
+        ),
+    )
+    parser.add_argument(
+        "--traj_uvd_gate_near_depth_relaxed_std_threshold_m",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional relaxed depth-step std threshold for near-depth tracks. "
+            "Disabled when <= 0; when enabled it must be >= --traj_uvd_gate_depth_std_threshold_m."
+        ),
+    )
+    parser.add_argument(
+        "--traj_uvd_gate_near_depth_exempt_threshold_m",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional near-depth cutoff in meters. "
+            "If > 0, tracks whose max traj depth stays below this value bypass the uv+depth anomaly gate."
+        ),
+    )
+    parser.add_argument(
+        "--query_depth_stabilization_mode",
+        type=str,
+        default="off",
+        choices=[
+            "off",
+            "temporal_median_world_v1",
+        ],
+        help=(
+            "Optional query seed 3D initialization stabilization before tracking. "
+            "temporal_median_world_v1 keeps original extrinsics but replaces each query seed's world point "
+            "with a temporal-median world estimate when enough consistent depth support exists."
+        ),
+    )
+    parser.add_argument(
+        "--query_depth_stabilization_reproj_tol_px",
+        type=float,
+        default=DEFAULT_DEPTH_MEDIAN_REPROJ_TOL_PX,
+        help=(
+            "Maximum query-view reprojection error used when collecting temporal depth support "
+            "for temporal_median_world_v1."
+        ),
+    )
+    parser.add_argument(
+        "--query_depth_stabilization_min_support",
+        type=int,
+        default=DEFAULT_DEPTH_MEDIAN_MIN_SUPPORT,
+        help="Minimum number of temporally consistent support frames required to replace a query seed world point.",
+    )
+    parser.add_argument(
+        "--query_depth_stabilization_min_query_depth_m",
+        type=float,
+        default=DEFAULT_QUERY_DEPTH_STABILIZATION_MIN_QUERY_DEPTH_M,
+        help="Minimum query-frame depth required for a seed to be eligible for temporal query-depth stabilization.",
+    )
+    parser.add_argument(
+        "--query_depth_stabilization_min_border_dist_px",
+        type=float,
+        default=DEFAULT_QUERY_DEPTH_STABILIZATION_MIN_BORDER_DIST_PX,
+        help="Minimum border distance required for a seed to be eligible for temporal query-depth stabilization.",
+    )
+    parser.add_argument(
+        "--dense_depth_stabilization_mode",
+        type=str,
+        default="off",
+        choices=[
+            "off",
+            "temporal_median_reproject_v1",
+        ],
+        help=(
+            "Optional dense depth_obs stabilization before tracking. "
+            "temporal_median_reproject_v1 warps neighboring frames into each target frame with current extrinsics "
+            "and replaces valid per-pixel depths with a temporal median when enough support exists."
+        ),
+    )
+    parser.add_argument(
+        "--dense_depth_stabilization_radius",
+        type=int,
+        default=2,
+        help="Temporal radius in frames used by dense depth stabilization.",
+    )
+    parser.add_argument(
+        "--dense_depth_stabilization_min_support",
+        type=int,
+        default=3,
+        help="Minimum temporal support count required to replace a dense depth pixel.",
+    )
+    parser.add_argument(
         "--support_grid_ratio",
         type=float,
-        default=0.8,
+        default=0.0,
         help="Support-point grid ratio relative to grid_size. 0 disables extra support points.",
     )
     parser.add_argument(
@@ -1107,9 +1387,33 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--grid_border_trim_left",
+        type=int,
+        default=30,
+        help="Drop this many leftmost query-grid columns before tracking.",
+    )
+    parser.add_argument(
+        "--grid_border_trim_right",
+        type=int,
+        default=30,
+        help="Drop this many rightmost query-grid columns before tracking.",
+    )
+    parser.add_argument(
+        "--grid_border_trim_top",
+        type=int,
+        default=30,
+        help="Drop this many top query-grid rows before tracking.",
+    )
+    parser.add_argument(
+        "--grid_border_trim_bottom",
+        type=int,
+        default=10,
+        help="Drop this many bottom query-grid rows before tracking.",
+    )
+    parser.add_argument(
         "--filter_level",
         type=str,
-        default="standard",
+        default="none",
         choices=["none", "basic", "standard", "strict"],
         help="Trajectory filtering level: none(no filter), basic(basic checks), standard(recommended), strict(high quality)",
     )
@@ -1121,6 +1425,7 @@ def parse_args():
             "external",
             "external_manipulator",
             "external_manipulator_v2",
+            TRAJ_FILTER_PROFILE_EGOCENTRIC_OBJECT_INTERACTION_V1,
             "wrist",
             "wrist_pick_place",
             "wrist_pick_place_no_heatmap",
@@ -1131,6 +1436,8 @@ def parse_args():
             "Trajectory filter profile: external keeps the current strict full-track mask; "
             "external_manipulator keeps external as the seed and then prunes to manipulator-like tracks; "
             "external_manipulator_v2 is a looser external manipulator profile that keeps major manipulator components; "
+            "egocentric_object_interaction_v1 keeps egocentric manipulator tracks and adds an object-near-manipulator "
+            "branch with delayed-contact rescue and stereo-consistency support when stereo context is available; "
             "wrist keeps partial trajectories with per-frame supervision masks; "
             "wrist_pick_place keeps the wrist seed, preserves the manipulator branch, and adds a pick-heatmap-guided "
             "object branch for pick_place scenes; "
@@ -1141,6 +1448,37 @@ def parse_args():
             "from its final tracks per sample; "
             "wrist_manipulator adds near-field and motion-aware pruning on top of wrist."
         ),
+    )
+    parser.add_argument(
+        "--stereo_aux_video_path",
+        type=str,
+        default=None,
+        help="Optional synchronized sibling stereo video directory used for stereo-consistency filtering.",
+    )
+    parser.add_argument(
+        "--stereo_aux_depth_path",
+        type=str,
+        default=None,
+        help="Optional synchronized sibling stereo depth directory used for stereo-consistency filtering.",
+    )
+    parser.add_argument(
+        "--stereo_aux_geom_npz",
+        type=str,
+        default=None,
+        help="Optional sibling stereo geometry NPZ/H5 used for stereo-consistency filtering.",
+    )
+    parser.add_argument(
+        "--stereo_aux_camera_name",
+        type=str,
+        default=None,
+        help="Optional sibling stereo camera name used when loading --stereo_aux_geom_npz from H5.",
+    )
+    parser.add_argument(
+        "--stereo_aux_extr_mode",
+        type=str,
+        default=None,
+        choices=["w2c", "c2w"],
+        help="Extrinsics convention for --stereo_aux_geom_npz. Defaults to --external_extr_mode when omitted.",
     )
     parser.add_argument(
         "--traj_filter_ablation_mode",
@@ -1207,6 +1545,46 @@ def parse_args():
         parser.error("external-only mode requires --depth_path.")
     if args.query_prefilter_wrist_rank_keep_ratio < 0.0 or args.query_prefilter_wrist_rank_keep_ratio > 1.0:
         parser.error("--query_prefilter_wrist_rank_keep_ratio must be within [0, 1].")
+    if args.query_visibility_gate_min_border_dist_px < 0.0:
+        parser.error("--query_visibility_gate_min_border_dist_px must be >= 0.")
+    if args.query_visibility_gate_near_depth_exempt_threshold_m < 0.0:
+        parser.error("--query_visibility_gate_near_depth_exempt_threshold_m must be >= 0.")
+    if args.query_fixed_view_depth_gate_uv_threshold_px < 0.0:
+        parser.error("--query_fixed_view_depth_gate_uv_threshold_px must be >= 0.")
+    if args.query_fixed_view_depth_gate_depth_threshold_m < 0.0:
+        parser.error("--query_fixed_view_depth_gate_depth_threshold_m must be >= 0.")
+    if args.traj_uvd_gate_uv_mean_threshold_px < 0.0:
+        parser.error("--traj_uvd_gate_uv_mean_threshold_px must be >= 0.")
+    if args.traj_uvd_gate_depth_std_threshold_m < 0.0:
+        parser.error("--traj_uvd_gate_depth_std_threshold_m must be >= 0.")
+    if args.traj_uvd_gate_max_depth_threshold_m < 0.0:
+        parser.error("--traj_uvd_gate_max_depth_threshold_m must be >= 0.")
+    if args.traj_uvd_gate_near_depth_threshold_m < 0.0:
+        parser.error("--traj_uvd_gate_near_depth_threshold_m must be >= 0.")
+    if args.traj_uvd_gate_near_depth_relaxed_std_threshold_m < 0.0:
+        parser.error("--traj_uvd_gate_near_depth_relaxed_std_threshold_m must be >= 0.")
+    if args.traj_uvd_gate_near_depth_exempt_threshold_m < 0.0:
+        parser.error("--traj_uvd_gate_near_depth_exempt_threshold_m must be >= 0.")
+    if (
+        args.traj_uvd_gate_near_depth_relaxed_std_threshold_m > 0.0
+        and args.traj_uvd_gate_near_depth_relaxed_std_threshold_m < args.traj_uvd_gate_depth_std_threshold_m
+    ):
+        parser.error(
+            "--traj_uvd_gate_near_depth_relaxed_std_threshold_m must be >= "
+            "--traj_uvd_gate_depth_std_threshold_m when enabled."
+        )
+    if args.query_depth_stabilization_reproj_tol_px <= 0.0:
+        parser.error("--query_depth_stabilization_reproj_tol_px must be > 0.")
+    if args.query_depth_stabilization_min_support < 1:
+        parser.error("--query_depth_stabilization_min_support must be >= 1.")
+    if args.query_depth_stabilization_min_query_depth_m < 0.0:
+        parser.error("--query_depth_stabilization_min_query_depth_m must be >= 0.")
+    if args.query_depth_stabilization_min_border_dist_px < 0.0:
+        parser.error("--query_depth_stabilization_min_border_dist_px must be >= 0.")
+    if args.dense_depth_stabilization_radius < 0:
+        parser.error("--dense_depth_stabilization_radius must be >= 0.")
+    if args.dense_depth_stabilization_min_support < 1:
+        parser.error("--dense_depth_stabilization_min_support must be >= 1.")
     if args.support_grid_ratio < 0.0:
         parser.error("--support_grid_ratio must be >= 0.")
     if args.depth_filter_workers <= 0:
@@ -1388,17 +1766,55 @@ def _build_grid_keypoints(
     grid_size: int,
     *,
     grid_hw: tuple[int, int] | None = None,
+    trim_left: int = 0,
+    trim_right: int = 0,
+    trim_top: int = 0,
+    trim_bottom: int = 0,
 ) -> np.ndarray:
+    grid_size = int(grid_size)
     if grid_hw is None:
-        grid_h = int(grid_size)
-        grid_w = int(grid_size)
+        grid_h = grid_size
+        grid_w = grid_size
     else:
         grid_h = int(grid_hw[0])
         grid_w = int(grid_hw[1])
-    y_coords = np.linspace(0, frame_h - 1, grid_h)
-    x_coords = np.linspace(0, frame_w - 1, grid_w)
+    if grid_h <= 0 or grid_w <= 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    trim_left = int(trim_left)
+    trim_right = int(trim_right)
+    trim_top = int(trim_top)
+    trim_bottom = int(trim_bottom)
+    if min(trim_left, trim_right, trim_top, trim_bottom) < 0:
+        raise ValueError("Grid border trims must be >= 0")
+    x_start = trim_left
+    x_end = grid_w - trim_right
+    y_start = trim_top
+    y_end = grid_h - trim_bottom
+    if x_start >= x_end or y_start >= y_end:
+        raise ValueError(
+            "Grid border trims remove all query points: "
+            f"grid_size={grid_size}, grid_hw={grid_hw}, left/right/top/bottom="
+            f"{trim_left}/{trim_right}/{trim_top}/{trim_bottom}"
+        )
+
+    y_coords = np.linspace(0, frame_h - 1, grid_h, dtype=np.float32)[y_start:y_end]
+    x_coords = np.linspace(0, frame_w - 1, grid_w, dtype=np.float32)[x_start:x_end]
     xx, yy = np.meshgrid(x_coords, y_coords)
     return np.stack([xx.flatten(), yy.flatten()], axis=1).astype(np.float32)
+
+
+def _scale_grid_trim_count(
+    trim_count: int,
+    *,
+    base_grid_size: int,
+    target_grid_size: int,
+) -> int:
+    trim_count = int(trim_count)
+    base_grid_size = int(base_grid_size)
+    target_grid_size = int(target_grid_size)
+    if trim_count <= 0 or base_grid_size <= 0 or target_grid_size <= 0:
+        return 0
+    return max(0, int(round(float(trim_count) * float(target_grid_size) / float(base_grid_size))))
 
 
 def _build_frame_query_points(frame_idx: int, dense_keypoints: np.ndarray) -> np.ndarray:
@@ -1437,12 +1853,80 @@ def _scatter_tracked_predictions_to_dense(
     return dense_coords, dense_visibs
 
 
+def _build_empty_query_frame_result(
+    *,
+    scene_ctx: dict[str, object],
+    start_frame: int,
+    end_frame: int,
+    video_segment,
+    filtered_depth_segment: np.ndarray,
+    intrs_segment: np.ndarray,
+    extrs_segment: np.ndarray,
+    dense_query_keypoints: np.ndarray,
+    tracked_query_indices: np.ndarray,
+    prefilter_result: dict[str, np.ndarray] | None,
+    query_visibility_gate_result: dict[str, np.ndarray] | None,
+    query_fixed_view_depth_gate_result: dict[str, np.ndarray] | None,
+    query_depth_stabilization_result: dict[str, np.ndarray] | None,
+    dense_depth_stabilization_result: dict[str, np.ndarray] | None,
+) -> dict[str, object]:
+    segment_len = int(end_frame - start_frame)
+    coords_cpu = torch.empty((segment_len, 0, 3), dtype=torch.float32)
+    visibs_cpu = torch.empty((segment_len, 0), dtype=torch.float32)
+    video_cpu = video_segment.cpu() if isinstance(video_segment, torch.Tensor) else np.asarray(video_segment)
+    stereo_aux_segment = None
+    stereo_aux_context = scene_ctx.get("stereo_aux_context")
+    if stereo_aux_context is not None:
+        stereo_aux_segment = {
+            "rgb_segment": stereo_aux_context["video_ten"][start_frame:end_frame].clone(),
+            "depth_segment": np.asarray(
+                stereo_aux_context["depth_npy"][start_frame:end_frame],
+                dtype=np.float32,
+            ),
+            "intrinsics_segment": np.asarray(
+                stereo_aux_context["intrs_npy"][start_frame:end_frame],
+                dtype=np.float32,
+            ),
+            "extrinsics_segment": np.asarray(
+                stereo_aux_context["extrs_npy"][start_frame:end_frame],
+                dtype=np.float32,
+            ),
+            "camera_name": str(stereo_aux_context.get("camera_name", "")),
+        }
+    return {
+        "coords": coords_cpu,
+        "visibs": visibs_cpu,
+        "video_segment": video_cpu,
+        "depths_segment": np.asarray(filtered_depth_segment, dtype=np.float32),
+        "intrinsics_segment": np.asarray(intrs_segment, dtype=np.float32),
+        "extrinsics_segment": np.asarray(extrs_segment, dtype=np.float32),
+        "original_frame_H": int(scene_ctx["original_frame_H"]),
+        "original_frame_W": int(scene_ctx["original_frame_W"]),
+        "processing_frame_H": int(scene_ctx["processing_frame_H"]),
+        "processing_frame_W": int(scene_ctx["processing_frame_W"]),
+        "dense_keypoints": np.asarray(dense_query_keypoints, dtype=np.float32),
+        "tracked_query_indices": np.asarray(tracked_query_indices, dtype=np.int32),
+        "prefilter_result": prefilter_result,
+        "query_visibility_gate_result": query_visibility_gate_result,
+        "query_fixed_view_depth_gate_result": query_fixed_view_depth_gate_result,
+        "query_depth_stabilization_result": query_depth_stabilization_result,
+        "dense_depth_stabilization_result": dense_depth_stabilization_result,
+        "dense_query_count": int(np.asarray(dense_query_keypoints, dtype=np.float32).shape[0]),
+        "tracked_query_count": int(np.asarray(tracked_query_indices, dtype=np.int32).shape[0]),
+        "support_grid_size": int(scene_ctx["support_grid_size"]),
+        "effective_support_query_count": 0,
+        "stereo_aux_segment": stereo_aux_segment,
+    }
+
+
 def _build_dense_sample_payload_from_tracked_subset(
     *,
     dense_keypoints: np.ndarray,
     tracked_query_indices: np.ndarray,
     tracked_sample_payload: dict[str, np.ndarray],
     prefilter_result: dict[str, np.ndarray] | None,
+    query_visibility_gate_result: dict[str, np.ndarray] | None = None,
+    query_fixed_view_depth_gate_result: dict[str, np.ndarray] | None = None,
 ) -> dict[str, np.ndarray]:
     dense_keypoints = np.asarray(dense_keypoints, dtype=np.float32)
     tracked_query_indices = np.asarray(tracked_query_indices, dtype=np.int32).reshape(-1)
@@ -1467,11 +1951,30 @@ def _build_dense_sample_payload_from_tracked_subset(
         "traj_supervision_prefix_len": np.zeros(dense_track_count, dtype=np.uint16),
         "traj_supervision_count": np.zeros(dense_track_count, dtype=np.uint16),
         "traj_wrist_seed_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_base_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_query_depth_quality_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_query_depth_keep_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_supervision_support_mask": np.zeros(dense_track_count, dtype=bool),
         "traj_query_depth_rank": np.full(dense_track_count, np.nan, dtype=np.float16),
         "traj_query_depth_edge_mask": np.zeros(dense_track_count, dtype=bool),
         "traj_query_depth_patch_valid_ratio": np.full(dense_track_count, np.nan, dtype=np.float16),
         "traj_query_depth_patch_std": np.full(dense_track_count, np.nan, dtype=np.float16),
         "traj_query_depth_edge_risk_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_query_source_bits": np.zeros(dense_track_count, dtype=np.uint16),
+        "traj_query_sampler_score": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_query_risk_bits": np.zeros(dense_track_count, dtype=np.uint16),
+        "traj_query_low_texture_score": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_query_specular_score": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_query_depth_edge_score": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_query_border_dist_px": np.zeros(dense_track_count, dtype=np.uint16),
+        "traj_query_visibility_reliable_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_query_visibility_removed_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_query_visibility_future_visible_ratio": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_query_visibility_first_invalid_step": np.full(dense_track_count, -1, dtype=np.int16),
+        "traj_query_depth_temporal_replace_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_query_depth_temporal_support_count": np.zeros(dense_track_count, dtype=np.uint16),
+        "traj_query_depth_temporal_anchor_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_query_depth_temporal_delta_world_m": np.full(dense_track_count, np.nan, dtype=np.float16),
         "traj_motion_extent": np.full(dense_track_count, np.nan, dtype=np.float16),
         "traj_motion_step_median": np.full(dense_track_count, np.nan, dtype=np.float16),
         "traj_motion_extent_all_valid": np.full(dense_track_count, np.nan, dtype=np.float16),
@@ -1479,6 +1982,10 @@ def _build_dense_sample_payload_from_tracked_subset(
         "traj_manipulator_candidate_mask": np.zeros(dense_track_count, dtype=bool),
         "traj_manipulator_cluster_id": np.full(dense_track_count, -1, dtype=np.int16),
         "traj_manipulator_component_size": np.zeros(dense_track_count, dtype=np.uint16),
+        "traj_near_depth_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_motion_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_cluster_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_pre_top95_mask": np.zeros(dense_track_count, dtype=bool),
         "traj_manipulator_cluster_fallback_used": np.asarray(
             tracked_sample_payload["traj_manipulator_cluster_fallback_used"], dtype=bool
         ),
@@ -1489,6 +1996,22 @@ def _build_dense_sample_payload_from_tracked_subset(
         "traj_pick_place_depth_guard_mask": np.zeros(dense_track_count, dtype=bool),
         "traj_pick_place_delayed_contact_rescue_mask": np.zeros(dense_track_count, dtype=bool),
         "traj_pick_place_object_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_stereo_compare_frame_count": np.zeros(dense_track_count, dtype=np.uint16),
+        "traj_stereo_depth_consistency_ratio": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_stereo_patch_error": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_stereo_consistency_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_uvd_gate_reliable_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_uvd_gate_removed_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_uvd_gate_uv_depth_anomaly_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_uvd_gate_far_depth_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_uvd_gate_near_depth_relaxed_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_uvd_gate_near_depth_exempt_mask": np.zeros(dense_track_count, dtype=bool),
+        "traj_uvd_gate_uv_mean_delta_px": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_uvd_gate_depth_delta_std_m": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_uvd_gate_max_depth_m": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_uvd_gate_effective_depth_std_threshold_m": np.full(dense_track_count, np.nan, dtype=np.float16),
+        "traj_uvd_gate_uv_pair_valid_count": np.zeros(dense_track_count, dtype=np.uint16),
+        "traj_uvd_gate_depth_pair_valid_count": np.zeros(dense_track_count, dtype=np.uint16),
     }
     if "visibility" in tracked_sample_payload:
         dense_payload["visibility"] = np.zeros((dense_track_count, num_frames), dtype=np.float16)
@@ -1513,6 +2036,126 @@ def _build_dense_sample_payload_from_tracked_subset(
         dense_payload["traj_query_depth_edge_risk_mask"] = np.asarray(
             prefilter_result["query_depth_edge_risk_mask"]
         ).astype(bool, copy=False)
+        if "query_source_bits" in prefilter_result:
+            dense_payload["traj_query_source_bits"] = np.asarray(prefilter_result["query_source_bits"]).astype(
+                np.uint16,
+                copy=False,
+            )
+        if "query_sampler_score" in prefilter_result:
+            dense_payload["traj_query_sampler_score"] = np.asarray(prefilter_result["query_sampler_score"]).astype(
+                np.float16,
+                copy=False,
+            )
+        if "query_risk_bits" in prefilter_result:
+            dense_payload["traj_query_risk_bits"] = np.asarray(prefilter_result["query_risk_bits"]).astype(
+                np.uint16,
+                copy=False,
+            )
+        if "query_low_texture_score" in prefilter_result:
+            dense_payload["traj_query_low_texture_score"] = np.asarray(
+                prefilter_result["query_low_texture_score"]
+            ).astype(np.float16, copy=False)
+        if "query_specular_score" in prefilter_result:
+            dense_payload["traj_query_specular_score"] = np.asarray(prefilter_result["query_specular_score"]).astype(
+                np.float16,
+                copy=False,
+            )
+        if "query_depth_edge_score" in prefilter_result:
+            dense_payload["traj_query_depth_edge_score"] = np.asarray(
+                prefilter_result["query_depth_edge_score"]
+            ).astype(np.float16, copy=False)
+        if "query_border_dist_px" in prefilter_result:
+            dense_payload["traj_query_border_dist_px"] = np.asarray(prefilter_result["query_border_dist_px"]).astype(
+                np.uint16,
+                copy=False,
+            )
+    if query_visibility_gate_result is not None:
+        query_visibility_reliable_mask = np.asarray(
+            query_visibility_gate_result["reliable_track_mask"],
+            dtype=bool,
+        )
+        dense_payload["traj_query_visibility_reliable_mask"] = np.asarray(
+            query_visibility_reliable_mask
+        ).astype(bool, copy=False)
+        dense_payload["traj_query_visibility_removed_mask"] = (~query_visibility_reliable_mask).astype(bool, copy=False)
+        dense_payload["traj_query_visibility_future_visible_ratio"] = np.asarray(
+            query_visibility_gate_result["future_visible_ratio"]
+        ).astype(np.float16, copy=False)
+        dense_payload["traj_query_visibility_first_invalid_step"] = np.asarray(
+            query_visibility_gate_result["first_invalid_step"]
+        ).astype(np.int16, copy=False)
+    if query_fixed_view_depth_gate_result is not None:
+        dense_payload["traj_query_fixed_view_depth_consistency_mask"] = np.asarray(
+            query_fixed_view_depth_gate_result["reliable_track_mask"]
+        ).astype(bool, copy=False)
+        dense_payload["traj_query_fixed_view_depth_anomaly_mask"] = (
+            np.asarray(
+                query_fixed_view_depth_gate_result["depth_anomaly_hit_count"],
+                dtype=np.uint16,
+            ).astype(np.uint16, copy=False)
+            > 0
+        )
+        dense_payload["traj_query_fixed_view_compare_frame_count"] = np.asarray(
+            query_fixed_view_depth_gate_result["compare_frame_count"]
+        ).astype(np.uint16, copy=False)
+        dense_payload["traj_query_fixed_view_uv_stable_hit_count"] = np.asarray(
+            query_fixed_view_depth_gate_result["uv_stable_hit_count"]
+        ).astype(np.uint16, copy=False)
+        dense_payload["traj_query_fixed_view_depth_jump_hit_count"] = np.asarray(
+            query_fixed_view_depth_gate_result["depth_jump_hit_count"]
+        ).astype(np.uint16, copy=False)
+        dense_payload["traj_query_fixed_view_depth_anomaly_hit_count"] = np.asarray(
+            query_fixed_view_depth_gate_result["depth_anomaly_hit_count"]
+        ).astype(np.uint16, copy=False)
+        dense_payload["traj_query_fixed_view_first_anomaly_step"] = np.asarray(
+            query_fixed_view_depth_gate_result["first_anomaly_step"]
+        ).astype(np.int16, copy=False)
+        dense_payload["traj_query_fixed_view_max_depth_delta_m"] = np.asarray(
+            query_fixed_view_depth_gate_result["max_depth_delta_m"]
+        ).astype(np.float16, copy=False)
+        dense_payload["traj_query_fixed_view_min_uv_delta_px"] = np.asarray(
+            query_fixed_view_depth_gate_result["min_uv_delta_px"]
+        ).astype(np.float16, copy=False)
+    if "traj_uvd_gate_reliable_mask" in tracked_sample_payload:
+        dense_payload["traj_uvd_gate_reliable_mask"][tracked_query_indices] = np.asarray(
+            tracked_sample_payload["traj_uvd_gate_reliable_mask"]
+        ).astype(bool, copy=False)
+        dense_payload["traj_uvd_gate_removed_mask"][tracked_query_indices] = np.asarray(
+            tracked_sample_payload["traj_uvd_gate_removed_mask"]
+        ).astype(bool, copy=False)
+        dense_payload["traj_uvd_gate_uv_depth_anomaly_mask"][tracked_query_indices] = np.asarray(
+            tracked_sample_payload["traj_uvd_gate_uv_depth_anomaly_mask"]
+        ).astype(bool, copy=False)
+        dense_payload["traj_uvd_gate_far_depth_mask"][tracked_query_indices] = np.asarray(
+            tracked_sample_payload["traj_uvd_gate_far_depth_mask"]
+        ).astype(bool, copy=False)
+        dense_payload["traj_uvd_gate_near_depth_relaxed_mask"][tracked_query_indices] = np.asarray(
+            tracked_sample_payload.get("traj_uvd_gate_near_depth_relaxed_mask", False)
+        ).astype(bool, copy=False)
+        dense_payload["traj_uvd_gate_near_depth_exempt_mask"][tracked_query_indices] = np.asarray(
+            tracked_sample_payload.get("traj_uvd_gate_near_depth_exempt_mask", False)
+        ).astype(bool, copy=False)
+        dense_payload["traj_uvd_gate_uv_mean_delta_px"][tracked_query_indices] = np.asarray(
+            tracked_sample_payload["traj_uvd_gate_uv_mean_delta_px"]
+        ).astype(np.float16, copy=False)
+        dense_payload["traj_uvd_gate_depth_delta_std_m"][tracked_query_indices] = np.asarray(
+            tracked_sample_payload["traj_uvd_gate_depth_delta_std_m"]
+        ).astype(np.float16, copy=False)
+        dense_payload["traj_uvd_gate_max_depth_m"][tracked_query_indices] = np.asarray(
+            tracked_sample_payload["traj_uvd_gate_max_depth_m"]
+        ).astype(np.float16, copy=False)
+        dense_payload["traj_uvd_gate_effective_depth_std_threshold_m"][tracked_query_indices] = np.asarray(
+            tracked_sample_payload.get(
+                "traj_uvd_gate_effective_depth_std_threshold_m",
+                dense_payload["traj_uvd_gate_effective_depth_std_threshold_m"][tracked_query_indices],
+            )
+        ).astype(np.float16, copy=False)
+        dense_payload["traj_uvd_gate_uv_pair_valid_count"][tracked_query_indices] = np.asarray(
+            tracked_sample_payload["traj_uvd_gate_uv_pair_valid_count"]
+        ).astype(np.uint16, copy=False)
+        dense_payload["traj_uvd_gate_depth_pair_valid_count"][tracked_query_indices] = np.asarray(
+            tracked_sample_payload["traj_uvd_gate_depth_pair_valid_count"]
+        ).astype(np.uint16, copy=False)
 
     dense_payload["traj_uvz"][tracked_query_indices] = np.asarray(tracked_sample_payload["traj_uvz"]).astype(
         np.float32,
@@ -1535,11 +2178,26 @@ def _build_dense_sample_payload_from_tracked_subset(
         "traj_supervision_prefix_len",
         "traj_supervision_count",
         "traj_wrist_seed_mask",
+        "traj_base_mask",
+        "traj_query_depth_quality_mask",
+        "traj_query_depth_keep_mask",
+        "traj_supervision_support_mask",
         "traj_query_depth_rank",
         "traj_query_depth_edge_mask",
         "traj_query_depth_patch_valid_ratio",
         "traj_query_depth_patch_std",
         "traj_query_depth_edge_risk_mask",
+        "traj_query_source_bits",
+        "traj_query_sampler_score",
+        "traj_query_risk_bits",
+        "traj_query_low_texture_score",
+        "traj_query_specular_score",
+        "traj_query_depth_edge_score",
+        "traj_query_border_dist_px",
+        "traj_query_depth_temporal_replace_mask",
+        "traj_query_depth_temporal_support_count",
+        "traj_query_depth_temporal_anchor_mask",
+        "traj_query_depth_temporal_delta_world_m",
         "traj_motion_extent",
         "traj_motion_step_median",
         "traj_motion_extent_all_valid",
@@ -1547,6 +2205,10 @@ def _build_dense_sample_payload_from_tracked_subset(
         "traj_manipulator_candidate_mask",
         "traj_manipulator_cluster_id",
         "traj_manipulator_component_size",
+        "traj_near_depth_mask",
+        "traj_motion_mask",
+        "traj_cluster_mask",
+        "traj_pre_top95_mask",
         "traj_pick_place_heatmap_hit_count",
         "traj_pick_place_heatmap_support_mask",
         "traj_pick_place_min_manipulator_distance",
@@ -1554,9 +2216,22 @@ def _build_dense_sample_payload_from_tracked_subset(
         "traj_pick_place_depth_guard_mask",
         "traj_pick_place_delayed_contact_rescue_mask",
         "traj_pick_place_object_mask",
+        "traj_stereo_compare_frame_count",
+        "traj_stereo_depth_consistency_ratio",
+        "traj_stereo_patch_error",
+        "traj_stereo_consistency_mask",
+        "traj_query_fixed_view_depth_consistency_mask",
+        "traj_query_fixed_view_depth_anomaly_mask",
+        "traj_query_fixed_view_compare_frame_count",
+        "traj_query_fixed_view_uv_stable_hit_count",
+        "traj_query_fixed_view_depth_jump_hit_count",
+        "traj_query_fixed_view_depth_anomaly_hit_count",
+        "traj_query_fixed_view_first_anomaly_step",
+        "traj_query_fixed_view_max_depth_delta_m",
+        "traj_query_fixed_view_min_uv_delta_px",
     )
     for field_name in per_track_fields:
-        if field_name not in tracked_sample_payload:
+        if field_name not in tracked_sample_payload or field_name not in dense_payload:
             continue
         dense_payload[field_name][tracked_query_indices] = np.asarray(tracked_sample_payload[field_name]).astype(
             dense_payload[field_name].dtype,
@@ -1622,6 +2297,21 @@ def prepare_query_frame_sample_bundle(
         if raw_depths_segment is not None
         else depths_segment.astype(np.float32, copy=False)
     )
+    stereo_context = None
+    if frame_data.get("stereo_aux_segment") is not None:
+        stereo_aux_segment = frame_data["stereo_aux_segment"]
+        stereo_rgb_segment = stereo_aux_segment["rgb_segment"]
+        if isinstance(stereo_rgb_segment, torch.Tensor):
+            stereo_rgb_segment = _tensor_to_numpy(stereo_rgb_segment).astype(np.float32, copy=False)
+        current_rgb_segment = _tensor_to_numpy(frame_data["video_segment"]).astype(np.float32, copy=False)
+        stereo_context = {
+            "current_rgb_segment": np.asarray(current_rgb_segment, dtype=np.float32),
+            "rgb_segment": np.asarray(stereo_rgb_segment, dtype=np.float32),
+            "depth_segment": np.asarray(stereo_aux_segment["depth_segment"], dtype=np.float32),
+            "intrinsics_segment": np.asarray(stereo_aux_segment["intrinsics_segment"], dtype=np.float32),
+            "extrinsics_segment": np.asarray(stereo_aux_segment["extrinsics_segment"], dtype=np.float32),
+            "camera_name": str(stereo_aux_segment.get("camera_name", "")),
+        }
     fixed_camera_view = {
         "c2w": np.linalg.inv(extrinsics_np[0]),
         "K": intrinsics_np[0],
@@ -1630,19 +2320,23 @@ def prepare_query_frame_sample_bundle(
     }
 
     projection_start = time.perf_counter()
-    try:
-        tracks2d_fixed = project_tracks_3d_to_2d(
-            tracks3d=coords_np,
-            camera_views=[fixed_camera_view] * len(coords_np),
-        ).transpose(1, 0, 2).astype(np.float32)
-        traj_uvz = project_tracks_3d_to_3d(
-            tracks3d=coords_np,
-            camera_views=[fixed_camera_view] * len(coords_np),
-        ).transpose(1, 0, 2).astype(np.float32)
-    except Exception as e:
-        logger.error(f"Error projecting tracks for frame {query_frame_idx}: {e}")
-        tracks2d_fixed = coords_np[:, :, :2].transpose(1, 0, 2).astype(np.float32)
-        traj_uvz = coords_np.transpose(1, 0, 2).astype(np.float32)
+    if coords_np.shape[1] == 0:
+        tracks2d_fixed = np.zeros((0, coords_np.shape[0], 2), dtype=np.float32)
+        traj_uvz = np.zeros((0, coords_np.shape[0], 3), dtype=np.float32)
+    else:
+        try:
+            tracks2d_fixed = project_tracks_3d_to_2d(
+                tracks3d=coords_np,
+                camera_views=[fixed_camera_view] * len(coords_np),
+            ).transpose(1, 0, 2).astype(np.float32)
+            traj_uvz = project_tracks_3d_to_3d(
+                tracks3d=coords_np,
+                camera_views=[fixed_camera_view] * len(coords_np),
+            ).transpose(1, 0, 2).astype(np.float32)
+        except Exception as e:
+            logger.error(f"Error projecting tracks for frame {query_frame_idx}: {e}")
+            tracks2d_fixed = coords_np[:, :, :2].transpose(1, 0, 2).astype(np.float32)
+            traj_uvz = coords_np.transpose(1, 0, 2).astype(np.float32)
     _accumulate_profile_stat(
         profile_stats,
         "prepare_bundle_projection_seconds",
@@ -1697,12 +2391,17 @@ def prepare_query_frame_sample_bundle(
         "processing_frame_H": frame_data.get("processing_frame_H"),
         "processing_frame_W": frame_data.get("processing_frame_W"),
         "prefilter_result": frame_data.get("prefilter_result"),
+        "query_visibility_gate_result": frame_data.get("query_visibility_gate_result"),
+        "query_fixed_view_depth_gate_result": frame_data.get("query_fixed_view_depth_gate_result"),
+        "query_depth_stabilization_result": frame_data.get("query_depth_stabilization_result"),
+        "dense_depth_stabilization_result": frame_data.get("dense_depth_stabilization_result"),
         "visibs": visibs_np,
         "query_frame_img": query_frame_img,
         "query_frame_depth": query_frame_depth.astype(np.float32),
         "raw_depths_segment": raw_depths_segment_np.astype(np.float32, copy=False),
         "intrinsics_segment": intrinsics_np.astype(np.float32, copy=False),
         "extrinsics_segment": extrinsics_np.astype(np.float32, copy=False),
+        "stereo_context": stereo_context,
         "temporal_compare_context": temporal_compare_context,
     }
 
@@ -1727,12 +2426,16 @@ def build_query_frame_sample_data(
         dtype=np.int32,
     ).reshape(-1)
     prefilter_result = prepared_bundle.get("prefilter_result")
+    query_visibility_gate_result = prepared_bundle.get("query_visibility_gate_result")
+    query_fixed_view_depth_gate_result = prepared_bundle.get("query_fixed_view_depth_gate_result")
+    query_depth_stabilization_result = prepared_bundle.get("query_depth_stabilization_result")
     visibs_np = np.asarray(prepared_bundle["visibs"])
     query_frame_idx = int(prepared_bundle["query_frame_idx"])
     query_frame_depth = np.asarray(prepared_bundle["query_frame_depth"], dtype=np.float32)
     raw_depths_segment = np.asarray(prepared_bundle["raw_depths_segment"], dtype=np.float32)
     intrinsics_np = np.asarray(prepared_bundle["intrinsics_segment"], dtype=np.float32)
     extrinsics_np = np.asarray(prepared_bundle["extrinsics_segment"], dtype=np.float32)
+    stereo_context = prepared_bundle.get("stereo_context")
     frame_h, frame_w = query_frame_depth.shape
     filter_array_prepare_seconds = time.perf_counter() - array_prepare_start
     _accumulate_profile_stat(
@@ -1753,10 +2456,69 @@ def build_query_frame_sample_data(
         raw_depths_segment=raw_depths_segment,
         intrinsics_segment=intrinsics_np,
         extrinsics_segment=extrinsics_np,
+        stereo_context=stereo_context,
         high_volatility_mask=high_volatility_mask,
         temporal_compare_context=prepared_bundle.get("temporal_compare_context"),
         profile_stats=profile_stats,
     )
+    traj_uvd_gate_result = None
+    traj_valid_mask = np.asarray(traj_filter_result["traj_valid_mask"], dtype=bool).copy()
+    traj_uvd_gate_mode = str(getattr(filter_args, "traj_uvd_gate_mode", TRAJ_UVD_GATE_MODE_OFF))
+    if traj_uvd_gate_mode == TRAJ_UVD_GATE_MODE_DELTA_UV_DEPTH_V1 and traj_uvz.shape[0] > 0:
+        traj_uvd_gate_start = time.perf_counter()
+        traj_uvd_gate_result = compute_traj_uvd_motion_gate(
+            traj_uvz,
+            uv_mean_threshold_px=float(
+                getattr(
+                    filter_args,
+                    "traj_uvd_gate_uv_mean_threshold_px",
+                    DEFAULT_TRAJ_UVD_GATE_UV_MEAN_THRESHOLD_PX,
+                )
+            ),
+            depth_std_threshold_m=float(
+                getattr(
+                    filter_args,
+                    "traj_uvd_gate_depth_std_threshold_m",
+                    DEFAULT_TRAJ_UVD_GATE_DEPTH_STD_THRESHOLD_M,
+                )
+            ),
+            max_depth_threshold_m=float(
+                getattr(
+                    filter_args,
+                    "traj_uvd_gate_max_depth_threshold_m",
+                    DEFAULT_TRAJ_UVD_GATE_MAX_DEPTH_THRESHOLD_M,
+                )
+            ),
+            near_depth_threshold_m=float(
+                getattr(
+                    filter_args,
+                    "traj_uvd_gate_near_depth_threshold_m",
+                    DEFAULT_TRAJ_UVD_GATE_NEAR_DEPTH_THRESHOLD_M,
+                )
+            ),
+            near_depth_relaxed_std_threshold_m=float(
+                getattr(
+                    filter_args,
+                    "traj_uvd_gate_near_depth_relaxed_std_threshold_m",
+                    DEFAULT_TRAJ_UVD_GATE_NEAR_DEPTH_RELAXED_STD_THRESHOLD_M,
+                )
+            ),
+            near_depth_exempt_threshold_m=float(
+                getattr(
+                    filter_args,
+                    "traj_uvd_gate_near_depth_exempt_threshold_m",
+                    DEFAULT_TRAJ_UVD_GATE_NEAR_DEPTH_EXEMPT_THRESHOLD_M,
+                )
+            ),
+        )
+        _accumulate_profile_stat(
+            profile_stats,
+            "traj_uvd_gate_seconds",
+            time.perf_counter() - traj_uvd_gate_start,
+        )
+        traj_valid_mask &= np.asarray(traj_uvd_gate_result["reliable_track_mask"], dtype=bool)
+    traj_filter_result = dict(traj_filter_result)
+    traj_filter_result["traj_valid_mask"] = traj_valid_mask.astype(bool, copy=False)
     payload_pack_start = time.perf_counter()
     tracked_sample_payload = {
         "traj_uvz": traj_uvz.astype(np.float32),
@@ -1764,7 +2526,7 @@ def build_query_frame_sample_data(
         "keypoints": keypoints,
         "query_frame_index": np.array([query_frame_idx], dtype=np.int32),
         "segment_frame_indices": query_frame_idx + np.arange(traj_uvz.shape[1], dtype=np.int32),
-        "traj_valid_mask": traj_filter_result["traj_valid_mask"].astype(bool),
+        "traj_valid_mask": traj_valid_mask.astype(bool),
         "traj_depth_consistency_ratio": traj_filter_result["traj_depth_consistency_ratio"].astype(np.float16),
         "traj_stable_depth_consistency_ratio": traj_filter_result["traj_stable_depth_consistency_ratio"].astype(
             np.float16
@@ -1778,6 +2540,10 @@ def build_query_frame_sample_data(
         "traj_supervision_prefix_len": traj_filter_result["traj_supervision_prefix_len"].astype(np.uint16),
         "traj_supervision_count": traj_filter_result["traj_supervision_count"].astype(np.uint16),
         "traj_wrist_seed_mask": traj_filter_result["traj_wrist_seed_mask"].astype(bool),
+        "traj_base_mask": traj_filter_result["traj_base_mask"].astype(bool),
+        "traj_query_depth_quality_mask": traj_filter_result["traj_query_depth_quality_mask"].astype(bool),
+        "traj_query_depth_keep_mask": traj_filter_result["traj_query_depth_keep_mask"].astype(bool),
+        "traj_supervision_support_mask": traj_filter_result["traj_supervision_support_mask"].astype(bool),
         "traj_query_depth_rank": traj_filter_result["traj_query_depth_rank"].astype(np.float16),
         "traj_query_depth_edge_mask": traj_filter_result["traj_query_depth_edge_mask"].astype(bool),
         "traj_query_depth_patch_valid_ratio": traj_filter_result["traj_query_depth_patch_valid_ratio"].astype(
@@ -1785,6 +2551,21 @@ def build_query_frame_sample_data(
         ),
         "traj_query_depth_patch_std": traj_filter_result["traj_query_depth_patch_std"].astype(np.float16),
         "traj_query_depth_edge_risk_mask": traj_filter_result["traj_query_depth_edge_risk_mask"].astype(bool),
+        "traj_query_source_bits": np.zeros(keypoints.shape[0], dtype=np.uint16),
+        "traj_query_sampler_score": np.full(keypoints.shape[0], np.nan, dtype=np.float16),
+        "traj_query_risk_bits": np.zeros(keypoints.shape[0], dtype=np.uint16),
+        "traj_query_low_texture_score": np.full(keypoints.shape[0], np.nan, dtype=np.float16),
+        "traj_query_specular_score": np.full(keypoints.shape[0], np.nan, dtype=np.float16),
+        "traj_query_depth_edge_score": np.full(keypoints.shape[0], np.nan, dtype=np.float16),
+        "traj_query_border_dist_px": np.zeros(keypoints.shape[0], dtype=np.uint16),
+        "traj_query_visibility_reliable_mask": np.zeros(keypoints.shape[0], dtype=bool),
+        "traj_query_visibility_removed_mask": np.zeros(keypoints.shape[0], dtype=bool),
+        "traj_query_visibility_future_visible_ratio": np.full(keypoints.shape[0], np.nan, dtype=np.float16),
+        "traj_query_visibility_first_invalid_step": np.full(keypoints.shape[0], -1, dtype=np.int16),
+        "traj_query_depth_temporal_replace_mask": np.zeros(keypoints.shape[0], dtype=bool),
+        "traj_query_depth_temporal_support_count": np.zeros(keypoints.shape[0], dtype=np.uint16),
+        "traj_query_depth_temporal_anchor_mask": np.zeros(keypoints.shape[0], dtype=bool),
+        "traj_query_depth_temporal_delta_world_m": np.full(keypoints.shape[0], np.nan, dtype=np.float16),
         "traj_motion_extent": traj_filter_result["traj_motion_extent"].astype(np.float16),
         "traj_motion_step_median": traj_filter_result["traj_motion_step_median"].astype(np.float16),
         "traj_motion_extent_all_valid": traj_filter_result["traj_motion_extent_all_valid"].astype(np.float16),
@@ -1796,6 +2577,10 @@ def build_query_frame_sample_data(
         "traj_manipulator_component_size": traj_filter_result["traj_manipulator_component_size"].astype(
             np.uint16
         ),
+        "traj_near_depth_mask": traj_filter_result["traj_near_depth_mask"].astype(bool),
+        "traj_motion_mask": traj_filter_result["traj_motion_mask"].astype(bool),
+        "traj_cluster_mask": traj_filter_result["traj_cluster_mask"].astype(bool),
+        "traj_pre_top95_mask": traj_filter_result["traj_pre_top95_mask"].astype(bool),
         "traj_manipulator_cluster_fallback_used": np.asarray(
             traj_filter_result["traj_manipulator_cluster_fallback_used"], dtype=bool
         ),
@@ -1814,7 +2599,189 @@ def build_query_frame_sample_data(
             "traj_pick_place_delayed_contact_rescue_mask"
         ].astype(bool),
         "traj_pick_place_object_mask": traj_filter_result["traj_pick_place_object_mask"].astype(bool),
+        "traj_stereo_compare_frame_count": traj_filter_result["traj_stereo_compare_frame_count"].astype(np.uint16),
+        "traj_stereo_depth_consistency_ratio": traj_filter_result["traj_stereo_depth_consistency_ratio"].astype(
+            np.float16
+        ),
+        "traj_stereo_patch_error": traj_filter_result["traj_stereo_patch_error"].astype(np.float16),
+        "traj_stereo_consistency_mask": traj_filter_result["traj_stereo_consistency_mask"].astype(bool),
+        "traj_uvd_gate_reliable_mask": np.ones(keypoints.shape[0], dtype=bool),
+        "traj_uvd_gate_removed_mask": np.zeros(keypoints.shape[0], dtype=bool),
+        "traj_uvd_gate_uv_depth_anomaly_mask": np.zeros(keypoints.shape[0], dtype=bool),
+        "traj_uvd_gate_far_depth_mask": np.zeros(keypoints.shape[0], dtype=bool),
+        "traj_uvd_gate_near_depth_relaxed_mask": np.zeros(keypoints.shape[0], dtype=bool),
+        "traj_uvd_gate_near_depth_exempt_mask": np.zeros(keypoints.shape[0], dtype=bool),
+        "traj_uvd_gate_uv_mean_delta_px": np.full(keypoints.shape[0], np.nan, dtype=np.float16),
+        "traj_uvd_gate_depth_delta_std_m": np.full(keypoints.shape[0], np.nan, dtype=np.float16),
+        "traj_uvd_gate_max_depth_m": np.full(keypoints.shape[0], np.nan, dtype=np.float16),
+        "traj_uvd_gate_effective_depth_std_threshold_m": np.full(keypoints.shape[0], np.nan, dtype=np.float16),
+        "traj_uvd_gate_uv_pair_valid_count": np.zeros(keypoints.shape[0], dtype=np.uint16),
+        "traj_uvd_gate_depth_pair_valid_count": np.zeros(keypoints.shape[0], dtype=np.uint16),
     }
+    if query_visibility_gate_result is not None:
+        query_visibility_reliable_mask = np.asarray(
+            query_visibility_gate_result["reliable_track_mask"],
+            dtype=bool,
+        ).reshape(-1)
+        tracked_sample_payload["traj_query_visibility_reliable_mask"] = np.asarray(
+            query_visibility_reliable_mask,
+            dtype=bool,
+        )[tracked_query_indices]
+        tracked_sample_payload["traj_query_visibility_removed_mask"] = np.asarray(
+            ~query_visibility_reliable_mask,
+            dtype=bool,
+        )[tracked_query_indices]
+        tracked_sample_payload["traj_query_visibility_future_visible_ratio"] = np.asarray(
+            query_visibility_gate_result["future_visible_ratio"],
+            dtype=np.float16,
+        ).reshape(-1)[tracked_query_indices]
+        tracked_sample_payload["traj_query_visibility_first_invalid_step"] = np.asarray(
+            query_visibility_gate_result["first_invalid_step"],
+            dtype=np.int16,
+        ).reshape(-1)[tracked_query_indices]
+    if query_fixed_view_depth_gate_result is not None:
+        tracked_sample_payload["traj_query_fixed_view_depth_consistency_mask"] = np.asarray(
+            query_fixed_view_depth_gate_result["reliable_track_mask"],
+            dtype=bool,
+        ).reshape(-1)[tracked_query_indices]
+        tracked_sample_payload["traj_query_fixed_view_depth_anomaly_mask"] = (
+            np.asarray(
+                query_fixed_view_depth_gate_result["depth_anomaly_hit_count"],
+                dtype=np.uint16,
+            ).reshape(-1)[tracked_query_indices]
+            > 0
+        )
+        tracked_sample_payload["traj_query_fixed_view_compare_frame_count"] = np.asarray(
+            query_fixed_view_depth_gate_result["compare_frame_count"],
+            dtype=np.uint16,
+        ).reshape(-1)[tracked_query_indices]
+        tracked_sample_payload["traj_query_fixed_view_uv_stable_hit_count"] = np.asarray(
+            query_fixed_view_depth_gate_result["uv_stable_hit_count"],
+            dtype=np.uint16,
+        ).reshape(-1)[tracked_query_indices]
+        tracked_sample_payload["traj_query_fixed_view_depth_jump_hit_count"] = np.asarray(
+            query_fixed_view_depth_gate_result["depth_jump_hit_count"],
+            dtype=np.uint16,
+        ).reshape(-1)[tracked_query_indices]
+        tracked_sample_payload["traj_query_fixed_view_depth_anomaly_hit_count"] = np.asarray(
+            query_fixed_view_depth_gate_result["depth_anomaly_hit_count"],
+            dtype=np.uint16,
+        ).reshape(-1)[tracked_query_indices]
+        tracked_sample_payload["traj_query_fixed_view_first_anomaly_step"] = np.asarray(
+            query_fixed_view_depth_gate_result["first_anomaly_step"],
+            dtype=np.int16,
+        ).reshape(-1)[tracked_query_indices]
+        tracked_sample_payload["traj_query_fixed_view_max_depth_delta_m"] = np.asarray(
+            query_fixed_view_depth_gate_result["max_depth_delta_m"],
+            dtype=np.float16,
+        ).reshape(-1)[tracked_query_indices]
+        tracked_sample_payload["traj_query_fixed_view_min_uv_delta_px"] = np.asarray(
+            query_fixed_view_depth_gate_result["min_uv_delta_px"],
+            dtype=np.float16,
+        ).reshape(-1)[tracked_query_indices]
+    if prefilter_result is not None:
+        tracked_sample_payload["traj_query_source_bits"] = np.asarray(
+            prefilter_result.get("query_source_bits", tracked_sample_payload["traj_query_source_bits"]),
+            dtype=np.uint16,
+        ).reshape(-1)[: keypoints.shape[0]]
+        tracked_sample_payload["traj_query_sampler_score"] = np.asarray(
+            prefilter_result.get("query_sampler_score", tracked_sample_payload["traj_query_sampler_score"]),
+            dtype=np.float16,
+        ).reshape(-1)[: keypoints.shape[0]]
+        tracked_sample_payload["traj_query_risk_bits"] = np.asarray(
+            prefilter_result.get("query_risk_bits", tracked_sample_payload["traj_query_risk_bits"]),
+            dtype=np.uint16,
+        ).reshape(-1)[: keypoints.shape[0]]
+        tracked_sample_payload["traj_query_low_texture_score"] = np.asarray(
+            prefilter_result.get("query_low_texture_score", tracked_sample_payload["traj_query_low_texture_score"]),
+            dtype=np.float16,
+        ).reshape(-1)[: keypoints.shape[0]]
+        tracked_sample_payload["traj_query_specular_score"] = np.asarray(
+            prefilter_result.get("query_specular_score", tracked_sample_payload["traj_query_specular_score"]),
+            dtype=np.float16,
+        ).reshape(-1)[: keypoints.shape[0]]
+        tracked_sample_payload["traj_query_depth_edge_score"] = np.asarray(
+            prefilter_result.get("query_depth_edge_score", tracked_sample_payload["traj_query_depth_edge_score"]),
+            dtype=np.float16,
+        ).reshape(-1)[: keypoints.shape[0]]
+        tracked_sample_payload["traj_query_border_dist_px"] = np.asarray(
+            prefilter_result.get("query_border_dist_px", tracked_sample_payload["traj_query_border_dist_px"]),
+            dtype=np.uint16,
+        ).reshape(-1)[: keypoints.shape[0]]
+    if query_depth_stabilization_result is not None:
+        tracked_sample_payload["traj_query_depth_temporal_replace_mask"] = np.asarray(
+            query_depth_stabilization_result.get(
+                "replace_mask", tracked_sample_payload["traj_query_depth_temporal_replace_mask"]
+            ),
+            dtype=bool,
+        ).reshape(-1)[: keypoints.shape[0]]
+        tracked_sample_payload["traj_query_depth_temporal_support_count"] = np.asarray(
+            query_depth_stabilization_result.get(
+                "support_counts", tracked_sample_payload["traj_query_depth_temporal_support_count"]
+            ),
+            dtype=np.uint16,
+        ).reshape(-1)[: keypoints.shape[0]]
+        tracked_sample_payload["traj_query_depth_temporal_anchor_mask"] = np.asarray(
+            query_depth_stabilization_result.get(
+                "anchor_mask", tracked_sample_payload["traj_query_depth_temporal_anchor_mask"]
+            ),
+            dtype=bool,
+        ).reshape(-1)[: keypoints.shape[0]]
+        tracked_sample_payload["traj_query_depth_temporal_delta_world_m"] = np.asarray(
+            query_depth_stabilization_result.get(
+                "delta_world_m", tracked_sample_payload["traj_query_depth_temporal_delta_world_m"]
+            ),
+            dtype=np.float16,
+        ).reshape(-1)[: keypoints.shape[0]]
+    if traj_uvd_gate_result is not None:
+        tracked_sample_payload["traj_uvd_gate_reliable_mask"] = np.asarray(
+            traj_uvd_gate_result["reliable_track_mask"],
+            dtype=bool,
+        )
+        tracked_sample_payload["traj_uvd_gate_removed_mask"] = np.asarray(
+            traj_uvd_gate_result["removed_track_mask"],
+            dtype=bool,
+        )
+        tracked_sample_payload["traj_uvd_gate_uv_depth_anomaly_mask"] = np.asarray(
+            traj_uvd_gate_result["uv_depth_anomaly_mask"],
+            dtype=bool,
+        )
+        tracked_sample_payload["traj_uvd_gate_far_depth_mask"] = np.asarray(
+            traj_uvd_gate_result["far_depth_mask"],
+            dtype=bool,
+        )
+        tracked_sample_payload["traj_uvd_gate_near_depth_relaxed_mask"] = np.asarray(
+            traj_uvd_gate_result["near_depth_relaxed_mask"],
+            dtype=bool,
+        )
+        tracked_sample_payload["traj_uvd_gate_near_depth_exempt_mask"] = np.asarray(
+            traj_uvd_gate_result["near_depth_exempt_mask"],
+            dtype=bool,
+        )
+        tracked_sample_payload["traj_uvd_gate_uv_mean_delta_px"] = np.asarray(
+            traj_uvd_gate_result["uv_mean_delta_px"],
+            dtype=np.float16,
+        )
+        tracked_sample_payload["traj_uvd_gate_depth_delta_std_m"] = np.asarray(
+            traj_uvd_gate_result["depth_delta_std_m"],
+            dtype=np.float16,
+        )
+        tracked_sample_payload["traj_uvd_gate_max_depth_m"] = np.asarray(
+            traj_uvd_gate_result["max_depth_m"],
+            dtype=np.float16,
+        )
+        tracked_sample_payload["traj_uvd_gate_effective_depth_std_threshold_m"] = np.asarray(
+            traj_uvd_gate_result["effective_depth_std_threshold_m"],
+            dtype=np.float16,
+        )
+        tracked_sample_payload["traj_uvd_gate_uv_pair_valid_count"] = np.asarray(
+            traj_uvd_gate_result["uv_pair_valid_count"],
+            dtype=np.uint16,
+        )
+        tracked_sample_payload["traj_uvd_gate_depth_pair_valid_count"] = np.asarray(
+            traj_uvd_gate_result["depth_pair_valid_count"],
+            dtype=np.uint16,
+        )
     if save_visibility:
         visibility = visibs_np
         if visibility.shape[0] == traj_uvz.shape[1] and visibility.shape[1] == traj_uvz.shape[0]:
@@ -1835,6 +2802,8 @@ def build_query_frame_sample_data(
             tracked_query_indices=tracked_query_indices,
             tracked_sample_payload=tracked_sample_payload,
             prefilter_result=prefilter_result if prefilter_result is not None else None,
+            query_visibility_gate_result=query_visibility_gate_result,
+            query_fixed_view_depth_gate_result=query_fixed_view_depth_gate_result,
         )
         filter_dense_payload_expand_seconds = time.perf_counter() - dense_expand_start
         _accumulate_profile_stat(
@@ -1922,11 +2891,30 @@ def build_v2_sample_data(
         "traj_supervision_prefix_len": sample_payload["traj_supervision_prefix_len"],
         "traj_supervision_count": sample_payload["traj_supervision_count"],
         "traj_wrist_seed_mask": sample_payload["traj_wrist_seed_mask"],
+        "traj_base_mask": sample_payload["traj_base_mask"],
+        "traj_query_depth_quality_mask": sample_payload["traj_query_depth_quality_mask"],
+        "traj_query_depth_keep_mask": sample_payload["traj_query_depth_keep_mask"],
+        "traj_supervision_support_mask": sample_payload["traj_supervision_support_mask"],
         "traj_query_depth_rank": sample_payload["traj_query_depth_rank"],
         "traj_query_depth_edge_mask": sample_payload["traj_query_depth_edge_mask"],
         "traj_query_depth_patch_valid_ratio": sample_payload["traj_query_depth_patch_valid_ratio"],
         "traj_query_depth_patch_std": sample_payload["traj_query_depth_patch_std"],
         "traj_query_depth_edge_risk_mask": sample_payload["traj_query_depth_edge_risk_mask"],
+        "traj_query_source_bits": sample_payload["traj_query_source_bits"],
+        "traj_query_sampler_score": sample_payload["traj_query_sampler_score"],
+        "traj_query_risk_bits": sample_payload["traj_query_risk_bits"],
+        "traj_query_low_texture_score": sample_payload["traj_query_low_texture_score"],
+        "traj_query_specular_score": sample_payload["traj_query_specular_score"],
+        "traj_query_depth_edge_score": sample_payload["traj_query_depth_edge_score"],
+        "traj_query_border_dist_px": sample_payload["traj_query_border_dist_px"],
+        "traj_query_visibility_reliable_mask": sample_payload["traj_query_visibility_reliable_mask"],
+        "traj_query_visibility_removed_mask": sample_payload["traj_query_visibility_removed_mask"],
+        "traj_query_visibility_future_visible_ratio": sample_payload["traj_query_visibility_future_visible_ratio"],
+        "traj_query_visibility_first_invalid_step": sample_payload["traj_query_visibility_first_invalid_step"],
+        "traj_query_depth_temporal_replace_mask": sample_payload["traj_query_depth_temporal_replace_mask"],
+        "traj_query_depth_temporal_support_count": sample_payload["traj_query_depth_temporal_support_count"],
+        "traj_query_depth_temporal_anchor_mask": sample_payload["traj_query_depth_temporal_anchor_mask"],
+        "traj_query_depth_temporal_delta_world_m": sample_payload["traj_query_depth_temporal_delta_world_m"],
         "traj_motion_extent": sample_payload["traj_motion_extent"],
         "traj_motion_step_median": sample_payload["traj_motion_step_median"],
         "traj_motion_extent_all_valid": sample_payload["traj_motion_extent_all_valid"],
@@ -1934,6 +2922,10 @@ def build_v2_sample_data(
         "traj_manipulator_candidate_mask": sample_payload["traj_manipulator_candidate_mask"],
         "traj_manipulator_cluster_id": sample_payload["traj_manipulator_cluster_id"],
         "traj_manipulator_component_size": sample_payload["traj_manipulator_component_size"],
+        "traj_near_depth_mask": sample_payload["traj_near_depth_mask"],
+        "traj_motion_mask": sample_payload["traj_motion_mask"],
+        "traj_cluster_mask": sample_payload["traj_cluster_mask"],
+        "traj_pre_top95_mask": sample_payload["traj_pre_top95_mask"],
         "traj_manipulator_cluster_fallback_used": sample_payload["traj_manipulator_cluster_fallback_used"],
         "traj_pick_place_heatmap_hit_count": sample_payload["traj_pick_place_heatmap_hit_count"],
         "traj_pick_place_heatmap_support_mask": sample_payload["traj_pick_place_heatmap_support_mask"],
@@ -1945,7 +2937,48 @@ def build_v2_sample_data(
             np.zeros_like(sample_payload["traj_pick_place_object_mask"], dtype=bool),
         ),
         "traj_pick_place_object_mask": sample_payload["traj_pick_place_object_mask"],
+        "traj_stereo_compare_frame_count": sample_payload["traj_stereo_compare_frame_count"],
+        "traj_stereo_depth_consistency_ratio": sample_payload["traj_stereo_depth_consistency_ratio"],
+        "traj_stereo_patch_error": sample_payload["traj_stereo_patch_error"],
+        "traj_stereo_consistency_mask": sample_payload["traj_stereo_consistency_mask"],
+        "traj_uvd_gate_reliable_mask": sample_payload["traj_uvd_gate_reliable_mask"],
+        "traj_uvd_gate_removed_mask": sample_payload["traj_uvd_gate_removed_mask"],
+        "traj_uvd_gate_uv_depth_anomaly_mask": sample_payload["traj_uvd_gate_uv_depth_anomaly_mask"],
+        "traj_uvd_gate_far_depth_mask": sample_payload["traj_uvd_gate_far_depth_mask"],
+        "traj_uvd_gate_uv_mean_delta_px": sample_payload["traj_uvd_gate_uv_mean_delta_px"],
+        "traj_uvd_gate_depth_delta_std_m": sample_payload["traj_uvd_gate_depth_delta_std_m"],
+        "traj_uvd_gate_max_depth_m": sample_payload["traj_uvd_gate_max_depth_m"],
+        "traj_uvd_gate_uv_pair_valid_count": sample_payload["traj_uvd_gate_uv_pair_valid_count"],
+        "traj_uvd_gate_depth_pair_valid_count": sample_payload["traj_uvd_gate_depth_pair_valid_count"],
     }
+    if "traj_query_fixed_view_depth_consistency_mask" in sample_payload:
+        sample_data["traj_query_fixed_view_depth_consistency_mask"] = sample_payload[
+            "traj_query_fixed_view_depth_consistency_mask"
+        ]
+        sample_data["traj_query_fixed_view_depth_anomaly_mask"] = sample_payload[
+            "traj_query_fixed_view_depth_anomaly_mask"
+        ]
+        sample_data["traj_query_fixed_view_compare_frame_count"] = sample_payload[
+            "traj_query_fixed_view_compare_frame_count"
+        ]
+        sample_data["traj_query_fixed_view_uv_stable_hit_count"] = sample_payload[
+            "traj_query_fixed_view_uv_stable_hit_count"
+        ]
+        sample_data["traj_query_fixed_view_depth_jump_hit_count"] = sample_payload[
+            "traj_query_fixed_view_depth_jump_hit_count"
+        ]
+        sample_data["traj_query_fixed_view_depth_anomaly_hit_count"] = sample_payload[
+            "traj_query_fixed_view_depth_anomaly_hit_count"
+        ]
+        sample_data["traj_query_fixed_view_first_anomaly_step"] = sample_payload[
+            "traj_query_fixed_view_first_anomaly_step"
+        ]
+        sample_data["traj_query_fixed_view_max_depth_delta_m"] = sample_payload[
+            "traj_query_fixed_view_max_depth_delta_m"
+        ]
+        sample_data["traj_query_fixed_view_min_uv_delta_px"] = sample_payload[
+            "traj_query_fixed_view_min_uv_delta_px"
+        ]
     if prepared_bundle.get("support_grid_size") is not None:
         sample_data["support_grid_size"] = np.array([int(prepared_bundle["support_grid_size"])], dtype=np.int32)
     _append_frame_resolution_metadata(
@@ -1955,6 +2988,40 @@ def build_v2_sample_data(
         processing_frame_height=prepared_bundle.get("processing_frame_H"),
         processing_frame_width=prepared_bundle.get("processing_frame_W"),
     )
+    if prepared_bundle.get("query_depth_stabilization_result") is not None:
+        sample_data["query_depth_stabilization_mode"] = np.asarray(
+            prepared_bundle["query_depth_stabilization_result"].get("mode", [QUERY_DEPTH_STABILIZATION_MODE_OFF])
+        )
+    if prepared_bundle.get("dense_depth_stabilization_result") is not None:
+        sample_data["dense_depth_stabilization_mode"] = np.asarray(
+            prepared_bundle["dense_depth_stabilization_result"].get("mode", [DENSE_DEPTH_STABILIZATION_MODE_OFF])
+        )
+        sample_data["dense_depth_temporal_replace_ratio"] = np.asarray(
+            prepared_bundle["dense_depth_stabilization_result"].get("replace_ratio", np.zeros(0, dtype=np.float32)),
+            dtype=np.float16,
+        )
+        sample_data["dense_depth_temporal_replace_count"] = np.asarray(
+            prepared_bundle["dense_depth_stabilization_result"].get("replace_count", np.zeros(0, dtype=np.int32)),
+            dtype=np.int32,
+        )
+        sample_data["dense_depth_temporal_support_count_median"] = np.asarray(
+            prepared_bundle["dense_depth_stabilization_result"].get(
+                "support_count_median", np.zeros(0, dtype=np.float32)
+            ),
+            dtype=np.float16,
+        )
+        sample_data["dense_depth_temporal_support_count_p95"] = np.asarray(
+            prepared_bundle["dense_depth_stabilization_result"].get("support_count_p95", np.zeros(0, dtype=np.float32)),
+            dtype=np.float16,
+        )
+        sample_data["dense_depth_temporal_delta_depth_median_m"] = np.asarray(
+            prepared_bundle["dense_depth_stabilization_result"].get("depth_delta_median_m", np.zeros(0, dtype=np.float32)),
+            dtype=np.float16,
+        )
+        sample_data["dense_depth_temporal_delta_depth_p95_m"] = np.asarray(
+            prepared_bundle["dense_depth_stabilization_result"].get("depth_delta_p95_m", np.zeros(0, dtype=np.float32)),
+            dtype=np.float16,
+        )
     if "visibility" in sample_payload:
         sample_data["visibility"] = sample_payload["visibility"]
     sample_data = _pad_v2_sample_data_to_future_len(sample_data=sample_data, future_len=future_len)
@@ -2186,11 +3253,30 @@ def save_single_query_frame_legacy(
         "traj_supervision_prefix_len": sample_payload["traj_supervision_prefix_len"],
         "traj_supervision_count": sample_payload["traj_supervision_count"],
         "traj_wrist_seed_mask": sample_payload["traj_wrist_seed_mask"],
+        "traj_base_mask": sample_payload["traj_base_mask"],
+        "traj_query_depth_quality_mask": sample_payload["traj_query_depth_quality_mask"],
+        "traj_query_depth_keep_mask": sample_payload["traj_query_depth_keep_mask"],
+        "traj_supervision_support_mask": sample_payload["traj_supervision_support_mask"],
         "traj_query_depth_rank": sample_payload["traj_query_depth_rank"],
         "traj_query_depth_edge_mask": sample_payload["traj_query_depth_edge_mask"],
         "traj_query_depth_patch_valid_ratio": sample_payload["traj_query_depth_patch_valid_ratio"],
         "traj_query_depth_patch_std": sample_payload["traj_query_depth_patch_std"],
         "traj_query_depth_edge_risk_mask": sample_payload["traj_query_depth_edge_risk_mask"],
+        "traj_query_source_bits": sample_payload["traj_query_source_bits"],
+        "traj_query_sampler_score": sample_payload["traj_query_sampler_score"],
+        "traj_query_risk_bits": sample_payload["traj_query_risk_bits"],
+        "traj_query_low_texture_score": sample_payload["traj_query_low_texture_score"],
+        "traj_query_specular_score": sample_payload["traj_query_specular_score"],
+        "traj_query_depth_edge_score": sample_payload["traj_query_depth_edge_score"],
+        "traj_query_border_dist_px": sample_payload["traj_query_border_dist_px"],
+        "traj_query_visibility_reliable_mask": sample_payload["traj_query_visibility_reliable_mask"],
+        "traj_query_visibility_removed_mask": sample_payload["traj_query_visibility_removed_mask"],
+        "traj_query_visibility_future_visible_ratio": sample_payload["traj_query_visibility_future_visible_ratio"],
+        "traj_query_visibility_first_invalid_step": sample_payload["traj_query_visibility_first_invalid_step"],
+        "traj_query_depth_temporal_replace_mask": sample_payload["traj_query_depth_temporal_replace_mask"],
+        "traj_query_depth_temporal_support_count": sample_payload["traj_query_depth_temporal_support_count"],
+        "traj_query_depth_temporal_anchor_mask": sample_payload["traj_query_depth_temporal_anchor_mask"],
+        "traj_query_depth_temporal_delta_world_m": sample_payload["traj_query_depth_temporal_delta_world_m"],
         "traj_motion_extent": sample_payload["traj_motion_extent"],
         "traj_motion_step_median": sample_payload["traj_motion_step_median"],
         "traj_motion_extent_all_valid": sample_payload["traj_motion_extent_all_valid"],
@@ -2198,6 +3284,10 @@ def save_single_query_frame_legacy(
         "traj_manipulator_candidate_mask": sample_payload["traj_manipulator_candidate_mask"],
         "traj_manipulator_cluster_id": sample_payload["traj_manipulator_cluster_id"],
         "traj_manipulator_component_size": sample_payload["traj_manipulator_component_size"],
+        "traj_near_depth_mask": sample_payload["traj_near_depth_mask"],
+        "traj_motion_mask": sample_payload["traj_motion_mask"],
+        "traj_cluster_mask": sample_payload["traj_cluster_mask"],
+        "traj_pre_top95_mask": sample_payload["traj_pre_top95_mask"],
         "traj_manipulator_cluster_fallback_used": sample_payload["traj_manipulator_cluster_fallback_used"],
         "traj_pick_place_heatmap_hit_count": sample_payload["traj_pick_place_heatmap_hit_count"],
         "traj_pick_place_heatmap_support_mask": sample_payload["traj_pick_place_heatmap_support_mask"],
@@ -2209,8 +3299,49 @@ def save_single_query_frame_legacy(
             np.zeros_like(sample_payload["traj_pick_place_object_mask"], dtype=bool),
         ),
         "traj_pick_place_object_mask": sample_payload["traj_pick_place_object_mask"],
+        "traj_stereo_compare_frame_count": sample_payload["traj_stereo_compare_frame_count"],
+        "traj_stereo_depth_consistency_ratio": sample_payload["traj_stereo_depth_consistency_ratio"],
+        "traj_stereo_patch_error": sample_payload["traj_stereo_patch_error"],
+        "traj_stereo_consistency_mask": sample_payload["traj_stereo_consistency_mask"],
+        "traj_uvd_gate_reliable_mask": sample_payload["traj_uvd_gate_reliable_mask"],
+        "traj_uvd_gate_removed_mask": sample_payload["traj_uvd_gate_removed_mask"],
+        "traj_uvd_gate_uv_depth_anomaly_mask": sample_payload["traj_uvd_gate_uv_depth_anomaly_mask"],
+        "traj_uvd_gate_far_depth_mask": sample_payload["traj_uvd_gate_far_depth_mask"],
+        "traj_uvd_gate_uv_mean_delta_px": sample_payload["traj_uvd_gate_uv_mean_delta_px"],
+        "traj_uvd_gate_depth_delta_std_m": sample_payload["traj_uvd_gate_depth_delta_std_m"],
+        "traj_uvd_gate_max_depth_m": sample_payload["traj_uvd_gate_max_depth_m"],
+        "traj_uvd_gate_uv_pair_valid_count": sample_payload["traj_uvd_gate_uv_pair_valid_count"],
+        "traj_uvd_gate_depth_pair_valid_count": sample_payload["traj_uvd_gate_depth_pair_valid_count"],
         "valid_steps": valid_steps,
     }
+    if "traj_query_fixed_view_depth_consistency_mask" in sample_payload:
+        sample_data["traj_query_fixed_view_depth_consistency_mask"] = sample_payload[
+            "traj_query_fixed_view_depth_consistency_mask"
+        ]
+        sample_data["traj_query_fixed_view_depth_anomaly_mask"] = sample_payload[
+            "traj_query_fixed_view_depth_anomaly_mask"
+        ]
+        sample_data["traj_query_fixed_view_compare_frame_count"] = sample_payload[
+            "traj_query_fixed_view_compare_frame_count"
+        ]
+        sample_data["traj_query_fixed_view_uv_stable_hit_count"] = sample_payload[
+            "traj_query_fixed_view_uv_stable_hit_count"
+        ]
+        sample_data["traj_query_fixed_view_depth_jump_hit_count"] = sample_payload[
+            "traj_query_fixed_view_depth_jump_hit_count"
+        ]
+        sample_data["traj_query_fixed_view_depth_anomaly_hit_count"] = sample_payload[
+            "traj_query_fixed_view_depth_anomaly_hit_count"
+        ]
+        sample_data["traj_query_fixed_view_first_anomaly_step"] = sample_payload[
+            "traj_query_fixed_view_first_anomaly_step"
+        ]
+        sample_data["traj_query_fixed_view_max_depth_delta_m"] = sample_payload[
+            "traj_query_fixed_view_max_depth_delta_m"
+        ]
+        sample_data["traj_query_fixed_view_min_uv_delta_px"] = sample_payload[
+            "traj_query_fixed_view_min_uv_delta_px"
+        ]
     if prepared_bundle.get("support_grid_size") is not None:
         sample_data["support_grid_size"] = np.array([int(prepared_bundle["support_grid_size"])], dtype=np.int32)
     _append_frame_resolution_metadata(
@@ -2220,6 +3351,40 @@ def save_single_query_frame_legacy(
         processing_frame_height=prepared_bundle.get("processing_frame_H"),
         processing_frame_width=prepared_bundle.get("processing_frame_W"),
     )
+    if prepared_bundle.get("query_depth_stabilization_result") is not None:
+        sample_data["query_depth_stabilization_mode"] = np.asarray(
+            prepared_bundle["query_depth_stabilization_result"].get("mode", [QUERY_DEPTH_STABILIZATION_MODE_OFF])
+        )
+    if prepared_bundle.get("dense_depth_stabilization_result") is not None:
+        sample_data["dense_depth_stabilization_mode"] = np.asarray(
+            prepared_bundle["dense_depth_stabilization_result"].get("mode", [DENSE_DEPTH_STABILIZATION_MODE_OFF])
+        )
+        sample_data["dense_depth_temporal_replace_ratio"] = np.asarray(
+            prepared_bundle["dense_depth_stabilization_result"].get("replace_ratio", np.zeros(0, dtype=np.float32)),
+            dtype=np.float16,
+        )
+        sample_data["dense_depth_temporal_replace_count"] = np.asarray(
+            prepared_bundle["dense_depth_stabilization_result"].get("replace_count", np.zeros(0, dtype=np.int32)),
+            dtype=np.int32,
+        )
+        sample_data["dense_depth_temporal_support_count_median"] = np.asarray(
+            prepared_bundle["dense_depth_stabilization_result"].get(
+                "support_count_median", np.zeros(0, dtype=np.float32)
+            ),
+            dtype=np.float16,
+        )
+        sample_data["dense_depth_temporal_support_count_p95"] = np.asarray(
+            prepared_bundle["dense_depth_stabilization_result"].get("support_count_p95", np.zeros(0, dtype=np.float32)),
+            dtype=np.float16,
+        )
+        sample_data["dense_depth_temporal_delta_depth_median_m"] = np.asarray(
+            prepared_bundle["dense_depth_stabilization_result"].get("depth_delta_median_m", np.zeros(0, dtype=np.float32)),
+            dtype=np.float16,
+        )
+        sample_data["dense_depth_temporal_delta_depth_p95_m"] = np.asarray(
+            prepared_bundle["dense_depth_stabilization_result"].get("depth_delta_p95_m", np.zeros(0, dtype=np.float32)),
+            dtype=np.float16,
+        )
     if "visibility" in sample_payload:
         sample_data["visibility"] = sample_payload["visibility"]
 
@@ -2526,7 +3691,11 @@ def save_structured_data(
             )
         scene_h5_relpath = "scene.h5" if scene_storage_mode == SCENE_STORAGE_CACHE else None
         rgb_cache_relpath = "scene_rgb.mp4" if scene_storage_mode == SCENE_STORAGE_CACHE else None
-        source_geom_path = getattr(filter_args, "external_geom_npz", None) if filter_args is not None else None
+        source_rgb_path = _normalize_source_ref_path(video_source_path)
+        source_depth_path = _normalize_source_ref_path(depth_source_path)
+        source_geom_path = _normalize_source_ref_path(
+            getattr(filter_args, "external_geom_npz", None) if filter_args is not None else None
+        )
         if scene_storage_mode == SCENE_STORAGE_CACHE:
             scene_cache_write_start = time.perf_counter()
             write_scene_h5(
@@ -2561,10 +3730,10 @@ def save_structured_data(
                 "scene_storage_mode": scene_storage_mode,
                 "scene_h5_path": scene_h5_relpath,
                 "rgb_cache_path": rgb_cache_relpath,
-                "source_rgb_path": video_source_path,
-                "source_rgb_kind": path_kind(video_source_path),
-                "source_depth_path": depth_source_path,
-                "source_depth_kind": path_kind(depth_source_path),
+                "source_rgb_path": source_rgb_path,
+                "source_rgb_kind": path_kind(source_rgb_path),
+                "source_depth_path": source_depth_path,
+                "source_depth_kind": path_kind(source_depth_path),
                 "source_geom_path": source_geom_path,
                 "source_geom_kind": path_kind(source_geom_path),
                 "source_camera_name": getattr(filter_args, "camera_name", None),
@@ -2891,6 +4060,147 @@ def _resolve_video_stride(video_path, args) -> tuple[int, int]:
     return stride, n_frames
 
 
+def _replace_camera_token_in_path(path_str: str | None, src_camera: str, dst_camera: str) -> str | None:
+    if not path_str:
+        return None
+    if src_camera not in path_str:
+        return None
+    replaced = path_str.replace(src_camera, dst_camera)
+    return replaced if replaced != path_str else None
+
+
+def _resolve_stereo_aux_spec(video_path, depth_path, args) -> dict[str, str] | None:
+    current_camera = str(getattr(args, "camera_name", "") or "").strip()
+    if current_camera == "":
+        current_camera = os.path.basename(str(video_path).rstrip("/"))
+    if current_camera not in {"stereo_left", "stereo_right"}:
+        return None
+    aux_camera = "stereo_right" if current_camera == "stereo_left" else "stereo_left"
+
+    aux_video_path = getattr(args, "stereo_aux_video_path", None)
+    if aux_video_path is None and video_path is not None:
+        candidate = _replace_camera_token_in_path(str(video_path), current_camera, aux_camera)
+        if candidate and os.path.exists(candidate):
+            aux_video_path = candidate
+
+    aux_depth_path = getattr(args, "stereo_aux_depth_path", None)
+    if aux_depth_path is None and depth_path is not None:
+        candidate = _replace_camera_token_in_path(str(depth_path), current_camera, aux_camera)
+        if candidate and os.path.exists(candidate):
+            aux_depth_path = candidate
+
+    aux_geom_path = getattr(args, "stereo_aux_geom_npz", None)
+    if aux_geom_path is None:
+        current_geom_path = getattr(args, "external_geom_npz", None)
+        if current_geom_path:
+            current_geom_path = str(current_geom_path)
+            if current_geom_path.endswith(".h5"):
+                aux_geom_path = current_geom_path
+            else:
+                candidate = _replace_camera_token_in_path(current_geom_path, current_camera, aux_camera)
+                if candidate and os.path.exists(candidate):
+                    aux_geom_path = candidate
+
+    aux_camera_name = getattr(args, "stereo_aux_camera_name", None) or aux_camera
+    aux_extr_mode = getattr(args, "stereo_aux_extr_mode", None) or getattr(args, "external_extr_mode", "w2c")
+    if not aux_video_path or not aux_depth_path or not aux_geom_path:
+        return None
+    if not os.path.exists(aux_video_path) or not os.path.exists(aux_depth_path) or not os.path.exists(aux_geom_path):
+        return None
+    return {
+        "camera_name": str(aux_camera_name),
+        "video_path": str(aux_video_path),
+        "depth_path": str(aux_depth_path),
+        "geom_path": str(aux_geom_path),
+        "extr_mode": str(aux_extr_mode),
+    }
+
+
+def _align_loaded_frames_to_source_indices(
+    data: torch.Tensor | np.ndarray,
+    loaded_source_frame_indices: np.ndarray,
+    target_source_frame_indices: np.ndarray,
+) -> torch.Tensor | np.ndarray:
+    loaded_source_frame_indices = np.asarray(loaded_source_frame_indices, dtype=np.int32).reshape(-1)
+    target_source_frame_indices = np.asarray(target_source_frame_indices, dtype=np.int32).reshape(-1)
+    if loaded_source_frame_indices.size == 0 or target_source_frame_indices.size == 0:
+        raise ValueError("Cannot align empty frame index arrays for stereo auxiliary context")
+    index_lookup = {int(source_idx): int(local_idx) for local_idx, source_idx in enumerate(loaded_source_frame_indices.tolist())}
+    missing = [int(source_idx) for source_idx in target_source_frame_indices.tolist() if int(source_idx) not in index_lookup]
+    if missing:
+        raise KeyError(
+            f"Stereo auxiliary context is missing {len(missing)} source frame(s): {missing[:5]}"
+            + (" ..." if len(missing) > 5 else "")
+        )
+    gather_indices = [index_lookup[int(source_idx)] for source_idx in target_source_frame_indices.tolist()]
+    if isinstance(data, torch.Tensor):
+        gather_tensor = torch.as_tensor(gather_indices, dtype=torch.long, device=data.device)
+        return data.index_select(0, gather_tensor)
+    return np.asarray(data)[gather_indices]
+
+
+def _load_stereo_aux_context(
+    *,
+    stereo_spec: dict[str, str],
+    stride: int,
+    max_num_frames: int,
+    target_source_frame_indices: np.ndarray,
+) -> dict[str, object] | None:
+    try:
+        aux_video_tensor, _, _, aux_video_source_indices = load_video_and_mask(
+            stereo_spec["video_path"],
+            None,
+            stride,
+            max_num_frames,
+        )
+        aux_depth_tensor, _, _, aux_depth_source_indices = load_video_and_mask(
+            stereo_spec["depth_path"],
+            None,
+            stride,
+            max_num_frames,
+            is_depth=True,
+        )
+        aux_video_tensor = _align_loaded_frames_to_source_indices(
+            aux_video_tensor,
+            aux_video_source_indices,
+            target_source_frame_indices,
+        )
+        aux_depth_tensor = _align_loaded_frames_to_source_indices(
+            aux_depth_tensor,
+            aux_depth_source_indices,
+            target_source_frame_indices,
+        )
+        aux_intrs_raw, aux_extrs_raw = _load_external_geom(
+            stereo_spec["geom_path"],
+            stereo_spec["camera_name"],
+        )
+        aux_extrs = normalize_extrinsics_to_w2c(
+            aux_extrs_raw,
+            extr_mode=stereo_spec["extr_mode"],
+            context="Stereo auxiliary external extrinsics",
+        )
+        max_source_idx = int(np.max(target_source_frame_indices))
+        if max_source_idx >= aux_intrs_raw.shape[0]:
+            raise IndexError(
+                f"Stereo auxiliary geom has {aux_intrs_raw.shape[0]} frames but needs source frame {max_source_idx}"
+            )
+        aux_intrs = aux_intrs_raw[target_source_frame_indices].astype(np.float32, copy=False)
+        aux_extrs = aux_extrs[target_source_frame_indices].astype(np.float32, copy=False)
+        video_ten = aux_video_tensor.float()
+        if video_ten.numel() > 0 and torch.max(video_ten) > 1.5:
+            video_ten = video_ten / 255.0
+        return {
+            "camera_name": stereo_spec["camera_name"],
+            "video_ten": video_ten.cpu(),
+            "depth_npy": np.asarray(aux_depth_tensor, dtype=np.float32),
+            "intrs_npy": aux_intrs,
+            "extrs_npy": aux_extrs,
+        }
+    except Exception as exc:
+        logger.warning(f"Failed to load stereo auxiliary context ({stereo_spec['camera_name']}): {exc}")
+        return None
+
+
 def load_scene_context(video_path, depth_path, args, model_depth_pose):
     """Load one scene once so query frames can be scheduled independently."""
     logger.info(f"Processing video: {video_path}")
@@ -3027,11 +4337,81 @@ def load_scene_context(video_path, depth_path, args, model_depth_pose):
     source_frame_indices = np.asarray(source_frame_indices, dtype=np.int32).reshape(-1)[:video_length]
 
     frame_H, frame_W = video_ten.shape[-2:]
+    query_grid_hw = getattr(args, "query_grid_hw", None)
+    if query_grid_hw is None:
+        base_grid_h = int(args.grid_size)
+        base_grid_w = int(args.grid_size)
+    else:
+        base_grid_h = int(query_grid_hw[0])
+        base_grid_w = int(query_grid_hw[1])
+    filter_config = resolve_traj_filter_config(args)
+    resolved_query_sampler_mode = resolve_query_sampler_mode(
+        mode=getattr(args, "query_sampler_mode", QUERY_SAMPLER_MODE_AUTO),
+        traj_filter_profile=filter_config["profile"],
+    )
+    if (
+        not bool(filter_config["enabled"])
+        and str(filter_config["profile"]) != TRAJ_FILTER_PROFILE_EXTERNAL
+    ):
+        logger.warning(
+            "filter_level='%s' disables traj_filter_profile='%s'; outputs will be raw tracked trajectories "
+            "with diagnostic defaults rather than profile-aware filtered results.",
+            getattr(args, "filter_level", "none"),
+            filter_config["profile"],
+        )
+    candidate_grid_size = resolve_candidate_grid_size(
+        int(args.grid_size),
+        factor=float(getattr(args, "query_candidate_grid_factor", DEFAULT_QUERY_CANDIDATE_GRID_FACTOR)),
+    )
+    candidate_grid_hw = (
+        resolve_candidate_grid_size(
+            base_grid_h,
+            factor=float(getattr(args, "query_candidate_grid_factor", DEFAULT_QUERY_CANDIDATE_GRID_FACTOR)),
+        ),
+        resolve_candidate_grid_size(
+            base_grid_w,
+            factor=float(getattr(args, "query_candidate_grid_factor", DEFAULT_QUERY_CANDIDATE_GRID_FACTOR)),
+        ),
+    )
+    grid_trim_left = int(getattr(args, "grid_border_trim_left", DEFAULT_GRID_BORDER_TRIM_LEFT))
+    grid_trim_right = int(getattr(args, "grid_border_trim_right", DEFAULT_GRID_BORDER_TRIM_RIGHT))
+    grid_trim_top = int(getattr(args, "grid_border_trim_top", DEFAULT_GRID_BORDER_TRIM_TOP))
+    grid_trim_bottom = int(getattr(args, "grid_border_trim_bottom", DEFAULT_GRID_BORDER_TRIM_BOTTOM))
     dense_query_keypoints = _build_grid_keypoints(
         frame_H,
         frame_W,
         args.grid_size,
-        grid_hw=getattr(args, "query_grid_hw", None),
+        grid_hw=query_grid_hw,
+        trim_left=grid_trim_left,
+        trim_right=grid_trim_right,
+        trim_top=grid_trim_top,
+        trim_bottom=grid_trim_bottom,
+    )
+    candidate_query_keypoints = _build_grid_keypoints(
+        frame_H,
+        frame_W,
+        candidate_grid_size,
+        grid_hw=candidate_grid_hw,
+        trim_left=_scale_grid_trim_count(
+            grid_trim_left,
+            base_grid_size=base_grid_w,
+            target_grid_size=candidate_grid_hw[1],
+        ),
+        trim_right=_scale_grid_trim_count(
+            grid_trim_right,
+            base_grid_size=base_grid_w,
+            target_grid_size=candidate_grid_hw[1],
+        ),
+        trim_top=_scale_grid_trim_count(
+            grid_trim_top,
+            base_grid_size=base_grid_h,
+            target_grid_size=candidate_grid_hw[0],
+        ),
+        trim_bottom=_scale_grid_trim_count(
+            grid_trim_bottom,
+            base_grid_size=base_grid_h,
+            target_grid_size=candidate_grid_hw[0],
+        ),
     )
     query_prefilter_mode = str(getattr(args, "query_prefilter_mode", DEFAULT_QUERY_PREFILTER_MODE))
     query_prefilter_rank_keep_ratio = float(
@@ -3042,23 +4422,35 @@ def load_scene_context(video_path, depth_path, args, model_depth_pose):
         )
     )
     query_prefilter_filter_config = (
-        resolve_traj_filter_config(args)
+        filter_config
         if query_prefilter_mode != QUERY_PREFILTER_MODE_OFF
         else None
     )
-    query_prefilter_enabled = bool(
-        query_prefilter_filter_config is not None
-        and bool(query_prefilter_filter_config["enabled"])
-        and query_prefilter_filter_config["profile"]
-        in {
+    query_prefilter_requires_enabled_filter = query_prefilter_mode != QUERY_PREFILTER_MODE_EXTERNAL_DEPTH_STATIC_V1
+    query_prefilter_profile_allowlist = (
+        {
+            TRAJ_FILTER_PROFILE_EXTERNAL,
+            "external_manipulator",
+            "external_manipulator_v2",
+        }
+        if query_prefilter_mode == QUERY_PREFILTER_MODE_EXTERNAL_DEPTH_STATIC_V1
+        else {
             "wrist",
             "wrist_manipulator_top95",
             "wrist_manipulator",
         }
     )
+    query_prefilter_enabled = bool(
+        query_prefilter_filter_config is not None
+        and (
+            bool(query_prefilter_filter_config["enabled"])
+            or (not query_prefilter_requires_enabled_filter)
+        )
+        and query_prefilter_filter_config["profile"] in query_prefilter_profile_allowlist
+    )
     support_grid_size = _resolve_support_grid_size(
         args.grid_size,
-        float(getattr(args, "support_grid_ratio", 0.8)),
+        float(getattr(args, "support_grid_ratio", 0.0)),
     )
 
     query_points_per_frame = {}
@@ -3092,6 +4484,16 @@ def load_scene_context(video_path, depth_path, args, model_depth_pose):
         if len(grid_points) > 0:
             query_points_per_frame[int(frame_idx)] = grid_points[:, 1:3]
 
+    stereo_aux_context = None
+    stereo_aux_spec = _resolve_stereo_aux_spec(video_path, depth_path, args)
+    if stereo_aux_spec is not None:
+        stereo_aux_context = _load_stereo_aux_context(
+            stereo_spec=stereo_aux_spec,
+            stride=int(stride),
+            max_num_frames=int(args.max_num_frames),
+            target_source_frame_indices=source_frame_indices,
+        )
+
     return {
         "video_path": str(video_path),
         "depth_path": str(depth_path) if depth_path is not None else None,
@@ -3109,16 +4511,24 @@ def load_scene_context(video_path, depth_path, args, model_depth_pose):
         "processing_frame_H": int(frame_H),
         "processing_frame_W": int(frame_W),
         "dense_query_keypoints": dense_query_keypoints.astype(np.float32, copy=False),
+        "candidate_query_keypoints": candidate_query_keypoints.astype(np.float32, copy=False),
         "query_frames": [int(frame_idx) for frame_idx in query_frames],
         "query_points_per_frame": query_points_per_frame,
         "query_frame_metadata": dict(query_frame_metadata),
         "original_filenames": list(original_filenames),
         "source_frame_indices": source_frame_indices.astype(np.int32, copy=False),
+        "query_sampler_mode": str(resolved_query_sampler_mode),
+        "candidate_grid_size": int(candidate_grid_size),
+        "grid_border_trim_left": int(grid_trim_left),
+        "grid_border_trim_right": int(grid_trim_right),
+        "grid_border_trim_top": int(grid_trim_top),
+        "grid_border_trim_bottom": int(grid_trim_bottom),
         "query_prefilter_mode": query_prefilter_mode,
         "query_prefilter_rank_keep_ratio": float(query_prefilter_rank_keep_ratio),
         "query_prefilter_filter_config": query_prefilter_filter_config,
         "query_prefilter_enabled": bool(query_prefilter_enabled),
         "support_grid_size": int(support_grid_size),
+        "stereo_aux_context": stereo_aux_context,
         "process_start": float(process_start),
         "profile_stats": profile_stats,
     }
@@ -3161,18 +4571,139 @@ def _run_query_frame_core(
             time.perf_counter() - segment_slice_start,
         )
 
-        dense_query_keypoints = np.asarray(scene_ctx["dense_query_keypoints"], dtype=np.float32)
-        dense_segment_query_point = _build_frame_query_points(start_frame, dense_query_keypoints)
-        dense_segment_query_point[:, 0] = 0
-        tracked_query_indices = np.arange(dense_segment_query_point.shape[0], dtype=np.int32)
-        prefilter_result = None
-
         prepare_inputs_start = time.perf_counter()
         filtered_depth_segment = depth_filter_runtime.get_filtered_depth_segment(
             start_frame,
             end_frame,
         )
-        if bool(scene_ctx["query_prefilter_enabled"]):
+        query_sampler_mode = str(scene_ctx.get("query_sampler_mode", QUERY_SAMPLER_MODE_GRID))
+        filter_config = resolve_traj_filter_config(args)
+        prefilter_result = None
+        query_visibility_gate_result = None
+        query_fixed_view_depth_gate_result = None
+        query_depth_stabilization_result = None
+        dense_depth_stabilization_result = None
+        dense_depth_stabilization_mode = str(
+            getattr(args, "dense_depth_stabilization_mode", DENSE_DEPTH_STABILIZATION_MODE_OFF)
+        )
+        if dense_depth_stabilization_mode == DENSE_DEPTH_STABILIZATION_MODE_TEMPORAL_MEDIAN_REPROJECT_V1:
+            filtered_depth_segment, dense_depth_stabilization_result = _build_dense_depth_stabilization_result(
+                depths=filtered_depth_segment,
+                intrinsics=intrs_segment,
+                extrinsics=extrs_segment,
+                args=args,
+                filter_config=filter_config,
+                profile_stats=profile_stats,
+            )
+        if query_sampler_mode == QUERY_SAMPLER_MODE_RELEVANCE_V1:
+            candidate_query_keypoints = np.asarray(scene_ctx["candidate_query_keypoints"], dtype=np.float32)
+            query_rgb_window = (
+                video_segment[: max(1, min(video_segment.shape[0], DEFAULT_QUERY_ACTIVITY_FRAMES))]
+                .detach()
+                .cpu()
+                .permute(0, 2, 3, 1)
+                .numpy()
+                .astype(np.float32, copy=False)
+            )
+            prefilter_result = build_relevance_first_query_sampler_result(
+                candidate_keypoints=candidate_query_keypoints,
+                query_rgb=query_rgb_window[0],
+                query_depth=filtered_depth_segment[0],
+                temporal_rgbs=query_rgb_window,
+                target_query_count=int(scene_ctx["dense_query_keypoints"].shape[0]),
+                min_depth=float(scene_ctx["query_prefilter_filter_config"]["min_depth"])
+                if scene_ctx.get("query_prefilter_filter_config") is not None
+                else float(filter_config["min_depth"]),
+                max_depth=float(scene_ctx["query_prefilter_filter_config"]["max_depth"])
+                if scene_ctx.get("query_prefilter_filter_config") is not None
+                else float(filter_config["max_depth"]),
+            )
+            dense_query_keypoints = np.asarray(prefilter_result["keypoints"], dtype=np.float32)
+            dense_segment_query_point = _build_frame_query_points(start_frame, dense_query_keypoints)
+            dense_segment_query_point[:, 0] = 0
+            tracked_query_indices = np.arange(dense_segment_query_point.shape[0], dtype=np.int32)
+        else:
+            dense_query_keypoints = np.asarray(scene_ctx["dense_query_keypoints"], dtype=np.float32)
+            dense_segment_query_point = _build_frame_query_points(start_frame, dense_query_keypoints)
+            dense_segment_query_point[:, 0] = 0
+            tracked_query_indices = np.arange(dense_segment_query_point.shape[0], dtype=np.int32)
+        query_visibility_gate_mode = str(
+            getattr(args, "query_visibility_gate_mode", QUERY_VISIBILITY_GATE_MODE_OFF)
+        )
+        visibility_keep_mask = None
+        if (
+            query_visibility_gate_mode == QUERY_VISIBILITY_GATE_MODE_ALL_FUTURE_V1
+            and dense_query_keypoints.shape[0] > 0
+        ):
+            visibility_gate_start = time.perf_counter()
+            query_visibility_gate_result = compute_query_visibility_gate(
+                filtered_depth_segment,
+                intrs_segment,
+                extrs_segment,
+                keypoints=dense_query_keypoints,
+                query_frame=0,
+                min_depth=float(filter_config["min_depth"]),
+                max_depth=float(filter_config["max_depth"]),
+                min_border_dist_px=float(
+                    getattr(
+                        args,
+                        "query_visibility_gate_min_border_dist_px",
+                        0.0,
+                    )
+                ),
+                near_depth_exempt_threshold_m=float(
+                    getattr(
+                        args,
+                        "query_visibility_gate_near_depth_exempt_threshold_m",
+                        DEFAULT_QUERY_VISIBILITY_GATE_NEAR_DEPTH_EXEMPT_THRESHOLD_M,
+                    )
+                ),
+            )
+            _accumulate_profile_stat(
+                profile_stats,
+                "query_visibility_gate_seconds",
+                time.perf_counter() - visibility_gate_start,
+            )
+            visibility_keep_mask = np.asarray(query_visibility_gate_result["reliable_track_mask"], dtype=bool)
+        query_fixed_view_depth_gate_mode = str(
+            getattr(args, "query_fixed_view_depth_gate_mode", QUERY_FIXED_VIEW_DEPTH_GATE_MODE_OFF)
+        )
+        gate_keep_mask = None
+        if (
+            query_fixed_view_depth_gate_mode == QUERY_FIXED_VIEW_DEPTH_GATE_MODE_FIRST_FRAME_UVD_V1
+            and dense_query_keypoints.shape[0] > 0
+        ):
+            gate_start = time.perf_counter()
+            query_fixed_view_depth_gate_result = compute_query_fixed_view_depth_gate(
+                filtered_depth_segment,
+                intrs_segment,
+                extrs_segment,
+                keypoints=dense_query_keypoints,
+                query_frame=0,
+                min_depth=float(filter_config["min_depth"]),
+                max_depth=float(filter_config["max_depth"]),
+                uv_threshold_px=float(
+                    getattr(
+                        args,
+                        "query_fixed_view_depth_gate_uv_threshold_px",
+                        DEFAULT_FIXED_VIEW_DEPTH_GATE_UV_THRESHOLD_PX,
+                    )
+                ),
+                depth_threshold_m=float(
+                    getattr(
+                        args,
+                        "query_fixed_view_depth_gate_depth_threshold_m",
+                        DEFAULT_FIXED_VIEW_DEPTH_GATE_DEPTH_THRESHOLD_M,
+                    )
+                ),
+            )
+            _accumulate_profile_stat(
+                profile_stats,
+                "query_fixed_view_depth_gate_seconds",
+                time.perf_counter() - gate_start,
+            )
+            gate_keep_mask = np.asarray(query_fixed_view_depth_gate_result["reliable_track_mask"], dtype=bool)
+        if bool(scene_ctx["query_prefilter_enabled"]) and query_sampler_mode == QUERY_SAMPLER_MODE_GRID:
             candidate_prefilter_result = build_query_prefilter_result(
                 dense_query_keypoints,
                 filtered_depth_segment[0],
@@ -3190,7 +4721,55 @@ def _run_query_frame_core(
                 tracked_query_indices = kept_query_indices
                 if tracked_query_indices.shape[0] != dense_segment_query_point.shape[0]:
                     prefilter_result = candidate_prefilter_result
+        if visibility_keep_mask is not None:
+            tracked_query_indices = tracked_query_indices[visibility_keep_mask[tracked_query_indices]]
+            logger.info(
+                f"Query frame {start_frame}: future-visibility gate kept "
+                f"{int(np.count_nonzero(visibility_keep_mask))}/{dense_query_keypoints.shape[0]} queries"
+            )
+        if gate_keep_mask is not None:
+            tracked_query_indices = tracked_query_indices[gate_keep_mask[tracked_query_indices]]
+            logger.info(
+                f"Query frame {start_frame}: fixed-view depth gate kept "
+                f"{int(np.count_nonzero(gate_keep_mask))}/{dense_query_keypoints.shape[0]} queries"
+            )
+        tracked_keypoints = np.asarray(dense_query_keypoints[tracked_query_indices], dtype=np.float32)
+        if tracked_keypoints.shape[0] == 0:
+            logger.warning(
+                f"Query frame {start_frame}: no query points remain after pretrack filters; "
+                "saving an empty tracked subset."
+            )
+            return _build_empty_query_frame_result(
+                scene_ctx=scene_ctx,
+                start_frame=start_frame,
+                end_frame=end_frame,
+                video_segment=video_segment,
+                filtered_depth_segment=filtered_depth_segment,
+                intrs_segment=intrs_segment,
+                extrs_segment=extrs_segment,
+                dense_query_keypoints=dense_query_keypoints,
+                tracked_query_indices=tracked_query_indices,
+                prefilter_result=prefilter_result,
+                query_visibility_gate_result=query_visibility_gate_result,
+                query_fixed_view_depth_gate_result=query_fixed_view_depth_gate_result,
+                query_depth_stabilization_result=query_depth_stabilization_result,
+                dense_depth_stabilization_result=dense_depth_stabilization_result,
+            )
         segment_query_point = [dense_segment_query_point[tracked_query_indices].copy()]
+        query_depth_stabilization_mode = str(
+            getattr(args, "query_depth_stabilization_mode", QUERY_DEPTH_STABILIZATION_MODE_OFF)
+        )
+        if query_depth_stabilization_mode == QUERY_DEPTH_STABILIZATION_MODE_TEMPORAL_MEDIAN_WORLD_V1:
+            stabilized_query_points, query_depth_stabilization_result = _build_temporal_median_world_query_points(
+                keypoints=tracked_keypoints,
+                depths=filtered_depth_segment,
+                intrinsics=intrs_segment,
+                extrinsics=extrs_segment,
+                args=args,
+                filter_config=filter_config,
+                profile_stats=profile_stats,
+            )
+            segment_query_point = [stabilized_query_points]
 
         video, depths, intrinsics, extrinsics, query_point_tensor, support_grid_size = (
             prepare_inputs(
@@ -3215,20 +4794,20 @@ def _run_query_frame_core(
         model_3dtracker.set_image_size((frame_H, frame_W))
 
         with torch.no_grad():
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                coords_seg, visibs_seg, inference_metadata = inference(
-                    model=model_3dtracker,
-                    video=video,
-                    depths=depths,
-                    intrinsics=intrinsics,
-                    extrinsics=extrinsics,
-                    query_point=query_point_tensor,
-                    num_iters=args.num_iters,
-                    grid_size=int(support_grid_size),
-                    bidrectional=False,
-                    profile_stats=profile_stats,
-                    return_metadata=True,
-                )
+            coords_seg, visibs_seg, inference_metadata = inference(
+                model=model_3dtracker,
+                video=video,
+                depths=depths,
+                intrinsics=intrinsics,
+                extrinsics=extrinsics,
+                query_point=query_point_tensor,
+                num_iters=args.num_iters,
+                grid_size=int(support_grid_size),
+                bidrectional=False,
+                tracker_precision_mode=getattr(args, "tracker_precision_mode", "fp32"),
+                profile_stats=profile_stats,
+                return_metadata=True,
+            )
 
         logger.debug(
             f"Query frame {start_frame}: coords_seg shape = {coords_seg.shape}, visibs_seg shape = {visibs_seg.shape}"
@@ -3266,6 +4845,25 @@ def _run_query_frame_core(
             profile_stats=profile_stats,
             key="segment_empty_cache_seconds",
         )
+        stereo_aux_segment = None
+        stereo_aux_context = scene_ctx.get("stereo_aux_context")
+        if stereo_aux_context is not None:
+            stereo_aux_segment = {
+                "rgb_segment": stereo_aux_context["video_ten"][start_frame:end_frame].clone(),
+                "depth_segment": np.asarray(
+                    stereo_aux_context["depth_npy"][start_frame:end_frame],
+                    dtype=np.float32,
+                ),
+                "intrinsics_segment": np.asarray(
+                    stereo_aux_context["intrs_npy"][start_frame:end_frame],
+                    dtype=np.float32,
+                ),
+                "extrinsics_segment": np.asarray(
+                    stereo_aux_context["extrs_npy"][start_frame:end_frame],
+                    dtype=np.float32,
+                ),
+                "camera_name": str(stereo_aux_context.get("camera_name", "")),
+            }
         return {
             "coords": coords_cpu,
             "visibs": visibs_cpu,
@@ -3280,12 +4878,17 @@ def _run_query_frame_core(
             "dense_keypoints": dense_query_keypoints.astype(np.float32, copy=False),
             "tracked_query_indices": tracked_query_indices.astype(np.int32, copy=False),
             "prefilter_result": prefilter_result,
+            "query_visibility_gate_result": query_visibility_gate_result,
+            "query_fixed_view_depth_gate_result": query_fixed_view_depth_gate_result,
+            "query_depth_stabilization_result": query_depth_stabilization_result,
+            "dense_depth_stabilization_result": dense_depth_stabilization_result,
             "dense_query_count": int(dense_query_keypoints.shape[0]),
             "tracked_query_count": int(tracked_query_indices.shape[0]),
             "support_grid_size": int(support_grid_size),
             "effective_support_query_count": int(
                 inference_metadata.get("effective_support_query_count", 0)
             ),
+            "stereo_aux_segment": stereo_aux_segment,
         }
     finally:
         depth_filter_runtime.release_segment_frames(start_frame, end_frame)
@@ -3505,6 +5108,9 @@ def save_source_ref_v2_query_results(
 
     query_frame_metadata = dict(query_frame_metadata or {})
     scene_meta_write_start = time.perf_counter()
+    source_rgb_path = _normalize_source_ref_path(video_source_path)
+    source_depth_path = _normalize_source_ref_path(depth_source_path)
+    source_geom_path = _normalize_source_ref_path(getattr(filter_args, "external_geom_npz", None))
     write_scene_meta(
         video_output_dir / "scene_meta.json",
         {
@@ -3526,12 +5132,12 @@ def save_source_ref_v2_query_results(
             "scene_storage_mode": SCENE_STORAGE_SOURCE_REF,
             "scene_h5_path": None,
             "rgb_cache_path": None,
-            "source_rgb_path": video_source_path,
-            "source_rgb_kind": path_kind(video_source_path),
-            "source_depth_path": depth_source_path,
-            "source_depth_kind": path_kind(depth_source_path),
-            "source_geom_path": getattr(filter_args, "external_geom_npz", None),
-            "source_geom_kind": path_kind(getattr(filter_args, "external_geom_npz", None)),
+            "source_rgb_path": source_rgb_path,
+            "source_rgb_kind": path_kind(source_rgb_path),
+            "source_depth_path": source_depth_path,
+            "source_depth_kind": path_kind(source_depth_path),
+            "source_geom_path": source_geom_path,
+            "source_geom_kind": path_kind(source_geom_path),
             "source_camera_name": getattr(filter_args, "camera_name", None),
             "source_extrinsics_mode": getattr(filter_args, "external_extr_mode", None),
             "depth_pose_method": getattr(filter_args, "depth_pose_method", None),
@@ -3946,25 +5552,167 @@ def create_uniform_grid_points(height, width, grid_size=20, device="cuda"):
 
     return grid_tensor
 
+
+def lift_query_points_to_world(query_i, depths, intrinsics, extrinsics):
+    query_i = np.asarray(query_i, dtype=np.float32)
+    if query_i.ndim != 2 or query_i.shape[1] != 3:
+        raise ValueError(f"Expected query_i shape (N,3) with [t,x,y], got {query_i.shape}")
+    if len(query_i) == 0:
+        return np.zeros((0, 4), dtype=np.float32)
+
+    t = int(query_i[0, 0])
+    depth_t = np.asarray(depths[t], dtype=np.float32)
+    K_inv_t = np.linalg.inv(np.asarray(intrinsics[t], dtype=np.float32))
+    c2w_t = np.linalg.inv(np.asarray(extrinsics[t], dtype=np.float32))
+
+    xy = query_i[:, 1:].astype(np.float32, copy=False)
+    ji = np.round(xy).astype(np.int32)
+    ji[:, 0] = np.clip(ji[:, 0], 0, max(depth_t.shape[1] - 1, 0))
+    ji[:, 1] = np.clip(ji[:, 1], 0, max(depth_t.shape[0] - 1, 0))
+    d = depth_t[ji[..., 1], ji[..., 0]]
+    xy_homo = np.concatenate([xy, np.ones_like(xy[:, :1])], axis=-1)
+    local_coords = K_inv_t @ xy_homo.T  # (3, N)
+    local_coords = local_coords * d[None, :]  # (3, N)
+    world_coords = c2w_t[:3, :3] @ local_coords + c2w_t[:3, 3:]
+    return np.concatenate([query_i[:, :1], world_coords.T], axis=-1).astype(np.float32, copy=False)
+
+
+def _build_temporal_median_world_query_points(
+    *,
+    keypoints: np.ndarray,
+    depths: np.ndarray,
+    intrinsics: np.ndarray,
+    extrinsics: np.ndarray,
+    args,
+    filter_config: dict[str, object],
+    profile_stats: dict[str, float] | None = None,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    keypoints = np.asarray(keypoints, dtype=np.float32)
+    if keypoints.ndim != 2 or keypoints.shape[1] != 2:
+        raise ValueError(f"Expected keypoints shape (N,2), got {keypoints.shape}")
+    query_frame = 0
+    query_xyt = np.concatenate(
+        [
+            np.full((keypoints.shape[0], 1), float(query_frame), dtype=np.float32),
+            keypoints,
+        ],
+        axis=1,
+    )
+    baseline_query_points = lift_query_points_to_world(query_xyt, depths, intrinsics, extrinsics)
+    stabilization_start = time.perf_counter()
+    bundle = build_query_anchor_bundle_from_keypoints(
+        depths,
+        intrinsics,
+        extrinsics,
+        keypoints=keypoints,
+        query_frame=query_frame,
+        min_query_depth_m=float(getattr(args, "query_depth_stabilization_min_query_depth_m", 0.0)),
+        min_border_dist_px=float(getattr(args, "query_depth_stabilization_min_border_dist_px", 0.0)),
+        min_depth=float(filter_config["min_depth"]),
+        max_depth=float(filter_config["max_depth"]),
+    )
+    bundle["world_points"] = np.asarray(baseline_query_points[:, 1:4], dtype=np.float32)
+    temporal_result = estimate_temporal_median_world_points(
+        depths,
+        intrinsics,
+        extrinsics,
+        query_anchor_bundle=bundle,
+        min_depth=float(filter_config["min_depth"]),
+        max_depth=float(filter_config["max_depth"]),
+        reproj_tol_px=float(getattr(args, "query_depth_stabilization_reproj_tol_px", DEFAULT_DEPTH_MEDIAN_REPROJ_TOL_PX)),
+        min_support=int(getattr(args, "query_depth_stabilization_min_support", DEFAULT_DEPTH_MEDIAN_MIN_SUPPORT)),
+    )
+    _accumulate_profile_stat(
+        profile_stats,
+        "query_depth_stabilization_seconds",
+        time.perf_counter() - stabilization_start,
+    )
+    stabilized_world_points = np.asarray(temporal_result["world_points"], dtype=np.float32)
+    delta_world_m = np.linalg.norm(
+        stabilized_world_points - np.asarray(baseline_query_points[:, 1:4], dtype=np.float32),
+        axis=1,
+    ).astype(np.float32)
+    stabilized_query_points = np.concatenate(
+        [
+            baseline_query_points[:, :1],
+            stabilized_world_points,
+        ],
+        axis=1,
+    ).astype(np.float32, copy=False)
+    metadata = {
+        "mode": np.array([QUERY_DEPTH_STABILIZATION_MODE_TEMPORAL_MEDIAN_WORLD_V1]),
+        "replace_mask": np.asarray(temporal_result["replace_mask"], dtype=bool),
+        "support_counts": np.asarray(temporal_result["support_counts"], dtype=np.int32),
+        "anchor_mask": np.asarray(bundle["anchor_mask"], dtype=bool),
+        "query_depth_values": np.asarray(bundle["query_depth_values"], dtype=np.float32),
+        "border_dist_px": np.asarray(bundle["border_dist_px"], dtype=np.float32),
+        "delta_world_m": delta_world_m,
+    }
+    return stabilized_query_points, metadata
+
+
+def _build_dense_depth_stabilization_result(
+    *,
+    depths: np.ndarray,
+    intrinsics: np.ndarray,
+    extrinsics: np.ndarray,
+    args,
+    filter_config: dict[str, object],
+    profile_stats: dict[str, float] | None = None,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    stabilization_start = time.perf_counter()
+    result = stabilize_depth_frames_temporal_median_reproject(
+        depths,
+        intrinsics,
+        extrinsics,
+        radius=int(
+            getattr(
+                args,
+                "dense_depth_stabilization_radius",
+                DEFAULT_DENSE_DEPTH_STABILIZATION_RADIUS,
+            )
+        ),
+        min_support=int(
+            getattr(
+                args,
+                "dense_depth_stabilization_min_support",
+                DEFAULT_DENSE_DEPTH_STABILIZATION_MIN_SUPPORT,
+            )
+        ),
+        min_depth=float(filter_config["min_depth"]),
+        max_depth=float(filter_config["max_depth"]),
+    )
+    _accumulate_profile_stat(
+        profile_stats,
+        "dense_depth_stabilization_seconds",
+        time.perf_counter() - stabilization_start,
+    )
+    metadata = {
+        "mode": np.asarray([DENSE_DEPTH_STABILIZATION_MODE_TEMPORAL_MEDIAN_REPROJECT_V1]),
+        "replace_ratio": np.asarray(result["replace_ratio"], dtype=np.float32),
+        "replace_count": np.asarray(result["replace_count"], dtype=np.int32),
+        "support_count_median": np.asarray(result["support_count_median"], dtype=np.float32),
+        "support_count_p95": np.asarray(result["support_count_p95"], dtype=np.float32),
+        "depth_delta_median_m": np.asarray(result["depth_delta_median_m"], dtype=np.float32),
+        "depth_delta_p95_m": np.asarray(result["depth_delta_p95_m"], dtype=np.float32),
+    }
+    return np.asarray(result["depth_frames"], dtype=np.float32), metadata
+
+
 def prepare_query_points(query_xyt, depths, intrinsics, extrinsics):
     final_queries = []
     for query_i in query_xyt:
         if len(query_i) == 0:
             continue
-
-        t = int(query_i[0, 0])
-        depth_t = depths[t]
-        K_inv_t = np.linalg.inv(intrinsics[t])
-        c2w_t = np.linalg.inv(extrinsics[t])
-
-        xy = query_i[:, 1:]
-        ji = np.round(xy).astype(int)
-        d = depth_t[ji[..., 1], ji[..., 0]]
-        xy_homo = np.concatenate([xy, np.ones_like(xy[:, :1])], axis=-1)
-        local_coords = K_inv_t @ xy_homo.T  # (3, N)
-        local_coords = local_coords * d[None, :]  # (3, N)
-        world_coords = c2w_t[:3, :3] @ local_coords + c2w_t[:3, 3:]
-        final_queries.append(np.concatenate([query_i[:, :1], world_coords.T], axis=-1))
+        query_i = np.asarray(query_i, dtype=np.float32)
+        if query_i.ndim != 2:
+            raise ValueError(f"Expected query_i to be rank-2, got {query_i.shape}")
+        if query_i.shape[1] == 4:
+            final_queries.append(query_i.astype(np.float32, copy=False))
+            continue
+        if query_i.shape[1] != 3:
+            raise ValueError(f"Expected query_i shape (N,3) or (N,4), got {query_i.shape}")
+        final_queries.append(lift_query_points_to_world(query_i, depths, intrinsics, extrinsics))
     return np.concatenate(final_queries, axis=0)  # (N, 4)
 
 

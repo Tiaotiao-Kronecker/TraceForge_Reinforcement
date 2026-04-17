@@ -211,6 +211,16 @@ class ResolveTrajFilterProfileTests(unittest.TestCase):
             "external",
         )
 
+    def test_auto_maps_stereo_cameras_to_external(self):
+        self.assertEqual(
+            resolve_traj_filter_profile("stereo_left", "auto"),
+            "external",
+        )
+        self.assertEqual(
+            resolve_traj_filter_profile("stereo_right", "auto"),
+            "external",
+        )
+
     def test_explicit_profile_bypasses_auto_mapping(self):
         self.assertEqual(
             resolve_traj_filter_profile("varied_camera_3", "wrist"),
@@ -291,9 +301,27 @@ class PressOneButtonCliSurfaceTests(unittest.TestCase):
         self.assertIsNone(_CLI_DEFAULTS.get("--episode_names_file"))
 
     def test_exposes_query_prefilter_and_support_ratio_flags(self):
+        self.assertIn("--query_sampler_mode", _CLI_FLAGS)
         self.assertIn("--query_prefilter_mode", _CLI_FLAGS)
         self.assertIn("--query_prefilter_wrist_rank_keep_ratio", _CLI_FLAGS)
+        self.assertIn("--query_visibility_gate_mode", _CLI_FLAGS)
+        self.assertIn("--query_visibility_gate_min_border_dist_px", _CLI_FLAGS)
+        self.assertIn("--query_fixed_view_depth_gate_mode", _CLI_FLAGS)
+        self.assertIn("--query_fixed_view_depth_gate_uv_threshold_px", _CLI_FLAGS)
+        self.assertIn("--query_fixed_view_depth_gate_depth_threshold_m", _CLI_FLAGS)
+        self.assertIn("--traj_uvd_gate_mode", _CLI_FLAGS)
+        self.assertIn("--traj_uvd_gate_uv_mean_threshold_px", _CLI_FLAGS)
+        self.assertIn("--traj_uvd_gate_depth_std_threshold_m", _CLI_FLAGS)
+        self.assertIn("--traj_uvd_gate_max_depth_threshold_m", _CLI_FLAGS)
+        self.assertIn("--query_depth_stabilization_mode", _CLI_FLAGS)
+        self.assertIn("--query_depth_stabilization_reproj_tol_px", _CLI_FLAGS)
+        self.assertIn("--query_depth_stabilization_min_support", _CLI_FLAGS)
+        self.assertIn("--dense_depth_stabilization_mode", _CLI_FLAGS)
+        self.assertIn("--dense_depth_stabilization_radius", _CLI_FLAGS)
+        self.assertIn("--dense_depth_stabilization_min_support", _CLI_FLAGS)
+        self.assertIn("--tracker_precision_mode", _CLI_FLAGS)
         self.assertIn("--support_grid_ratio", _CLI_FLAGS)
+        self.assertIn("--grid_border_trim_right", _CLI_FLAGS)
         self.assertIn("--traj_filter_ablation_mode", _CLI_FLAGS)
         self.assertIn("--collect_profile_stats", _CLI_FLAGS)
         self.assertIn("--hardware_telemetry_interval_sec", _CLI_FLAGS)
@@ -313,11 +341,66 @@ class PressOneButtonCliSurfaceTests(unittest.TestCase):
     def test_traj_filter_profile_default_is_external(self):
         self.assertEqual(_CLI_DEFAULTS.get("--traj_filter_profile"), "external")
 
-    def test_support_grid_ratio_default_is_point_eight(self):
-        self.assertEqual(_CLI_DEFAULTS.get("--support_grid_ratio"), 0.8)
+    def test_defaults_to_raw_grid_no_filter_external_profile(self):
+        self.assertEqual(_CLI_DEFAULTS.get("--query_sampler_mode"), "grid")
+        self.assertEqual(_CLI_DEFAULTS.get("--filter_level"), "none")
+        self.assertEqual(_CLI_DEFAULTS.get("--traj_filter_profile"), "external")
+        self.assertEqual(_CLI_DEFAULTS.get("--grid_border_trim_left"), 30)
+        self.assertEqual(_CLI_DEFAULTS.get("--grid_border_trim_right"), 30)
+        self.assertEqual(_CLI_DEFAULTS.get("--grid_border_trim_top"), 30)
+        self.assertEqual(_CLI_DEFAULTS.get("--grid_border_trim_bottom"), 10)
+
+    def test_exposes_egocentric_profile_choice(self):
+        self.assertIn(
+            "egocentric_object_interaction_v1",
+            _CLI_CHOICES.get("--traj_filter_profile", ()),
+        )
+
+    def test_support_grid_ratio_default_is_zero(self):
+        self.assertEqual(_CLI_DEFAULTS.get("--support_grid_ratio"), 0.0)
+        self.assertEqual(_CLI_DEFAULTS.get("--tracker_precision_mode"), "fp32")
+        self.assertEqual(_CLI_DEFAULTS.get("--query_visibility_gate_mode"), "all_future_v1")
+        self.assertEqual(_CLI_DEFAULTS.get("--query_visibility_gate_min_border_dist_px"), 0.0)
+        self.assertEqual(_CLI_DEFAULTS.get("--query_visibility_gate_near_depth_exempt_threshold_m"), 0.0)
+        self.assertEqual(_CLI_DEFAULTS.get("--query_fixed_view_depth_gate_mode"), "first_frame_uvd_v1")
+        self.assertEqual(_CLI_DEFAULTS.get("--query_fixed_view_depth_gate_uv_threshold_px"), 1.0)
+        self.assertEqual(_CLI_DEFAULTS.get("--query_fixed_view_depth_gate_depth_threshold_m"), 0.1)
+        self.assertEqual(_CLI_DEFAULTS.get("--traj_uvd_gate_mode"), "delta_uv_depth_v1")
+        self.assertEqual(_CLI_DEFAULTS.get("--traj_uvd_gate_uv_mean_threshold_px"), 3.0)
+        self.assertEqual(_CLI_DEFAULTS.get("--traj_uvd_gate_depth_std_threshold_m"), 0.01)
+        self.assertEqual(_CLI_DEFAULTS.get("--traj_uvd_gate_max_depth_threshold_m"), 1.5)
+        self.assertEqual(_CLI_DEFAULTS.get("--query_depth_stabilization_mode"), "off")
+        self.assertEqual(_CLI_DEFAULTS.get("--dense_depth_stabilization_mode"), "off")
 
     def test_exposes_wrist_pick_place_no_heatmap_profile(self):
         self.assertIn("wrist_pick_place_no_heatmap", _CLI_CHOICES.get("--traj_filter_profile", ()))
+
+    def test_exposes_temporal_query_depth_stabilization_mode(self):
+        self.assertIn(
+            "all_future_v1",
+            _CLI_CHOICES.get("--query_visibility_gate_mode", ()),
+        )
+        self.assertIn(
+            "first_frame_uvd_v1",
+            _CLI_CHOICES.get("--query_fixed_view_depth_gate_mode", ()),
+        )
+        self.assertIn(
+            "delta_uv_depth_v1",
+            _CLI_CHOICES.get("--traj_uvd_gate_mode", ()),
+        )
+        self.assertIn(
+            "temporal_median_world_v1",
+            _CLI_CHOICES.get("--query_depth_stabilization_mode", ()),
+        )
+        self.assertIn(
+            "temporal_median_reproject_v1",
+            _CLI_CHOICES.get("--dense_depth_stabilization_mode", ()),
+        )
+        self.assertIn(
+            "external_depth_static_v1",
+            _CLI_CHOICES.get("--query_prefilter_mode", ()),
+        )
+        self.assertIn("deep_bf16", _CLI_CHOICES.get("--tracker_precision_mode", ()))
 
 
 class CameraNumItersOverrideTests(unittest.TestCase):
@@ -538,6 +621,12 @@ class BatchTelemetryRecordTests(unittest.TestCase):
                 "processing_resize_hw": (180, 320),
                 "resize_width": 320,
                 "resize_height": 180,
+                "query_depth_stabilization_mode": "off",
+                "query_depth_stabilization_reproj_tol_px": 3.0,
+                "query_depth_stabilization_min_support": 3,
+                "dense_depth_stabilization_mode": "off",
+                "dense_depth_stabilization_radius": 2,
+                "dense_depth_stabilization_min_support": 3,
                 "filter_level": "standard",
                 "traj_filter_profile": "auto",
                 "external_geom_name": "trajectory_valid.h5",
@@ -583,6 +672,10 @@ class BatchTelemetryRecordTests(unittest.TestCase):
         self.assertTrue(summary["resize_enabled"])
         self.assertEqual(summary["resize_width"], 320)
         self.assertEqual(summary["resize_height"], 180)
+        self.assertEqual(summary["query_depth_stabilization_mode"], "off")
+        self.assertEqual(summary["query_depth_stabilization_reproj_tol_px"], 3.0)
+        self.assertEqual(summary["dense_depth_stabilization_mode"], "off")
+        self.assertEqual(summary["dense_depth_stabilization_radius"], 2)
         self.assertAlmostEqual(summary["wall_clock_seconds"], 1234.5)
 
 

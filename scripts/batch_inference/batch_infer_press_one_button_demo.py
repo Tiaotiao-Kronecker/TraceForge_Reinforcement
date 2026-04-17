@@ -325,6 +325,12 @@ def build_camera_task_metric_record(
         "camera_num_iters_overrides": dict(getattr(args, "camera_num_iters_overrides", {})),
         "depth_filter_workers": int(getattr(args, "depth_filter_workers", _DEFAULT_DEPTH_FILTER_WORKERS)),
         "traj_filter_profile": getattr(args, "traj_filter_profile", None),
+        "query_visibility_gate_mode": getattr(args, "query_visibility_gate_mode", None),
+        "query_visibility_gate_near_depth_exempt_threshold_m": getattr(
+            args, "query_visibility_gate_near_depth_exempt_threshold_m", None
+        ),
+        "query_fixed_view_depth_gate_mode": getattr(args, "query_fixed_view_depth_gate_mode", None),
+        "traj_uvd_gate_mode": getattr(args, "traj_uvd_gate_mode", None),
         "resize_enabled": bool(getattr(args, "processing_resize_hw", None) is not None),
         "resize_width": getattr(args, "resize_width", None),
         "resize_height": getattr(args, "resize_height", None),
@@ -409,6 +415,12 @@ def build_camera_task_profile_record(
         "camera_num_iters_overrides": dict(getattr(args, "camera_num_iters_overrides", {})),
         "depth_filter_workers": int(getattr(args, "depth_filter_workers", _DEFAULT_DEPTH_FILTER_WORKERS)),
         "traj_filter_profile": getattr(args, "traj_filter_profile", None),
+        "query_visibility_gate_mode": getattr(args, "query_visibility_gate_mode", None),
+        "query_visibility_gate_near_depth_exempt_threshold_m": getattr(
+            args, "query_visibility_gate_near_depth_exempt_threshold_m", None
+        ),
+        "query_fixed_view_depth_gate_mode": getattr(args, "query_fixed_view_depth_gate_mode", None),
+        "traj_uvd_gate_mode": getattr(args, "traj_uvd_gate_mode", None),
         "resize_enabled": bool(getattr(args, "processing_resize_hw", None) is not None),
         "resize_width": getattr(args, "resize_width", None),
         "resize_height": getattr(args, "resize_height", None),
@@ -507,9 +519,61 @@ def build_batch_run_summary(
         "grid_width": getattr(args, "grid_width", None),
         "grid_height": getattr(args, "grid_height", None),
         "support_grid_ratio": float(args.support_grid_ratio),
+        "tracker_precision_mode": str(getattr(args, "tracker_precision_mode", "fp32")),
+        "query_visibility_gate_mode": str(
+            getattr(args, "query_visibility_gate_mode", "all_future_v1")
+        ),
+        "query_visibility_gate_min_border_dist_px": float(
+            getattr(args, "query_visibility_gate_min_border_dist_px", 0.0)
+        ),
+        "query_visibility_gate_near_depth_exempt_threshold_m": float(
+            getattr(args, "query_visibility_gate_near_depth_exempt_threshold_m", 0.0)
+        ),
+        "query_fixed_view_depth_gate_mode": str(
+            getattr(args, "query_fixed_view_depth_gate_mode", "first_frame_uvd_v1")
+        ),
+        "query_fixed_view_depth_gate_uv_threshold_px": float(
+            getattr(args, "query_fixed_view_depth_gate_uv_threshold_px", 1.0)
+        ),
+        "query_fixed_view_depth_gate_depth_threshold_m": float(
+            getattr(args, "query_fixed_view_depth_gate_depth_threshold_m", 0.10)
+        ),
+        "traj_uvd_gate_mode": str(
+            getattr(args, "traj_uvd_gate_mode", "delta_uv_depth_v1")
+        ),
+        "traj_uvd_gate_uv_mean_threshold_px": float(
+            getattr(args, "traj_uvd_gate_uv_mean_threshold_px", 3.0)
+        ),
+        "traj_uvd_gate_depth_std_threshold_m": float(
+            getattr(args, "traj_uvd_gate_depth_std_threshold_m", 0.01)
+        ),
+        "traj_uvd_gate_max_depth_threshold_m": float(
+            getattr(args, "traj_uvd_gate_max_depth_threshold_m", 1.5)
+        ),
+        "traj_uvd_gate_near_depth_threshold_m": float(
+            getattr(args, "traj_uvd_gate_near_depth_threshold_m", 0.0)
+        ),
+        "traj_uvd_gate_near_depth_relaxed_std_threshold_m": float(
+            getattr(args, "traj_uvd_gate_near_depth_relaxed_std_threshold_m", 0.0)
+        ),
+        "traj_uvd_gate_near_depth_exempt_threshold_m": float(
+            getattr(args, "traj_uvd_gate_near_depth_exempt_threshold_m", 0.0)
+        ),
         "resize_enabled": bool(getattr(args, "processing_resize_hw", None) is not None),
         "resize_width": getattr(args, "resize_width", None),
         "resize_height": getattr(args, "resize_height", None),
+        "query_depth_stabilization_mode": str(getattr(args, "query_depth_stabilization_mode", "off")),
+        "query_depth_stabilization_reproj_tol_px": float(
+            getattr(args, "query_depth_stabilization_reproj_tol_px", 3.0)
+        ),
+        "query_depth_stabilization_min_support": int(
+            getattr(args, "query_depth_stabilization_min_support", 3)
+        ),
+        "dense_depth_stabilization_mode": str(getattr(args, "dense_depth_stabilization_mode", "off")),
+        "dense_depth_stabilization_radius": int(getattr(args, "dense_depth_stabilization_radius", 2)),
+        "dense_depth_stabilization_min_support": int(
+            getattr(args, "dense_depth_stabilization_min_support", 3)
+        ),
         "filter_level": args.filter_level,
         "traj_filter_profile": args.traj_filter_profile,
         "external_geom_name": args.external_geom_name,
@@ -774,10 +838,17 @@ def parse_args() -> argparse.Namespace:
         help="Optional rectangular query-grid height override. Requires --grid_width.",
     )
     parser.add_argument(
+        "--query_sampler_mode",
+        type=str,
+        default="grid",
+        choices=["auto", "grid", "relevance_first_v1"],
+        help="Query sampler mode forwarded to infer.py. Default is raw grid sampling.",
+    )
+    parser.add_argument(
         "--query_prefilter_mode",
         type=str,
         default="off",
-        choices=["off", "profile_aware_static_v1"],
+        choices=["off", "profile_aware_static_v1", "external_depth_static_v1"],
         help="Optional static query prefilter applied before tracking.",
     )
     parser.add_argument(
@@ -787,10 +858,115 @@ def parse_args() -> argparse.Namespace:
         help="For wrist_manipulator* query prefiltering, keep the nearest query-depth ranks up to this ratio.",
     )
     parser.add_argument(
+        "--query_visibility_gate_mode",
+        type=str,
+        default="all_future_v1",
+        choices=["off", "all_future_v1"],
+        help="Optional future-visibility gate forwarded to infer.py.",
+    )
+    parser.add_argument(
+        "--query_visibility_gate_min_border_dist_px",
+        type=float,
+        default=0.0,
+        help="Minimum projected border distance required by the future-visibility gate.",
+    )
+    parser.add_argument(
+        "--query_visibility_gate_near_depth_exempt_threshold_m",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional near-depth cutoff in meters forwarded to infer.py. "
+            "Queries shallower than this bypass the all-future in-view requirement."
+        ),
+    )
+    parser.add_argument(
+        "--query_fixed_view_depth_gate_mode",
+        type=str,
+        default="first_frame_uvd_v1",
+        choices=["off", "first_frame_uvd_v1"],
+        help="Optional fixed-view temporal depth gate forwarded to infer.py.",
+    )
+    parser.add_argument(
+        "--query_fixed_view_depth_gate_uv_threshold_px",
+        type=float,
+        default=1.0,
+        help="Maximum first-frame reprojection drift treated as uv-stable by the fixed-view depth gate.",
+    )
+    parser.add_argument(
+        "--query_fixed_view_depth_gate_depth_threshold_m",
+        type=float,
+        default=0.10,
+        help="Minimum first-frame depth delta treated as anomalous by the fixed-view depth gate.",
+    )
+    parser.add_argument(
+        "--traj_uvd_gate_mode",
+        type=str,
+        default="delta_uv_depth_v1",
+        choices=["off", "delta_uv_depth_v1"],
+        help="Optional post-track traj_uvd gate forwarded to infer.py.",
+    )
+    parser.add_argument(
+        "--traj_uvd_gate_uv_mean_threshold_px",
+        type=float,
+        default=3.0,
+        help="Maximum mean per-step uv motion treated as near-static by the traj_uvd gate.",
+    )
+    parser.add_argument(
+        "--traj_uvd_gate_depth_std_threshold_m",
+        type=float,
+        default=0.01,
+        help="Minimum depth-step std treated as anomalous by the traj_uvd gate.",
+    )
+    parser.add_argument(
+        "--traj_uvd_gate_max_depth_threshold_m",
+        type=float,
+        default=1.5,
+        help="Tracks deeper than this max depth are removed by the traj_uvd gate.",
+    )
+    parser.add_argument(
+        "--traj_uvd_gate_near_depth_threshold_m",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional near-depth cutoff in meters forwarded to infer.py. "
+            "Tracks shallower than this can use a relaxed depth-step std threshold."
+        ),
+    )
+    parser.add_argument(
+        "--traj_uvd_gate_near_depth_relaxed_std_threshold_m",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional relaxed depth-step std threshold for near-depth tracks. "
+            "Disabled when <= 0; when enabled it must be >= --traj_uvd_gate_depth_std_threshold_m."
+        ),
+    )
+    parser.add_argument(
+        "--traj_uvd_gate_near_depth_exempt_threshold_m",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional near-depth cutoff in meters forwarded to infer.py. "
+            "Tracks shallower than this bypass the uv+depth anomaly gate."
+        ),
+    )
+    parser.add_argument(
         "--support_grid_ratio",
         type=float,
-        default=0.8,
+        default=0.0,
         help="Support-point grid ratio relative to grid_size. 0 disables support points.",
+    )
+    parser.add_argument(
+        "--tracker_precision_mode",
+        type=str,
+        default="fp32",
+        choices=["fp32", "autocast_bf16", "deep_bf16", "bf16"],
+        help=(
+            "Tracker precision path forwarded to infer.py. "
+            "fp32 is the maintained baseline; autocast_bf16 uses bf16 autocast on eligible kernels; "
+            "deep_bf16 keeps geometry/state in fp32 while pushing encoder/corr/update features deeper into bf16. "
+            "Legacy alias bf16 maps to autocast_bf16."
+        ),
     )
     parser.add_argument(
         "--depth_filter_workers",
@@ -799,9 +975,83 @@ def parse_args() -> argparse.Namespace:
         help="Thread count used by infer.py when precomputing filtered depth segments.",
     )
     parser.add_argument(
+        "--query_depth_stabilization_mode",
+        type=str,
+        default="off",
+        choices=["off", "temporal_median_world_v1"],
+        help="Optional query seed 3D initialization stabilization forwarded to infer.py.",
+    )
+    parser.add_argument(
+        "--query_depth_stabilization_reproj_tol_px",
+        type=float,
+        default=3.0,
+        help="Temporal query-depth stabilization reprojection tolerance in pixels.",
+    )
+    parser.add_argument(
+        "--query_depth_stabilization_min_support",
+        type=int,
+        default=3,
+        help="Minimum temporal support frames required to replace a query seed world point.",
+    )
+    parser.add_argument(
+        "--query_depth_stabilization_min_query_depth_m",
+        type=float,
+        default=0.01,
+        help="Minimum query depth required for temporal query-depth stabilization.",
+    )
+    parser.add_argument(
+        "--query_depth_stabilization_min_border_dist_px",
+        type=float,
+        default=0.0,
+        help="Minimum border distance required for temporal query-depth stabilization.",
+    )
+    parser.add_argument(
+        "--dense_depth_stabilization_mode",
+        type=str,
+        default="off",
+        choices=["off", "temporal_median_reproject_v1"],
+        help="Optional dense depth_obs stabilization forwarded to infer.py.",
+    )
+    parser.add_argument(
+        "--dense_depth_stabilization_radius",
+        type=int,
+        default=2,
+        help="Temporal radius in frames used by dense depth stabilization.",
+    )
+    parser.add_argument(
+        "--dense_depth_stabilization_min_support",
+        type=int,
+        default=3,
+        help="Minimum temporal support count required to replace a dense depth pixel.",
+    )
+    parser.add_argument(
+        "--grid_border_trim_left",
+        type=int,
+        default=30,
+        help="Drop this many leftmost query-grid columns before tracking.",
+    )
+    parser.add_argument(
+        "--grid_border_trim_right",
+        type=int,
+        default=30,
+        help="Drop this many rightmost query-grid columns before tracking.",
+    )
+    parser.add_argument(
+        "--grid_border_trim_top",
+        type=int,
+        default=30,
+        help="Drop this many top query-grid rows before tracking.",
+    )
+    parser.add_argument(
+        "--grid_border_trim_bottom",
+        type=int,
+        default=10,
+        help="Drop this many bottom query-grid rows before tracking.",
+    )
+    parser.add_argument(
         "--filter_level",
         type=str,
-        default="standard",
+        default="none",
         choices=["none", "basic", "standard", "strict"],
         help="Trajectory filtering level for sample traj_valid_mask",
     )
@@ -814,6 +1064,7 @@ def parse_args() -> argparse.Namespace:
             "external",
             "external_manipulator",
             "external_manipulator_v2",
+            "egocentric_object_interaction_v1",
             "wrist",
             "wrist_pick_place",
             "wrist_pick_place_no_heatmap",
@@ -823,7 +1074,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Trajectory filtering profile. The maintained external-only default is external for all cameras; "
             "auto is retained as a compatibility alias and currently resolves to external. "
-            "external_manipulator, external_manipulator_v2, wrist_pick_place, "
+            "external_manipulator, external_manipulator_v2, egocentric_object_interaction_v1, "
+            "wrist_pick_place, "
             "wrist_pick_place_no_heatmap, wrist_manipulator_top95, "
             "and wrist_manipulator "
             "must be requested explicitly."
@@ -905,6 +1157,57 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--query_prefilter_wrist_rank_keep_ratio must be within [0, 1]")
     if args.support_grid_ratio < 0.0:
         raise ValueError("--support_grid_ratio must be >= 0")
+    if args.query_visibility_gate_min_border_dist_px < 0.0:
+        raise ValueError("--query_visibility_gate_min_border_dist_px must be >= 0")
+    if args.query_visibility_gate_near_depth_exempt_threshold_m < 0.0:
+        raise ValueError("--query_visibility_gate_near_depth_exempt_threshold_m must be >= 0")
+    if args.query_fixed_view_depth_gate_uv_threshold_px < 0.0:
+        raise ValueError("--query_fixed_view_depth_gate_uv_threshold_px must be >= 0")
+    if args.query_fixed_view_depth_gate_depth_threshold_m < 0.0:
+        raise ValueError("--query_fixed_view_depth_gate_depth_threshold_m must be >= 0")
+    if args.traj_uvd_gate_uv_mean_threshold_px < 0.0:
+        raise ValueError("--traj_uvd_gate_uv_mean_threshold_px must be >= 0")
+    if args.traj_uvd_gate_depth_std_threshold_m < 0.0:
+        raise ValueError("--traj_uvd_gate_depth_std_threshold_m must be >= 0")
+    if args.traj_uvd_gate_max_depth_threshold_m < 0.0:
+        raise ValueError("--traj_uvd_gate_max_depth_threshold_m must be >= 0")
+    if args.traj_uvd_gate_near_depth_threshold_m < 0.0:
+        raise ValueError("--traj_uvd_gate_near_depth_threshold_m must be >= 0")
+    if args.traj_uvd_gate_near_depth_relaxed_std_threshold_m < 0.0:
+        raise ValueError("--traj_uvd_gate_near_depth_relaxed_std_threshold_m must be >= 0")
+    if args.traj_uvd_gate_near_depth_exempt_threshold_m < 0.0:
+        raise ValueError("--traj_uvd_gate_near_depth_exempt_threshold_m must be >= 0")
+    if (
+        args.traj_uvd_gate_near_depth_relaxed_std_threshold_m > 0.0
+        and args.traj_uvd_gate_near_depth_relaxed_std_threshold_m < args.traj_uvd_gate_depth_std_threshold_m
+    ):
+        raise ValueError(
+            "--traj_uvd_gate_near_depth_relaxed_std_threshold_m must be >= "
+            "--traj_uvd_gate_depth_std_threshold_m when enabled"
+        )
+    if args.query_depth_stabilization_reproj_tol_px <= 0.0:
+        raise ValueError("--query_depth_stabilization_reproj_tol_px must be > 0")
+    if args.query_depth_stabilization_min_support < 1:
+        raise ValueError("--query_depth_stabilization_min_support must be >= 1")
+    if args.query_depth_stabilization_min_query_depth_m < 0.0:
+        raise ValueError("--query_depth_stabilization_min_query_depth_m must be >= 0")
+    if args.query_depth_stabilization_min_border_dist_px < 0.0:
+        raise ValueError("--query_depth_stabilization_min_border_dist_px must be >= 0")
+    if args.dense_depth_stabilization_radius < 0:
+        raise ValueError("--dense_depth_stabilization_radius must be >= 0")
+    if args.dense_depth_stabilization_min_support < 1:
+        raise ValueError("--dense_depth_stabilization_min_support must be >= 1")
+    if min(
+        args.grid_border_trim_left,
+        args.grid_border_trim_right,
+        args.grid_border_trim_top,
+        args.grid_border_trim_bottom,
+    ) < 0:
+        raise ValueError("--grid_border_trim_{left,right,top,bottom} must all be >= 0")
+    if args.grid_border_trim_left + args.grid_border_trim_right >= args.grid_size:
+        raise ValueError("grid horizontal trims must leave at least one query-grid column")
+    if args.grid_border_trim_top + args.grid_border_trim_bottom >= args.grid_size:
+        raise ValueError("grid vertical trims must leave at least one query-grid row")
     if args.workers_per_gpu <= 0:
         raise ValueError("--workers_per_gpu must be >= 1")
     if args.depth_filter_workers <= 0:
@@ -2290,7 +2593,14 @@ def main() -> None:
         f"keyframes_per_sec={args.keyframes_per_sec_min}~{args.keyframes_per_sec_max}, "
         f"future_len={args.future_len}, grid_size={args.grid_size}, "
         f"grid_hw={getattr(args, 'query_grid_hw', None)}, "
-        f"query_prefilter={args.query_prefilter_mode}, support_grid_ratio={args.support_grid_ratio}, "
+        f"query_prefilter={args.query_prefilter_mode}, "
+        f"query_visibility_gate={args.query_visibility_gate_mode}, "
+        f"query_fixed_view_depth_gate={args.query_fixed_view_depth_gate_mode}, "
+        f"traj_uvd_gate={args.traj_uvd_gate_mode}, "
+        f"query_depth_stabilization={args.query_depth_stabilization_mode}, "
+        f"dense_depth_stabilization={args.dense_depth_stabilization_mode}, "
+        f"tracker_precision_mode={args.tracker_precision_mode}, "
+        f"support_grid_ratio={args.support_grid_ratio}, "
         f"load_stride={args.fps}, depth_filter_workers={args.depth_filter_workers}"
     )
     logger.info(

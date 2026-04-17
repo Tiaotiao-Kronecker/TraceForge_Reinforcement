@@ -22,6 +22,7 @@ TEMPORAL_MIN_CONSISTENCY_RATIO = 0.95
 TRAJ_FILTER_PROFILE_EXTERNAL = "external"
 TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR = "external_manipulator"
 TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR_V2 = "external_manipulator_v2"
+TRAJ_FILTER_PROFILE_EGOCENTRIC_OBJECT_INTERACTION_V1 = "egocentric_object_interaction_v1"
 TRAJ_FILTER_PROFILE_WRIST = "wrist"
 TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE = "wrist_pick_place"
 TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE_NO_HEATMAP = "wrist_pick_place_no_heatmap"
@@ -33,6 +34,11 @@ WRIST_MIN_SUPPORT_FRAMES = 3
 WRIST_PREFIX_RATIO = 0.15
 WRIST_SUPPORT_RATIO = 0.20
 WRIST_MANIPULATOR_TOP95_KEEP_RATIO = 0.95
+
+EGOCENTRIC_MIN_PREFIX_FRAMES = 1
+EGOCENTRIC_MIN_SUPPORT_FRAMES = 1
+EGOCENTRIC_PREFIX_RATIO = 0.05
+EGOCENTRIC_SUPPORT_RATIO = 0.05
 
 WRIST_MANIPULATOR_MAX_DEPTH_RANK = 0.50
 WRIST_MANIPULATOR_MIN_MOTION_EXTENT = 0.03
@@ -61,14 +67,32 @@ EXTERNAL_MANIPULATOR_V2_MIN_COMPONENT_RATIO = 0.002
 EXTERNAL_MANIPULATOR_V2_MIN_COMPONENT_SIZE = 2
 EXTERNAL_MANIPULATOR_V2_MAJOR_COMPONENT_RATIO = 0.15
 
+EGOCENTRIC_MANIPULATOR_MAX_DEPTH_RANK = 0.82
+EGOCENTRIC_MANIPULATOR_MIN_MOTION_EXTENT = 0.01
+EGOCENTRIC_MANIPULATOR_CLUSTER_RADIUS_RATIO = 0.06
+EGOCENTRIC_MANIPULATOR_CLUSTER_RADIUS_MIN_PX = 24
+EGOCENTRIC_MANIPULATOR_MIN_COMPONENT_RATIO = 0.002
+EGOCENTRIC_MANIPULATOR_MIN_COMPONENT_SIZE = 2
+EGOCENTRIC_MANIPULATOR_MAJOR_COMPONENT_RATIO = 0.12
+EGOCENTRIC_OBJECT_MAX_MANIPULATOR_DISTANCE_M = 0.20
+EGOCENTRIC_OBJECT_QUERY_DEPTH_MARGIN_M = 0.25
+
+STEREO_DEPTH_ABS_TOL = 0.05
+STEREO_DEPTH_REL_TOL = 0.10
+STEREO_MIN_CONSISTENCY_RATIO = 0.60
+STEREO_MAX_PATCH_ERROR = 0.20
+
 VOLATILITY_LOW_PERCENTILE = 5.0
 VOLATILITY_HIGH_PERCENTILE = 95.0
 VOLATILITY_MASK_PERCENTILE = 99.0
 
 QUERY_PREFILTER_MODE_OFF = "off"
 QUERY_PREFILTER_MODE_PROFILE_AWARE_STATIC_V1 = "profile_aware_static_v1"
+QUERY_PREFILTER_MODE_EXTERNAL_DEPTH_STATIC_V1 = "external_depth_static_v1"
 DEFAULT_QUERY_PREFILTER_MODE = QUERY_PREFILTER_MODE_OFF
 DEFAULT_QUERY_PREFILTER_WRIST_RANK_KEEP_RATIO = 0.30
+EXTERNAL_QUERY_PREFILTER_MIN_QUERY_DEPTH_M = 0.05
+EXTERNAL_QUERY_PREFILTER_EDGE_BORDER_PX = 40
 
 TRAJ_FILTER_ABLATION_MODE_NONE = "none"
 TRAJ_FILTER_ABLATION_MODE_WRIST_SEED_TOP95 = "wrist_seed_top95"
@@ -1381,6 +1405,10 @@ def resolve_traj_filter_config(filter_args) -> dict:
             "wrist_min_support_frames": WRIST_MIN_SUPPORT_FRAMES,
             "wrist_prefix_ratio": WRIST_PREFIX_RATIO,
             "wrist_support_ratio": WRIST_SUPPORT_RATIO,
+            "egocentric_min_prefix_frames": EGOCENTRIC_MIN_PREFIX_FRAMES,
+            "egocentric_min_support_frames": EGOCENTRIC_MIN_SUPPORT_FRAMES,
+            "egocentric_prefix_ratio": EGOCENTRIC_PREFIX_RATIO,
+            "egocentric_support_ratio": EGOCENTRIC_SUPPORT_RATIO,
         },
         "standard": {
             "enabled": True,
@@ -1406,6 +1434,10 @@ def resolve_traj_filter_config(filter_args) -> dict:
             "wrist_min_support_frames": WRIST_MIN_SUPPORT_FRAMES,
             "wrist_prefix_ratio": WRIST_PREFIX_RATIO,
             "wrist_support_ratio": WRIST_SUPPORT_RATIO,
+            "egocentric_min_prefix_frames": EGOCENTRIC_MIN_PREFIX_FRAMES,
+            "egocentric_min_support_frames": EGOCENTRIC_MIN_SUPPORT_FRAMES,
+            "egocentric_prefix_ratio": EGOCENTRIC_PREFIX_RATIO,
+            "egocentric_support_ratio": EGOCENTRIC_SUPPORT_RATIO,
         },
         "strict": {
             "enabled": True,
@@ -1431,6 +1463,10 @@ def resolve_traj_filter_config(filter_args) -> dict:
             "wrist_min_support_frames": WRIST_MIN_SUPPORT_FRAMES,
             "wrist_prefix_ratio": WRIST_PREFIX_RATIO,
             "wrist_support_ratio": WRIST_SUPPORT_RATIO,
+            "egocentric_min_prefix_frames": EGOCENTRIC_MIN_PREFIX_FRAMES,
+            "egocentric_min_support_frames": EGOCENTRIC_MIN_SUPPORT_FRAMES,
+            "egocentric_prefix_ratio": EGOCENTRIC_PREFIX_RATIO,
+            "egocentric_support_ratio": EGOCENTRIC_SUPPORT_RATIO,
         },
         "none": {
             "enabled": False,
@@ -1456,6 +1492,10 @@ def resolve_traj_filter_config(filter_args) -> dict:
             "wrist_min_support_frames": WRIST_MIN_SUPPORT_FRAMES,
             "wrist_prefix_ratio": WRIST_PREFIX_RATIO,
             "wrist_support_ratio": WRIST_SUPPORT_RATIO,
+            "egocentric_min_prefix_frames": EGOCENTRIC_MIN_PREFIX_FRAMES,
+            "egocentric_min_support_frames": EGOCENTRIC_MIN_SUPPORT_FRAMES,
+            "egocentric_prefix_ratio": EGOCENTRIC_PREFIX_RATIO,
+            "egocentric_support_ratio": EGOCENTRIC_SUPPORT_RATIO,
         },
     }
     config = defaults[level].copy()
@@ -1491,6 +1531,19 @@ def resolve_traj_filter_config(filter_args) -> dict:
             "external_manipulator_v2_min_component_ratio": EXTERNAL_MANIPULATOR_V2_MIN_COMPONENT_RATIO,
             "external_manipulator_v2_min_component_size": EXTERNAL_MANIPULATOR_V2_MIN_COMPONENT_SIZE,
             "external_manipulator_v2_major_component_ratio": EXTERNAL_MANIPULATOR_V2_MAJOR_COMPONENT_RATIO,
+            "egocentric_manipulator_max_depth_rank": EGOCENTRIC_MANIPULATOR_MAX_DEPTH_RANK,
+            "egocentric_manipulator_min_motion_extent": EGOCENTRIC_MANIPULATOR_MIN_MOTION_EXTENT,
+            "egocentric_manipulator_cluster_radius_ratio": EGOCENTRIC_MANIPULATOR_CLUSTER_RADIUS_RATIO,
+            "egocentric_manipulator_cluster_radius_min_px": EGOCENTRIC_MANIPULATOR_CLUSTER_RADIUS_MIN_PX,
+            "egocentric_manipulator_min_component_ratio": EGOCENTRIC_MANIPULATOR_MIN_COMPONENT_RATIO,
+            "egocentric_manipulator_min_component_size": EGOCENTRIC_MANIPULATOR_MIN_COMPONENT_SIZE,
+            "egocentric_manipulator_major_component_ratio": EGOCENTRIC_MANIPULATOR_MAJOR_COMPONENT_RATIO,
+            "egocentric_object_max_manipulator_distance_m": EGOCENTRIC_OBJECT_MAX_MANIPULATOR_DISTANCE_M,
+            "egocentric_object_query_depth_margin_m": EGOCENTRIC_OBJECT_QUERY_DEPTH_MARGIN_M,
+            "stereo_depth_abs_tol": STEREO_DEPTH_ABS_TOL,
+            "stereo_depth_rel_tol": STEREO_DEPTH_REL_TOL,
+            "stereo_min_consistency_ratio": STEREO_MIN_CONSISTENCY_RATIO,
+            "stereo_max_patch_error": STEREO_MAX_PATCH_ERROR,
         }
     )
     if filter_args is None:
@@ -1705,6 +1758,28 @@ def compute_query_depth_edge_risk_mask(
     }
 
 
+def _compute_query_border_distances_px(
+    keypoints: np.ndarray,
+    *,
+    height: int,
+    width: int,
+) -> np.ndarray:
+    keypoints = np.asarray(keypoints, dtype=np.float32)
+    if keypoints.ndim != 2 or keypoints.shape[1] != 2:
+        raise ValueError(f"Expected keypoints shape (N,2), got {keypoints.shape}")
+    x = keypoints[:, 0].astype(np.float32, copy=False)
+    y = keypoints[:, 1].astype(np.float32, copy=False)
+    border_dist = np.minimum.reduce(
+        [
+            x,
+            y,
+            np.maximum(float(width - 1) - x, 0.0),
+            np.maximum(float(height - 1) - y, 0.0),
+        ]
+    )
+    return np.clip(np.round(border_dist), 0, np.iinfo(np.uint16).max).astype(np.uint16)
+
+
 def build_query_prefilter_result(
     keypoints: np.ndarray,
     query_depth: np.ndarray,
@@ -1729,6 +1804,24 @@ def build_query_prefilter_result(
     default_ratio = np.full(num_tracks, np.nan, dtype=np.float32)
     default_std = np.full(num_tracks, np.nan, dtype=np.float32)
     default_bool = np.zeros(num_tracks, dtype=bool)
+    default_border_dist = _compute_query_border_distances_px(
+        keypoints,
+        height=int(query_depth.shape[0]),
+        width=int(query_depth.shape[1]),
+    )
+
+    def _default_result() -> dict[str, np.ndarray]:
+        return {
+            "prefilter_mask": default_prefilter_mask,
+            "reason_bits": default_reason_bits,
+            "query_depth_quality_mask": default_prefilter_mask.copy(),
+            "query_depth_edge_mask": default_bool.copy(),
+            "query_depth_edge_risk_mask": default_bool.copy(),
+            "query_depth_patch_valid_ratio": default_ratio.copy(),
+            "query_depth_patch_std": default_std.copy(),
+            "query_depth_rank": default_rank.copy(),
+            "query_border_dist_px": default_border_dist.copy(),
+        }
 
     if filter_config is None:
         filter_config = resolve_traj_filter_config(filter_args)
@@ -1739,34 +1832,27 @@ def build_query_prefilter_result(
         else str(getattr(filter_args, "query_prefilter_mode", DEFAULT_QUERY_PREFILTER_MODE))
     )
 
-    if mode == QUERY_PREFILTER_MODE_OFF or not bool(filter_config["enabled"]):
-        return {
-            "prefilter_mask": default_prefilter_mask,
-            "reason_bits": default_reason_bits,
-            "query_depth_quality_mask": default_prefilter_mask.copy(),
-            "query_depth_edge_mask": default_bool.copy(),
-            "query_depth_edge_risk_mask": default_bool.copy(),
-            "query_depth_patch_valid_ratio": default_ratio.copy(),
-            "query_depth_patch_std": default_std.copy(),
-            "query_depth_rank": default_rank.copy(),
-        }
-    if mode != QUERY_PREFILTER_MODE_PROFILE_AWARE_STATIC_V1:
+    if mode == QUERY_PREFILTER_MODE_OFF:
+        return _default_result()
+    if mode not in {
+        QUERY_PREFILTER_MODE_PROFILE_AWARE_STATIC_V1,
+        QUERY_PREFILTER_MODE_EXTERNAL_DEPTH_STATIC_V1,
+    }:
         raise ValueError(f"Unsupported query_prefilter_mode: {mode}")
-    if profile in {
+    if (
+        not bool(filter_config["enabled"])
+        and mode != QUERY_PREFILTER_MODE_EXTERNAL_DEPTH_STATIC_V1
+    ):
+        return _default_result()
+    if (
+        mode == QUERY_PREFILTER_MODE_PROFILE_AWARE_STATIC_V1
+        and profile in {
         TRAJ_FILTER_PROFILE_EXTERNAL,
         TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR,
         TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR_V2,
-    }:
-        return {
-            "prefilter_mask": default_prefilter_mask,
-            "reason_bits": default_reason_bits,
-            "query_depth_quality_mask": default_prefilter_mask.copy(),
-            "query_depth_edge_mask": default_bool.copy(),
-            "query_depth_edge_risk_mask": default_bool.copy(),
-            "query_depth_patch_valid_ratio": default_ratio.copy(),
-            "query_depth_patch_std": default_std.copy(),
-            "query_depth_rank": default_rank.copy(),
         }
+    ):
+        return _default_result()
 
     patch_stats = _compute_query_depth_patch_stats(
         keypoints,
@@ -1786,8 +1872,30 @@ def build_query_prefilter_result(
 
     query_depth_edge_mask = np.zeros(num_tracks, dtype=bool)
     query_depth_edge_risk_mask = np.zeros(num_tracks, dtype=bool)
+    query_border_dist_px = default_border_dist.copy()
     prefilter_mask = query_depth_quality_mask.copy()
-    if profile in {
+    if mode == QUERY_PREFILTER_MODE_EXTERNAL_DEPTH_STATIC_V1:
+        query_depth_values = np.asarray(patch_stats["query_values"]).astype(np.float32, copy=False)
+        min_query_depth_mask = np.isfinite(query_depth_values) & (
+            query_depth_values > float(EXTERNAL_QUERY_PREFILTER_MIN_QUERY_DEPTH_M)
+        )
+        prefilter_mask &= min_query_depth_mask
+        reason_bits[~min_query_depth_mask] |= MASK_REASON_QUERY_DEPTH_FAIL
+        edge_result = compute_query_depth_edge_risk_mask(
+            keypoints,
+            query_depth,
+            min_depth=float(filter_config["min_depth"]),
+            max_depth=float(filter_config["max_depth"]),
+            patch_stats=patch_stats,
+        )
+        query_depth_edge_mask = np.asarray(edge_result["query_edge_mask"]).astype(bool, copy=False)
+        query_depth_edge_risk_mask = np.asarray(edge_result["mask"]).astype(bool, copy=False)
+        external_edge_fail_mask = query_depth_edge_risk_mask & (
+            query_border_dist_px <= np.uint16(EXTERNAL_QUERY_PREFILTER_EDGE_BORDER_PX)
+        )
+        prefilter_mask &= ~external_edge_fail_mask
+        reason_bits[external_edge_fail_mask] |= MASK_REASON_QUERY_DEPTH_EDGE_FAIL
+    elif profile in {
         TRAJ_FILTER_PROFILE_WRIST,
         TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE,
         TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE_NO_HEATMAP,
@@ -1833,6 +1941,7 @@ def build_query_prefilter_result(
         "query_depth_patch_valid_ratio": np.asarray(patch_stats["patch_valid_ratio"]).astype(np.float32, copy=False),
         "query_depth_patch_std": np.asarray(patch_stats["patch_std"]).astype(np.float32, copy=False),
         "query_depth_rank": query_depth_rank.astype(np.float32, copy=False),
+        "query_border_dist_px": query_border_dist_px.astype(np.uint16, copy=False),
     }
 
 
@@ -2100,6 +2209,157 @@ def project_world_tracks_to_camera_uvz(
     return projected
 
 
+def _rgb_segment_to_gray(rgb_segment: np.ndarray) -> np.ndarray:
+    rgb_segment = np.asarray(rgb_segment, dtype=np.float32)
+    if rgb_segment.ndim != 4:
+        raise ValueError(f"Expected rgb_segment shape (T,C,H,W) or (T,H,W,C), got {rgb_segment.shape}")
+    if rgb_segment.shape[1] == 3:
+        red, green, blue = rgb_segment[:, 0], rgb_segment[:, 1], rgb_segment[:, 2]
+    elif rgb_segment.shape[-1] == 3:
+        red, green, blue = rgb_segment[..., 0], rgb_segment[..., 1], rgb_segment[..., 2]
+    else:
+        raise ValueError(f"Expected RGB channel dimension of size 3, got {rgb_segment.shape}")
+    if np.nanmax(rgb_segment) > 1.5:
+        red = red / 255.0
+        green = green / 255.0
+        blue = blue / 255.0
+    gray = 0.299 * red + 0.587 * green + 0.114 * blue
+    return np.clip(gray, 0.0, 1.0).astype(np.float32)
+
+
+def _sample_segment_values_at_uv(
+    values_segment: np.ndarray,
+    uvz: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    values_segment = np.asarray(values_segment, dtype=np.float32)
+    uvz = np.asarray(uvz, dtype=np.float32)
+    if values_segment.ndim != 3:
+        raise ValueError(f"Expected values_segment shape (T,H,W), got {values_segment.shape}")
+    if uvz.ndim != 3 or uvz.shape[-1] < 2:
+        raise ValueError(f"Expected uvz shape (N,T,>=2), got {uvz.shape}")
+    num_tracks, num_frames = uvz.shape[:2]
+    if values_segment.shape[0] != num_frames:
+        raise ValueError(
+            f"Expected values_segment first dim {num_frames}, got {values_segment.shape[0]}"
+        )
+
+    h, w = values_segment.shape[1:]
+    u = uvz[..., 0]
+    v = uvz[..., 1]
+    in_bounds = (
+        np.isfinite(u)
+        & np.isfinite(v)
+        & (u >= 0.0)
+        & (u <= float(max(w - 1, 0)))
+        & (v >= 0.0)
+        & (v <= float(max(h - 1, 0)))
+    )
+    xs = np.clip(np.round(np.nan_to_num(u, nan=-1.0)).astype(np.int32), 0, max(w - 1, 0))
+    ys = np.clip(np.round(np.nan_to_num(v, nan=-1.0)).astype(np.int32), 0, max(h - 1, 0))
+    sampled = np.full((num_tracks, num_frames), np.nan, dtype=np.float32)
+    for frame_idx in range(num_frames):
+        valid_mask = in_bounds[:, frame_idx]
+        if not np.any(valid_mask):
+            continue
+        sampled[valid_mask, frame_idx] = values_segment[frame_idx, ys[valid_mask, frame_idx], xs[valid_mask, frame_idx]]
+    sampled_valid = in_bounds & np.isfinite(sampled)
+    return sampled.astype(np.float32), sampled_valid.astype(bool)
+
+
+def evaluate_stereo_consistency(
+    traj_uvz: np.ndarray,
+    *,
+    visibs: np.ndarray | None,
+    intrinsics_segment: np.ndarray,
+    extrinsics_segment: np.ndarray,
+    stereo_context: dict[str, np.ndarray | str] | None,
+    min_depth: float,
+    max_depth: float,
+    min_valid_frames: int,
+    depth_abs_tol: float,
+    depth_rel_tol: float,
+    min_consistency_ratio: float,
+    max_patch_error: float,
+) -> dict[str, np.ndarray]:
+    traj_uvz = np.asarray(traj_uvz, dtype=np.float32)
+    num_tracks, num_frames, _ = traj_uvz.shape
+    default_ratio = np.full(num_tracks, np.nan, dtype=np.float32)
+    default_counts = np.zeros(num_tracks, dtype=np.uint16)
+    if stereo_context is None:
+        return {
+            "compare_counts": default_counts,
+            "depth_consistency_ratio": default_ratio,
+            "patch_error": default_ratio.copy(),
+            "mask": np.ones(num_tracks, dtype=bool),
+        }
+
+    stereo_depths = np.asarray(stereo_context["depth_segment"], dtype=np.float32)
+    stereo_intrinsics = np.asarray(stereo_context["intrinsics_segment"], dtype=np.float32)
+    stereo_extrinsics = np.asarray(stereo_context["extrinsics_segment"], dtype=np.float32)
+    if stereo_depths.shape[0] != num_frames:
+        raise ValueError(
+            f"Stereo context frame count mismatch: traj has {num_frames}, stereo depth has {stereo_depths.shape[0]}"
+        )
+
+    visibility = _normalize_visibility(visibs, num_tracks=num_tracks, num_frames=num_frames)
+    world_tracks = traj_uvz_to_world_coordinates(
+        traj_uvz,
+        query_intrinsics=intrinsics_segment[0],
+        query_w2c=extrinsics_segment[0],
+        min_depth=min_depth,
+        max_depth=max_depth,
+    )
+    stereo_uvz = project_world_tracks_to_camera_uvz(
+        world_tracks,
+        intrinsics_segment=stereo_intrinsics,
+        extrinsics_segment=stereo_extrinsics,
+        min_depth=min_depth,
+        max_depth=max_depth,
+    )
+    compare_mask = np.isfinite(traj_uvz).all(axis=-1) & np.isfinite(stereo_uvz).all(axis=-1)
+    if visibility is not None:
+        compare_mask &= visibility
+
+    sampled_depths, sampled_depth_valid = _sample_segment_values_at_uv(stereo_depths, stereo_uvz)
+    compare_mask &= sampled_depth_valid
+    expected_depth = stereo_uvz[..., 2]
+    depth_tol = np.maximum(float(depth_abs_tol), float(depth_rel_tol) * np.abs(expected_depth))
+    depth_agree = compare_mask & np.isfinite(expected_depth) & np.isfinite(sampled_depths)
+    depth_agree &= np.abs(sampled_depths - expected_depth) <= depth_tol
+    compare_counts = compare_mask.sum(axis=1).astype(np.uint16)
+    depth_consistency_ratio = _counts_to_ratio(depth_agree.sum(axis=1), compare_counts)
+
+    patch_error = np.full(num_tracks, np.nan, dtype=np.float32)
+    current_rgb_segment = stereo_context.get("current_rgb_segment")
+    stereo_rgb_segment = stereo_context.get("rgb_segment")
+    if current_rgb_segment is not None and stereo_rgb_segment is not None:
+        current_gray = _rgb_segment_to_gray(np.asarray(current_rgb_segment, dtype=np.float32))
+        stereo_gray = _rgb_segment_to_gray(np.asarray(stereo_rgb_segment, dtype=np.float32))
+        current_gray_samples, current_gray_valid = _sample_segment_values_at_uv(current_gray, traj_uvz)
+        stereo_gray_samples, stereo_gray_valid = _sample_segment_values_at_uv(stereo_gray, stereo_uvz)
+        patch_mask = compare_mask & current_gray_valid & stereo_gray_valid
+        if np.any(patch_mask):
+            gray_diff = np.abs(current_gray_samples - stereo_gray_samples).astype(np.float32)
+            gray_diff[~patch_mask] = np.nan
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                patch_error = np.nanmedian(gray_diff, axis=1).astype(np.float32)
+
+    enough_support_mask = compare_counts >= np.uint16(max(1, int(min_valid_frames)))
+    patch_pass_mask = (~np.isfinite(patch_error)) | (patch_error <= float(max_patch_error))
+    stereo_mask = (~enough_support_mask) | (
+        np.isfinite(depth_consistency_ratio)
+        & (depth_consistency_ratio >= float(min_consistency_ratio))
+        & patch_pass_mask
+    )
+    return {
+        "compare_counts": compare_counts.astype(np.uint16),
+        "depth_consistency_ratio": depth_consistency_ratio.astype(np.float32),
+        "patch_error": patch_error.astype(np.float32),
+        "mask": stereo_mask.astype(bool),
+    }
+
+
 def prepare_temporal_depth_consistency_context(
     traj_uvz: np.ndarray,
     *,
@@ -2292,6 +2552,7 @@ def build_traj_filter_result(
     raw_depths_segment: np.ndarray | None = None,
     intrinsics_segment: np.ndarray | None = None,
     extrinsics_segment: np.ndarray | None = None,
+    stereo_context: dict[str, np.ndarray | str] | None = None,
     high_volatility_mask: np.ndarray | None = None,
     depth_volatility_map: np.ndarray | None = None,
     temporal_compare_context: dict[str, np.ndarray | int] | None = None,
@@ -2307,6 +2568,7 @@ def build_traj_filter_result(
         TRAJ_FILTER_PROFILE_EXTERNAL,
         TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR,
         TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR_V2,
+        TRAJ_FILTER_PROFILE_EGOCENTRIC_OBJECT_INTERACTION_V1,
         TRAJ_FILTER_PROFILE_WRIST,
         TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE,
         TRAJ_FILTER_PROFILE_WRIST_PICK_PLACE_NO_HEATMAP,
@@ -2363,6 +2625,9 @@ def build_traj_filter_result(
     default_all_true_mask = np.ones(num_tracks, dtype=bool)
     default_pick_place_count = np.zeros(num_tracks, dtype=np.uint16)
     default_pick_place_distance = np.full(num_tracks, np.nan, dtype=np.float32)
+    default_stereo_compare_count = np.zeros(num_tracks, dtype=np.uint16)
+    default_stereo_ratio = np.full(num_tracks, np.nan, dtype=np.float32)
+    default_stereo_mask = np.ones(num_tracks, dtype=bool)
     filter_result_base_geometry_seconds = 0.0
     filter_result_query_depth_patch_stats_seconds = 0.0
     filter_result_query_depth_quality_seconds = 0.0
@@ -2417,6 +2682,10 @@ def build_traj_filter_result(
             "traj_pick_place_depth_guard_mask": default_manipulator_mask.copy(),
             "traj_pick_place_delayed_contact_rescue_mask": default_manipulator_mask.copy(),
             "traj_pick_place_object_mask": default_manipulator_mask.copy(),
+            "traj_stereo_compare_frame_count": default_stereo_compare_count.copy(),
+            "traj_stereo_depth_consistency_ratio": default_stereo_ratio.copy(),
+            "traj_stereo_patch_error": default_stereo_ratio.copy(),
+            "traj_stereo_consistency_mask": default_stereo_mask.copy(),
         }
         _accumulate_profile_stat(
             profile_stats,
@@ -2431,6 +2700,10 @@ def build_traj_filter_result(
     tail_truncated_sample = is_tail_truncated_sample(num_frames=num_frames, filter_args=filter_args)
     visibs_for_filter = visibility if (config["use_visibility"] and not tail_truncated_sample) else None
     visibs_for_temporal = None if tail_truncated_sample else visibility
+    if profile == TRAJ_FILTER_PROFILE_EGOCENTRIC_OBJECT_INTERACTION_V1:
+        # Egocentric tracks often get near-zero learned visibility; use geometric
+        # temporal/stereo support here instead of letting visibility collapse all support.
+        visibs_for_temporal = None
 
     base_geometry = compute_traj_base_geometry(
         traj,
@@ -2603,6 +2876,33 @@ def build_traj_filter_result(
     supervision_prefix_len = _compute_true_prefix_lengths(supervision_mask).astype(np.uint16)
     supervision_count = supervision_mask.sum(axis=1).astype(np.uint16)
 
+    stereo_compare_frame_count = default_stereo_compare_count.copy()
+    stereo_depth_consistency_ratio = default_stereo_ratio.copy()
+    stereo_patch_error = default_stereo_ratio.copy()
+    stereo_consistency_mask = default_stereo_mask.copy()
+    if stereo_context is not None:
+        stereo_result = evaluate_stereo_consistency(
+            traj,
+            visibs=visibs_for_temporal,
+            intrinsics_segment=intrinsics_segment,
+            extrinsics_segment=extrinsics_segment,
+            stereo_context=stereo_context,
+            min_depth=config["min_depth"],
+            max_depth=config["max_depth"],
+            min_valid_frames=config["min_valid_frames"],
+            depth_abs_tol=config["stereo_depth_abs_tol"],
+            depth_rel_tol=config["stereo_depth_rel_tol"],
+            min_consistency_ratio=config["stereo_min_consistency_ratio"],
+            max_patch_error=config["stereo_max_patch_error"],
+        )
+        stereo_compare_frame_count = np.asarray(stereo_result["compare_counts"]).astype(np.uint16, copy=False)
+        stereo_depth_consistency_ratio = np.asarray(stereo_result["depth_consistency_ratio"]).astype(
+            np.float32,
+            copy=False,
+        )
+        stereo_patch_error = np.asarray(stereo_result["patch_error"]).astype(np.float32, copy=False)
+        stereo_consistency_mask = np.asarray(stereo_result["mask"]).astype(bool, copy=False)
+
     reason_bits = np.zeros(num_tracks, dtype=np.uint8)
 
     wrist_seed_mask = default_manipulator_mask.copy()
@@ -2662,6 +2962,7 @@ def build_traj_filter_result(
                 "min_depth": config["min_depth"],
                 "max_depth": config["max_depth"],
                 "motion_metric_mode": "supervised",
+                "reusable_geometry": None,
                 "profile_stats": profile_stats,
             }
             if profile == TRAJ_FILTER_PROFILE_EXTERNAL_MANIPULATOR:
@@ -2742,6 +3043,138 @@ def build_traj_filter_result(
             reason_bits[wrist_seed_mask & (~traj_near_depth_mask)] |= MASK_REASON_MANIPULATOR_DEPTH_FAIL
             reason_bits[wrist_seed_mask & (~traj_motion_mask)] |= MASK_REASON_MANIPULATOR_MOTION_FAIL
             reason_bits[traj_manipulator_candidate_mask & (~traj_cluster_mask)] |= MASK_REASON_MANIPULATOR_CLUSTER_FAIL
+    elif profile == TRAJ_FILTER_PROFILE_EGOCENTRIC_OBJECT_INTERACTION_V1:
+        traj_base_mask = wrist_base_mask.copy()
+        required_prefix_frames = _resolve_support_frame_requirement(
+            num_frames=num_frames,
+            min_frames=config["egocentric_min_prefix_frames"],
+            ratio=config["egocentric_prefix_ratio"],
+        )
+        required_support_frames = _resolve_support_frame_requirement(
+            num_frames=num_frames,
+            min_frames=config["egocentric_min_support_frames"],
+            ratio=config["egocentric_support_ratio"],
+        )
+        supervision_support_mask = (
+            supervision_prefix_len >= required_prefix_frames
+        ) & (
+            supervision_count >= required_support_frames
+        )
+        traj_supervision_support_mask = supervision_support_mask.copy()
+        reason_bits[~traj_base_mask] |= MASK_REASON_BASE_GEOMETRY_FAIL
+        reason_bits[~query_depth_quality_mask] |= MASK_REASON_QUERY_DEPTH_FAIL
+        reason_bits[~supervision_support_mask] |= MASK_REASON_TEMPORAL_CONSISTENCY_FAIL
+        wrist_seed_mask = traj_base_mask & query_depth_mask & supervision_support_mask
+
+        raw_depths_segment, intrinsics_segment, extrinsics_segment = _require_segment_geometry(
+            raw_depths_segment=raw_depths_segment,
+            intrinsics_segment=intrinsics_segment,
+            extrinsics_segment=extrinsics_segment,
+            expected_num_frames=num_frames,
+        )
+        reusable_geometry: dict[str, np.ndarray] | None = {}
+        manipulator_near_depth_before = _get_profile_stat(
+            profile_stats, "filter_result_manipulator_near_depth_seconds"
+        )
+        manipulator_world_lift_before = _get_profile_stat(
+            profile_stats, "filter_result_manipulator_world_lift_seconds"
+        )
+        manipulator_motion_before = _get_profile_stat(
+            profile_stats, "filter_result_manipulator_motion_seconds"
+        )
+        manipulator_cluster_before = _get_profile_stat(
+            profile_stats, "filter_result_manipulator_cluster_seconds"
+        )
+        (
+            manipulator_final_mask,
+            traj_query_depth_rank,
+            traj_motion_extent,
+            traj_motion_step_median,
+            traj_motion_extent_all_valid,
+            traj_motion_step_median_all_valid,
+            traj_manipulator_candidate_mask,
+            traj_manipulator_cluster_id,
+            traj_manipulator_component_size,
+            traj_near_depth_mask,
+            traj_motion_mask,
+            traj_cluster_mask,
+            fallback_used,
+        ) = _apply_manipulator_aware_filter(
+            traj=traj,
+            keypoints=keypoints,
+            seed_mask=wrist_seed_mask,
+            supervision_mask=supervision_mask,
+            intrinsics_segment=intrinsics_segment,
+            extrinsics_segment=extrinsics_segment,
+            image_height=image_height,
+            image_width=image_width,
+            min_depth=config["min_depth"],
+            max_depth=config["max_depth"],
+            max_depth_rank=config["egocentric_manipulator_max_depth_rank"],
+            min_motion_extent=config["egocentric_manipulator_min_motion_extent"],
+            cluster_radius_ratio=config["egocentric_manipulator_cluster_radius_ratio"],
+            cluster_radius_min_px=config["egocentric_manipulator_cluster_radius_min_px"],
+            min_component_ratio=config["egocentric_manipulator_min_component_ratio"],
+            min_component_size=config["egocentric_manipulator_min_component_size"],
+            component_keep_mode="major",
+            major_component_ratio=config["egocentric_manipulator_major_component_ratio"],
+            motion_metric_mode="all_valid",
+            reusable_geometry=reusable_geometry,
+            profile_stats=profile_stats,
+        )
+        filter_result_manipulator_near_depth_seconds += max(
+            0.0,
+            _get_profile_stat(profile_stats, "filter_result_manipulator_near_depth_seconds")
+            - manipulator_near_depth_before,
+        )
+        filter_result_manipulator_world_lift_seconds += max(
+            0.0,
+            _get_profile_stat(profile_stats, "filter_result_manipulator_world_lift_seconds")
+            - manipulator_world_lift_before,
+        )
+        filter_result_manipulator_motion_seconds += max(
+            0.0,
+            _get_profile_stat(profile_stats, "filter_result_manipulator_motion_seconds")
+            - manipulator_motion_before,
+        )
+        filter_result_manipulator_cluster_seconds += max(
+            0.0,
+            _get_profile_stat(profile_stats, "filter_result_manipulator_cluster_seconds")
+            - manipulator_cluster_before,
+        )
+        traj_manipulator_cluster_fallback_used = np.asarray(fallback_used, dtype=bool)
+
+        reason_bits[wrist_seed_mask & (~traj_near_depth_mask)] |= MASK_REASON_MANIPULATOR_DEPTH_FAIL
+        reason_bits[wrist_seed_mask & (~traj_motion_mask)] |= MASK_REASON_MANIPULATOR_MOTION_FAIL
+        reason_bits[traj_manipulator_candidate_mask & (~traj_cluster_mask)] |= MASK_REASON_MANIPULATOR_CLUSTER_FAIL
+
+        pick_place_world_tracks = None if reusable_geometry is None else reusable_geometry.get("world_tracks")
+        (
+            traj_pick_place_delayed_contact_rescue_mask,
+            traj_pick_place_min_manipulator_distance,
+            traj_pick_place_contact_mask,
+            traj_pick_place_depth_guard_mask,
+            _traj_pick_place_delayed_contact_mask,
+        ) = _apply_delayed_contact_object_rescue_filter(
+            traj=traj,
+            visibs=visibility,
+            seed_mask=wrist_seed_mask,
+            local_keep_mask=manipulator_final_mask,
+            manipulator_reference_mask=manipulator_final_mask,
+            manipulator_reference_component_ids=traj_manipulator_cluster_id,
+            intrinsics_segment=intrinsics_segment,
+            extrinsics_segment=extrinsics_segment,
+            min_depth=config["min_depth"],
+            max_depth=config["max_depth"],
+            max_manipulator_distance_m=config["egocentric_object_max_manipulator_distance_m"],
+            query_depth_margin_m=config["egocentric_object_query_depth_margin_m"],
+            world_tracks=pick_place_world_tracks,
+        )
+        traj_pick_place_object_mask = traj_pick_place_delayed_contact_rescue_mask.copy()
+        final_mask = manipulator_final_mask | traj_pick_place_object_mask
+        traj_pre_top95_mask = final_mask.copy()
+        if stereo_context is not None:
+            final_mask = final_mask & stereo_consistency_mask
     else:
         wrist_profile_base_mask = wrist_base_mask
         if profile in {
@@ -3049,6 +3482,10 @@ def build_traj_filter_result(
         "traj_pick_place_depth_guard_mask": traj_pick_place_depth_guard_mask.astype(bool),
         "traj_pick_place_delayed_contact_rescue_mask": traj_pick_place_delayed_contact_rescue_mask.astype(bool),
         "traj_pick_place_object_mask": traj_pick_place_object_mask.astype(bool),
+        "traj_stereo_compare_frame_count": stereo_compare_frame_count.astype(np.uint16),
+        "traj_stereo_depth_consistency_ratio": stereo_depth_consistency_ratio.astype(np.float32),
+        "traj_stereo_patch_error": stereo_patch_error.astype(np.float32),
+        "traj_stereo_consistency_mask": stereo_consistency_mask.astype(bool),
     }
     filter_result_total_seconds = time.perf_counter() - filter_result_start
     _accumulate_profile_stat(profile_stats, "filter_result_total_seconds", filter_result_total_seconds)

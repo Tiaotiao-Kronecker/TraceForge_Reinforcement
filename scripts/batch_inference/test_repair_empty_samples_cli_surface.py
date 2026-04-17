@@ -36,6 +36,20 @@ class RepairEmptySamplesCliSurfaceTests(unittest.TestCase):
     def test_num_iters_default_is_three(self):
         self.assertEqual(_collect_cli_default(_PARSE_ARGS_AST, "--num_iters"), 3)
 
+    def test_filter_level_default_is_none(self):
+        self.assertEqual(_collect_cli_default(_PARSE_ARGS_AST, "--filter_level"), "none")
+
+    def test_tracker_precision_mode_default_is_fp32(self):
+        self.assertEqual(_collect_cli_default(_PARSE_ARGS_AST, "--tracker_precision_mode"), "fp32")
+
+    def test_support_grid_ratio_default_is_zero(self):
+        self.assertEqual(_collect_cli_default(_PARSE_ARGS_AST, "--support_grid_ratio"), 0.0)
+
+    def test_fixed_view_depth_gate_defaults_are_exposed(self):
+        self.assertEqual(_collect_cli_default(_PARSE_ARGS_AST, "--query_fixed_view_depth_gate_mode"), "first_frame_uvd_v1")
+        self.assertEqual(_collect_cli_default(_PARSE_ARGS_AST, "--query_fixed_view_depth_gate_uv_threshold_px"), 1.0)
+        self.assertEqual(_collect_cli_default(_PARSE_ARGS_AST, "--query_fixed_view_depth_gate_depth_threshold_m"), 0.1)
+
 
 if __name__ == "__main__":
     unittest.main()

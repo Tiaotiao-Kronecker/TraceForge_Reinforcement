@@ -1,4 +1,4 @@
-
+import contextlib
 from typing import Tuple
 import time
 import torch
@@ -9,6 +9,18 @@ import av
 import cv2
 import numpy as np
 from einops import repeat, rearrange
+
+
+TRACKER_PRECISION_MODE_FP32 = "fp32"
+TRACKER_PRECISION_MODE_AUTOCAST_BF16 = "autocast_bf16"
+TRACKER_PRECISION_MODE_DEEP_BF16 = "deep_bf16"
+_TRACKER_PRECISION_MODE_LEGACY_BF16 = "bf16"
+TRACKER_PRECISION_MODE_CHOICES = (
+    TRACKER_PRECISION_MODE_FP32,
+    TRACKER_PRECISION_MODE_AUTOCAST_BF16,
+    TRACKER_PRECISION_MODE_DEEP_BF16,
+    _TRACKER_PRECISION_MODE_LEGACY_BF16,
+)
 
 
 def _sync_device_if_needed(device: torch.device) -> None:
@@ -24,6 +36,39 @@ def _accumulate_profile_stat(
     if profile_stats is None:
         return
     profile_stats[key] = float(profile_stats.get(key, 0.0) + float(seconds))
+
+
+def normalize_tracker_precision_mode(mode: str | None) -> str:
+    normalized = str(mode or TRACKER_PRECISION_MODE_FP32).strip().lower()
+    if normalized == _TRACKER_PRECISION_MODE_LEGACY_BF16:
+        return TRACKER_PRECISION_MODE_AUTOCAST_BF16
+    if normalized not in {
+        TRACKER_PRECISION_MODE_FP32,
+        TRACKER_PRECISION_MODE_AUTOCAST_BF16,
+        TRACKER_PRECISION_MODE_DEEP_BF16,
+    }:
+        raise ValueError(f"Unsupported tracker_precision_mode: {mode}")
+    return normalized
+
+
+def get_tracker_precision_autocast_context(device: torch.device, tracker_precision_mode: str):
+    tracker_precision_mode = normalize_tracker_precision_mode(tracker_precision_mode)
+    if tracker_precision_mode == TRACKER_PRECISION_MODE_FP32:
+        return contextlib.nullcontext()
+    if device.type != "cuda":
+        raise ValueError(f"{tracker_precision_mode} requires a CUDA device")
+    return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+
+def configure_tracker_precision(model: torch.nn.Module, tracker_precision_mode: str) -> str:
+    tracker_precision_mode = normalize_tracker_precision_mode(tracker_precision_mode)
+    current_mode = getattr(model, "_configured_tracker_precision_mode", None)
+    if current_mode == tracker_precision_mode:
+        return tracker_precision_mode
+    if hasattr(model, "set_precision_mode"):
+        model.set_precision_mode(tracker_precision_mode)
+    setattr(model, "_configured_tracker_precision_mode", tracker_precision_mode)
+    return tracker_precision_mode
 
 def get_grid_queries(grid_size: int, depths: torch.Tensor, intrinsics: torch.Tensor, extrinsics: torch.Tensor):
     if len (depths.shape) == 3:
@@ -69,6 +114,7 @@ def _inference_with_grid(
     query_point: torch.Tensor,
     num_iters: int = 5,
     grid_size: int = 8,
+    tracker_precision_mode: str = TRACKER_PRECISION_MODE_FP32,
     profile_stats: dict[str, float] | None = None,
     **kwargs,
 ):
@@ -79,18 +125,21 @@ def _inference_with_grid(
     else:
         N_supports = 0
 
+    tracker_precision_mode = configure_tracker_precision(model, tracker_precision_mode)
+    autocast_ctx = get_tracker_precision_autocast_context(video.device, tracker_precision_mode)
     _sync_device_if_needed(video.device)
     model_forward_start = time.perf_counter()
-    preds, train_data_list = model(
-        rgb_obs=video,
-        depth_obs=depths,
-        num_iters=num_iters,
-        query_point=query_point,
-        intrinsics=intrinsics,
-        extrinsics=extrinsics,
-        mode="inference",
-        **kwargs
-    )
+    with autocast_ctx:
+        preds, train_data_list = model(
+            rgb_obs=video,
+            depth_obs=depths,
+            num_iters=num_iters,
+            query_point=query_point,
+            intrinsics=intrinsics,
+            extrinsics=extrinsics,
+            mode="inference",
+            **kwargs
+        )
     _sync_device_if_needed(video.device)
     _accumulate_profile_stat(
         profile_stats,
@@ -164,6 +213,7 @@ def inference(
     grid_size: int = 8,
     bidrectional: bool = True,
     vis_threshold = 0.9,
+    tracker_precision_mode: str = TRACKER_PRECISION_MODE_FP32,
     profile_stats: dict[str, float] | None = None,
     return_metadata: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, dict[str, int]]:
@@ -197,6 +247,7 @@ def inference(
             num_iters=num_iters,
             depth_roi=_depth_roi,
             grid_size=grid_size,
+            tracker_precision_mode=tracker_precision_mode,
             profile_stats=profile_stats,
         )
     )
@@ -213,6 +264,7 @@ def inference(
                 num_iters=num_iters,
                 depth_roi=_depth_roi,
                 grid_size=grid_size,
+                tracker_precision_mode=tracker_precision_mode,
                 profile_stats=profile_stats,
             )
         )
@@ -239,5 +291,6 @@ def inference(
     if return_metadata:
         return coords_out, visibs_out, {
             "effective_support_query_count": int(max(0, support_query_count)),
+            "tracker_precision_mode": str(normalize_tracker_precision_mode(tracker_precision_mode)),
         }
     return coords_out, visibs_out

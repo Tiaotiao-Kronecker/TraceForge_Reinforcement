@@ -112,7 +112,8 @@ pass `--camera_names` / `--camera-names` explicitly, and only those cameras are
 inferred or benchmarked. Other maintained defaults still cover
 `depth_pose_method=external`, `external_geom_name=trajectory_valid.h5`, `fps=1`,
 `max_num_frames=512`, `future_len=32`, `num_iters=3`, `grid_size=80`,
-`filter_level=standard`, and `traj_filter_profile=external`.
+`support_grid_ratio=0.0`, `filter_level=none`, and
+`traj_filter_profile=external`.
 `traj_filter_profile=auto` is retained as a compatibility alias and currently
 resolves to `external`. Wrist-oriented profiles remain available only when
 explicitly requested for historical investigations or compatibility reruns.

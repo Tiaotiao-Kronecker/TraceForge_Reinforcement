@@ -97,7 +97,7 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
 - 必须显式传入 `--camera_names`；脚本只会推理这里列出的相机名，不再假设 `varied_camera_*`
 - 其他维护态默认值仍覆盖 `depth_pose_method=external`、`external_geom_name=trajectory_valid.h5`、
   `fps=1`、`max_num_frames=512`、`future_len=32`、`grid_size=80`、
-  `filter_level=standard`、`traj_filter_profile=external`
+  `support_grid_ratio=0.0`、`filter_level=none`、`traj_filter_profile=external`
 - `--collect_profile_stats` 会把每个 camera task 的 `profile_stats` / `save_profile_stats`
   额外落到 `_camera_task_profiles.jsonl`
 - `--hardware_telemetry_interval_sec > 0` 会周期记录 GPU/CPU/IO 指标到 `_hardware_telemetry.jsonl`

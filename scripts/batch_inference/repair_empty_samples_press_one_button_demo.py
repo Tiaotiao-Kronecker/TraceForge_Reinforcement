@@ -886,6 +886,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--external_extr_mode", type=str, default="w2c", choices=["w2c", "c2w"])
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num_iters", type=int, default=3)
+    parser.add_argument(
+        "--tracker_precision_mode",
+        type=str,
+        default="fp32",
+        choices=["fp32", "autocast_bf16", "deep_bf16", "bf16"],
+    )
     parser.add_argument("--fps", type=int, default=1)
     parser.add_argument("--max_num_frames", type=int, default=512)
     parser.add_argument("--save_video", action="store_true", default=False)
@@ -901,8 +907,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grid_size", type=int, default=80)
     parser.add_argument("--query_prefilter_mode", type=str, default="off", choices=["off", "profile_aware_static_v1"])
     parser.add_argument("--query_prefilter_wrist_rank_keep_ratio", type=float, default=0.30)
-    parser.add_argument("--support_grid_ratio", type=float, default=0.8)
-    parser.add_argument("--filter_level", type=str, default="standard", choices=["none", "basic", "standard", "strict"])
+    parser.add_argument(
+        "--query_fixed_view_depth_gate_mode",
+        type=str,
+        default="first_frame_uvd_v1",
+        choices=["off", "first_frame_uvd_v1"],
+    )
+    parser.add_argument("--query_fixed_view_depth_gate_uv_threshold_px", type=float, default=1.0)
+    parser.add_argument("--query_fixed_view_depth_gate_depth_threshold_m", type=float, default=0.10)
+    parser.add_argument("--support_grid_ratio", type=float, default=0.0)
+    parser.add_argument("--filter_level", type=str, default="none", choices=["none", "basic", "standard", "strict"])
     parser.add_argument(
         "--traj_filter_profile",
         type=str,
@@ -945,6 +959,10 @@ def parse_args() -> argparse.Namespace:
     )
     if args.workers_per_gpu <= 0:
         raise ValueError("--workers_per_gpu must be >= 1")
+    if args.query_fixed_view_depth_gate_uv_threshold_px < 0.0:
+        raise ValueError("--query_fixed_view_depth_gate_uv_threshold_px must be >= 0")
+    if args.query_fixed_view_depth_gate_depth_threshold_m < 0.0:
+        raise ValueError("--query_fixed_view_depth_gate_depth_threshold_m must be >= 0")
     return args
 
 

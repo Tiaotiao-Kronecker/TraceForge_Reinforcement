@@ -26,6 +26,10 @@ from torch.profiler import record_function
 
 logger = logging.getLogger(__name__)
 
+TRACKER_PRECISION_MODE_FP32 = "fp32"
+TRACKER_PRECISION_MODE_AUTOCAST_BF16 = "autocast_bf16"
+TRACKER_PRECISION_MODE_DEEP_BF16 = "deep_bf16"
+
 # https://github.com/pytorch/pytorch/issues/61474
 def nanmin(tensor, dim=None, keepdim=False):
     max_value = torch.finfo(tensor.dtype).max
@@ -103,12 +107,37 @@ class PointTracker3D(nn.Module):
         self.register_buffer(
             "time_emb", get_1d_sincos_pos_embed_from_grid(self.point_updater.input_dim, time_grid[0])
         )
+        self.precision_mode = TRACKER_PRECISION_MODE_FP32
         logger.info(f"Image Feature Dim: {self.encoder.embedding_dim}")
 
     def set_image_size(self, image_size: Tuple[int, int]):
         self.image_size = image_size
         self.corr_processor.set_image_size(image_size)
         self.encoder.set_image_size(image_size)
+
+    def _module_device_is_cuda(self) -> bool:
+        for tensor in list(self.parameters()) + list(self.buffers()):
+            return tensor.device.type == "cuda"
+        return False
+
+    def set_precision_mode(self, precision_mode: str):
+        precision_mode = str(precision_mode).strip().lower()
+        if precision_mode not in {
+            TRACKER_PRECISION_MODE_FP32,
+            TRACKER_PRECISION_MODE_AUTOCAST_BF16,
+            TRACKER_PRECISION_MODE_DEEP_BF16,
+        }:
+            raise ValueError(f"Unsupported precision_mode: {precision_mode}")
+        self.precision_mode = precision_mode
+
+        target_dtype = torch.float32
+        if precision_mode == TRACKER_PRECISION_MODE_DEEP_BF16 and self._module_device_is_cuda():
+            target_dtype = torch.bfloat16
+
+        self.encoder.to(dtype=target_dtype)
+        self.corr_processor.to(dtype=target_dtype)
+        self.point_updater.to(dtype=target_dtype)
+        self.time_emb.data = self.time_emb.data.to(dtype=target_dtype)
 
     # Copied from: https://github.com/facebookresearch/co-tracker/blob/b00a83b66a2e72c7136bdc91e258988f42ebf6bc/cotracker/models/core/cotracker/cotracker3_online.py#L145
     def interpolate_time_embed(self, x, t):
@@ -188,7 +217,8 @@ class PointTracker3D(nn.Module):
             )
 
         # Update coordinates
-        updater_input: Any = [visibs[..., None], corr_embs]
+        updater_input_dtype = corr_embs.dtype if torch.is_floating_point(corr_embs) else coords.dtype
+        updater_input: Any = [visibs[..., None].to(dtype=updater_input_dtype), corr_embs]
 
         rel_coords_forward = coords[:, :-1] - coords[:, 1:]
         rel_coords_backward = coords[:, 1:] - coords[:, :-1]
@@ -202,7 +232,7 @@ class PointTracker3D(nn.Module):
             torch.cat([rel_coords_forward, rel_coords_backward], dim=-1),
             min_deg=-2,
             max_deg=14,
-        )
+        ).to(dtype=updater_input_dtype)
         updater_input.append(rel_pos_emb_input)
 
         if self.use_local_pos_input or self.use_uv_input:
@@ -212,7 +242,7 @@ class PointTracker3D(nn.Module):
             ], dim=-1)
             pixel_coords = rearrange(projector(rearrange(coords_with_time, "b t n c -> b (t n) c")), "b (t n) c -> b t n c", t=T)[..., :2]
             normalized_pixel_coords = pixel_coords / torch.tensor([self.image_size[1] - 1, self.image_size[0] - 1], device=pixel_coords.device)
-            pixel_pos_emb_input = posenc(normalized_pixel_coords, min_deg=-2, max_deg=14)
+            pixel_pos_emb_input = posenc(normalized_pixel_coords, min_deg=-2, max_deg=14).to(dtype=updater_input_dtype)
             updater_input.append(pixel_pos_emb_input)
 
         updater_input = torch.cat(updater_input, dim=-1) # (B, T, N, D)
@@ -346,7 +376,6 @@ class PointTracker3D(nn.Module):
         ] # B, N, 4, 4
 
         with torch.autocast(device_type="cuda", enabled=False):
-
             original_ctx.inv_extrinsics = torch.linalg.inv(original_ctx.extrinsics)
             original_ctx.camera_locs = original_ctx.inv_extrinsics[..., :3, 3]
 
@@ -400,32 +429,32 @@ class PointTracker3D(nn.Module):
                     intrinsics=original_ctx.intrinsics,
                     extrinsics=original_ctx.extrinsics,
                 )
-                
-            with record_function("prepare_window"):
-                if "gridpool" in str (type(self.corr_processor)).lower():
-                    assert B == 1, "Gridpool only supports batch size 1"
-                    assert self.norm_mode == "isotropic", "Gridpool only supports isotropic normalization"
-                    corr_ctx = self.corr_processor.prepare_window(  # type: ignore
-                        feats=feats,
-                        camera_locs=normalized_ctx.camera_locs,
-                        pcds=normalized_ctx.pcds,
-                        queries=normalized_ctx.queries,
-                        projector=normalized_ctx.projector,
-                        shared_ctx=shared_corr_ctx,
-                        # this only works for batch size 1
-                        normalizer=lambda x: (x - original_ctx.mean_coords[0, None, :]) / original_ctx.std_coords[0, None, :] * self.norm_scale,
-                    )
-                else:
-                    corr_ctx = self.corr_processor.prepare_window(  # type: ignore
-                        feats=feats,
-                        camera_locs=normalized_ctx.camera_locs,
-                        pcds=normalized_ctx.pcds,
-                        queries=normalized_ctx.queries,
-                        projector=normalized_ctx.projector,
-                        shared_ctx=shared_corr_ctx,
-                    )
 
-            corr_ctx = corr_ctx.time_slice(start=window_start, end=window_end)
+        with record_function("prepare_window"):
+            if "gridpool" in str (type(self.corr_processor)).lower():
+                assert B == 1, "Gridpool only supports batch size 1"
+                assert self.norm_mode == "isotropic", "Gridpool only supports isotropic normalization"
+                corr_ctx = self.corr_processor.prepare_window(  # type: ignore
+                    feats=feats,
+                    camera_locs=normalized_ctx.camera_locs,
+                    pcds=normalized_ctx.pcds,
+                    queries=normalized_ctx.queries,
+                    projector=normalized_ctx.projector,
+                    shared_ctx=shared_corr_ctx,
+                    # this only works for batch size 1
+                    normalizer=lambda x: (x - original_ctx.mean_coords[0, None, :]) / original_ctx.std_coords[0, None, :] * self.norm_scale,
+                )
+            else:
+                corr_ctx = self.corr_processor.prepare_window(  # type: ignore
+                    feats=feats,
+                    camera_locs=normalized_ctx.camera_locs,
+                    pcds=normalized_ctx.pcds,
+                    queries=normalized_ctx.queries,
+                    projector=normalized_ctx.projector,
+                    shared_ctx=shared_corr_ctx,
+                )
+
+        corr_ctx = corr_ctx.time_slice(start=window_start, end=window_end)
 
         for output in self._forward_window(
             coords_init=normalized_ctx.coords_init,
@@ -575,7 +604,13 @@ class PointTracker3D(nn.Module):
         if image_feats is None:
             image_feats = self.encode_rgbs(rgb_obs, chunk_size=chunk_size)
         
-        image_feats = image_feats.to(dtype=torch.float32)
+        if self.precision_mode == TRACKER_PRECISION_MODE_FP32:
+            image_feats = image_feats.to(dtype=torch.float32)
+        elif (
+            self.precision_mode == TRACKER_PRECISION_MODE_DEEP_BF16
+            and image_feats.device.type == "cuda"
+        ):
+            image_feats = image_feats.to(dtype=torch.bfloat16)
 
         query_coords = query_point[..., 1:]
         query_frames = query_point[..., 0].long()

@@ -416,6 +416,61 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 if "traj_query_depth_edge_risk_mask" in data
                 else np.zeros(num_tracks, dtype=bool)
             )
+            traj_query_source_bits = (
+                data["traj_query_source_bits"].astype(np.uint16)
+                if "traj_query_source_bits" in data
+                else np.zeros(num_tracks, dtype=np.uint16)
+            )
+            traj_query_sampler_score = (
+                data["traj_query_sampler_score"].astype(np.float16)
+                if "traj_query_sampler_score" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            )
+            traj_query_risk_bits = (
+                data["traj_query_risk_bits"].astype(np.uint16)
+                if "traj_query_risk_bits" in data
+                else np.zeros(num_tracks, dtype=np.uint16)
+            )
+            traj_query_low_texture_score = (
+                data["traj_query_low_texture_score"].astype(np.float16)
+                if "traj_query_low_texture_score" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            )
+            traj_query_specular_score = (
+                data["traj_query_specular_score"].astype(np.float16)
+                if "traj_query_specular_score" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            )
+            traj_query_depth_edge_score = (
+                data["traj_query_depth_edge_score"].astype(np.float16)
+                if "traj_query_depth_edge_score" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            )
+            traj_query_border_dist_px = (
+                data["traj_query_border_dist_px"].astype(np.uint16)
+                if "traj_query_border_dist_px" in data
+                else np.zeros(num_tracks, dtype=np.uint16)
+            )
+            traj_base_mask = (
+                np.asarray(data["traj_base_mask"]).astype(bool, copy=False)
+                if "traj_base_mask" in data
+                else np.ones(num_tracks, dtype=bool)
+            )
+            traj_query_depth_quality_mask = (
+                np.asarray(data["traj_query_depth_quality_mask"]).astype(bool, copy=False)
+                if "traj_query_depth_quality_mask" in data
+                else np.ones(num_tracks, dtype=bool)
+            )
+            traj_query_depth_keep_mask = (
+                np.asarray(data["traj_query_depth_keep_mask"]).astype(bool, copy=False)
+                if "traj_query_depth_keep_mask" in data
+                else np.ones(num_tracks, dtype=bool)
+            )
+            traj_supervision_support_mask = (
+                np.asarray(data["traj_supervision_support_mask"]).astype(bool, copy=False)
+                if "traj_supervision_support_mask" in data
+                else np.ones(num_tracks, dtype=bool)
+            )
             traj_motion_extent = (
                 data["traj_motion_extent"].astype(np.float16)
                 if "traj_motion_extent" in data
@@ -450,6 +505,26 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 data["traj_manipulator_component_size"].astype(np.uint16)
                 if "traj_manipulator_component_size" in data
                 else np.zeros(num_tracks, dtype=np.uint16)
+            )
+            traj_near_depth_mask = (
+                np.asarray(data["traj_near_depth_mask"]).astype(bool, copy=False)
+                if "traj_near_depth_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            )
+            traj_motion_mask = (
+                np.asarray(data["traj_motion_mask"]).astype(bool, copy=False)
+                if "traj_motion_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            )
+            traj_cluster_mask = (
+                np.asarray(data["traj_cluster_mask"]).astype(bool, copy=False)
+                if "traj_cluster_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            )
+            traj_pre_top95_mask = (
+                np.asarray(data["traj_pre_top95_mask"]).astype(bool, copy=False)
+                if "traj_pre_top95_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
             )
             traj_manipulator_cluster_fallback_used = (
                 bool(np.asarray(data["traj_manipulator_cluster_fallback_used"]).reshape(-1)[0])
@@ -491,6 +566,136 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 if "traj_pick_place_object_mask" in data
                 else np.zeros(num_tracks, dtype=bool)
             )
+            traj_stereo_compare_frame_count = (
+                data["traj_stereo_compare_frame_count"].astype(np.uint16)
+                if "traj_stereo_compare_frame_count" in data
+                else np.zeros(num_tracks, dtype=np.uint16)
+            )
+            traj_stereo_depth_consistency_ratio = (
+                data["traj_stereo_depth_consistency_ratio"].astype(np.float16)
+                if "traj_stereo_depth_consistency_ratio" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            )
+            traj_stereo_patch_error = (
+                data["traj_stereo_patch_error"].astype(np.float16)
+                if "traj_stereo_patch_error" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            )
+            traj_stereo_consistency_mask = (
+                np.asarray(data["traj_stereo_consistency_mask"]).astype(bool, copy=False)
+                if "traj_stereo_consistency_mask" in data
+                else np.ones(num_tracks, dtype=bool)
+            )
+            traj_query_fixed_view_depth_consistency_mask = (
+                np.asarray(data["traj_query_fixed_view_depth_consistency_mask"]).astype(bool, copy=False)
+                if "traj_query_fixed_view_depth_consistency_mask" in data
+                else None
+            )
+            traj_query_fixed_view_depth_anomaly_mask = (
+                np.asarray(data["traj_query_fixed_view_depth_anomaly_mask"]).astype(bool, copy=False)
+                if "traj_query_fixed_view_depth_anomaly_mask" in data
+                else None
+            )
+            traj_query_fixed_view_compare_frame_count = (
+                data["traj_query_fixed_view_compare_frame_count"].astype(np.uint16)
+                if "traj_query_fixed_view_compare_frame_count" in data
+                else None
+            )
+            traj_query_fixed_view_uv_stable_hit_count = (
+                data["traj_query_fixed_view_uv_stable_hit_count"].astype(np.uint16)
+                if "traj_query_fixed_view_uv_stable_hit_count" in data
+                else None
+            )
+            traj_query_fixed_view_depth_jump_hit_count = (
+                data["traj_query_fixed_view_depth_jump_hit_count"].astype(np.uint16)
+                if "traj_query_fixed_view_depth_jump_hit_count" in data
+                else None
+            )
+            traj_query_fixed_view_depth_anomaly_hit_count = (
+                data["traj_query_fixed_view_depth_anomaly_hit_count"].astype(np.uint16)
+                if "traj_query_fixed_view_depth_anomaly_hit_count" in data
+                else None
+            )
+            traj_query_fixed_view_first_anomaly_step = (
+                data["traj_query_fixed_view_first_anomaly_step"].astype(np.int16)
+                if "traj_query_fixed_view_first_anomaly_step" in data
+                else None
+            )
+            traj_query_fixed_view_max_depth_delta_m = (
+                data["traj_query_fixed_view_max_depth_delta_m"].astype(np.float16)
+                if "traj_query_fixed_view_max_depth_delta_m" in data
+                else None
+            )
+            traj_query_fixed_view_min_uv_delta_px = (
+                data["traj_query_fixed_view_min_uv_delta_px"].astype(np.float16)
+                if "traj_query_fixed_view_min_uv_delta_px" in data
+                else None
+            )
+            traj_query_visibility_reliable_mask = (
+                np.asarray(data["traj_query_visibility_reliable_mask"]).astype(bool, copy=False)
+                if "traj_query_visibility_reliable_mask" in data
+                else None
+            )
+            traj_query_visibility_removed_mask = (
+                np.asarray(data["traj_query_visibility_removed_mask"]).astype(bool, copy=False)
+                if "traj_query_visibility_removed_mask" in data
+                else None
+            )
+            traj_query_visibility_future_visible_ratio = (
+                data["traj_query_visibility_future_visible_ratio"].astype(np.float16)
+                if "traj_query_visibility_future_visible_ratio" in data
+                else None
+            )
+            traj_query_visibility_first_invalid_step = (
+                data["traj_query_visibility_first_invalid_step"].astype(np.int16)
+                if "traj_query_visibility_first_invalid_step" in data
+                else None
+            )
+            traj_uvd_gate_reliable_mask = (
+                np.asarray(data["traj_uvd_gate_reliable_mask"]).astype(bool, copy=False)
+                if "traj_uvd_gate_reliable_mask" in data
+                else None
+            )
+            traj_uvd_gate_removed_mask = (
+                np.asarray(data["traj_uvd_gate_removed_mask"]).astype(bool, copy=False)
+                if "traj_uvd_gate_removed_mask" in data
+                else None
+            )
+            traj_uvd_gate_uv_depth_anomaly_mask = (
+                np.asarray(data["traj_uvd_gate_uv_depth_anomaly_mask"]).astype(bool, copy=False)
+                if "traj_uvd_gate_uv_depth_anomaly_mask" in data
+                else None
+            )
+            traj_uvd_gate_far_depth_mask = (
+                np.asarray(data["traj_uvd_gate_far_depth_mask"]).astype(bool, copy=False)
+                if "traj_uvd_gate_far_depth_mask" in data
+                else None
+            )
+            traj_uvd_gate_uv_mean_delta_px = (
+                data["traj_uvd_gate_uv_mean_delta_px"].astype(np.float16)
+                if "traj_uvd_gate_uv_mean_delta_px" in data
+                else None
+            )
+            traj_uvd_gate_depth_delta_std_m = (
+                data["traj_uvd_gate_depth_delta_std_m"].astype(np.float16)
+                if "traj_uvd_gate_depth_delta_std_m" in data
+                else None
+            )
+            traj_uvd_gate_max_depth_m = (
+                data["traj_uvd_gate_max_depth_m"].astype(np.float16)
+                if "traj_uvd_gate_max_depth_m" in data
+                else None
+            )
+            traj_uvd_gate_uv_pair_valid_count = (
+                data["traj_uvd_gate_uv_pair_valid_count"].astype(np.uint16)
+                if "traj_uvd_gate_uv_pair_valid_count" in data
+                else None
+            )
+            traj_uvd_gate_depth_pair_valid_count = (
+                data["traj_uvd_gate_depth_pair_valid_count"].astype(np.uint16)
+                if "traj_uvd_gate_depth_pair_valid_count" in data
+                else None
+            )
             valid_steps = (
                 np.asarray(data["valid_steps"]).astype(bool, copy=False)
                 if "valid_steps" in data
@@ -525,6 +730,17 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 "traj_query_depth_patch_valid_ratio": traj_query_depth_patch_valid_ratio,
                 "traj_query_depth_patch_std": traj_query_depth_patch_std,
                 "traj_query_depth_edge_risk_mask": traj_query_depth_edge_risk_mask,
+                "traj_query_source_bits": traj_query_source_bits,
+                "traj_query_sampler_score": traj_query_sampler_score,
+                "traj_query_risk_bits": traj_query_risk_bits,
+                "traj_query_low_texture_score": traj_query_low_texture_score,
+                "traj_query_specular_score": traj_query_specular_score,
+                "traj_query_depth_edge_score": traj_query_depth_edge_score,
+                "traj_query_border_dist_px": traj_query_border_dist_px,
+                "traj_base_mask": traj_base_mask,
+                "traj_query_depth_quality_mask": traj_query_depth_quality_mask,
+                "traj_query_depth_keep_mask": traj_query_depth_keep_mask,
+                "traj_supervision_support_mask": traj_supervision_support_mask,
                 "traj_motion_extent": traj_motion_extent,
                 "traj_motion_step_median": traj_motion_step_median,
                 "traj_motion_extent_all_valid": traj_motion_extent_all_valid,
@@ -532,6 +748,10 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 "traj_manipulator_candidate_mask": traj_manipulator_candidate_mask,
                 "traj_manipulator_cluster_id": traj_manipulator_cluster_id,
                 "traj_manipulator_component_size": traj_manipulator_component_size,
+                "traj_near_depth_mask": traj_near_depth_mask,
+                "traj_motion_mask": traj_motion_mask,
+                "traj_cluster_mask": traj_cluster_mask,
+                "traj_pre_top95_mask": traj_pre_top95_mask,
                 "traj_manipulator_cluster_fallback_used": traj_manipulator_cluster_fallback_used,
                 "traj_pick_place_heatmap_hit_count": traj_pick_place_heatmap_hit_count,
                 "traj_pick_place_heatmap_support_mask": traj_pick_place_heatmap_support_mask,
@@ -540,6 +760,32 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 "traj_pick_place_depth_guard_mask": traj_pick_place_depth_guard_mask,
                 "traj_pick_place_delayed_contact_rescue_mask": traj_pick_place_delayed_contact_rescue_mask,
                 "traj_pick_place_object_mask": traj_pick_place_object_mask,
+                "traj_stereo_compare_frame_count": traj_stereo_compare_frame_count,
+                "traj_stereo_depth_consistency_ratio": traj_stereo_depth_consistency_ratio,
+                "traj_stereo_patch_error": traj_stereo_patch_error,
+                "traj_stereo_consistency_mask": traj_stereo_consistency_mask,
+                "traj_query_fixed_view_depth_consistency_mask": traj_query_fixed_view_depth_consistency_mask,
+                "traj_query_fixed_view_depth_anomaly_mask": traj_query_fixed_view_depth_anomaly_mask,
+                "traj_query_fixed_view_compare_frame_count": traj_query_fixed_view_compare_frame_count,
+                "traj_query_fixed_view_uv_stable_hit_count": traj_query_fixed_view_uv_stable_hit_count,
+                "traj_query_fixed_view_depth_jump_hit_count": traj_query_fixed_view_depth_jump_hit_count,
+                "traj_query_fixed_view_depth_anomaly_hit_count": traj_query_fixed_view_depth_anomaly_hit_count,
+                "traj_query_fixed_view_first_anomaly_step": traj_query_fixed_view_first_anomaly_step,
+                "traj_query_fixed_view_max_depth_delta_m": traj_query_fixed_view_max_depth_delta_m,
+                "traj_query_fixed_view_min_uv_delta_px": traj_query_fixed_view_min_uv_delta_px,
+                "traj_query_visibility_reliable_mask": traj_query_visibility_reliable_mask,
+                "traj_query_visibility_removed_mask": traj_query_visibility_removed_mask,
+                "traj_query_visibility_future_visible_ratio": traj_query_visibility_future_visible_ratio,
+                "traj_query_visibility_first_invalid_step": traj_query_visibility_first_invalid_step,
+                "traj_uvd_gate_reliable_mask": traj_uvd_gate_reliable_mask,
+                "traj_uvd_gate_removed_mask": traj_uvd_gate_removed_mask,
+                "traj_uvd_gate_uv_depth_anomaly_mask": traj_uvd_gate_uv_depth_anomaly_mask,
+                "traj_uvd_gate_far_depth_mask": traj_uvd_gate_far_depth_mask,
+                "traj_uvd_gate_uv_mean_delta_px": traj_uvd_gate_uv_mean_delta_px,
+                "traj_uvd_gate_depth_delta_std_m": traj_uvd_gate_depth_delta_std_m,
+                "traj_uvd_gate_max_depth_m": traj_uvd_gate_max_depth_m,
+                "traj_uvd_gate_uv_pair_valid_count": traj_uvd_gate_uv_pair_valid_count,
+                "traj_uvd_gate_depth_pair_valid_count": traj_uvd_gate_depth_pair_valid_count,
                 "valid_steps": valid_steps,
                 "frame_aligned": frame_aligned,
             }
@@ -676,6 +922,61 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 if "traj_query_depth_edge_risk_mask" in data
                 else np.zeros(num_tracks, dtype=bool)
             ),
+            "traj_query_source_bits": (
+                data["traj_query_source_bits"].astype(np.uint16)
+                if "traj_query_source_bits" in data
+                else np.zeros(num_tracks, dtype=np.uint16)
+            ),
+            "traj_query_sampler_score": (
+                data["traj_query_sampler_score"].astype(np.float16)
+                if "traj_query_sampler_score" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            ),
+            "traj_query_risk_bits": (
+                data["traj_query_risk_bits"].astype(np.uint16)
+                if "traj_query_risk_bits" in data
+                else np.zeros(num_tracks, dtype=np.uint16)
+            ),
+            "traj_query_low_texture_score": (
+                data["traj_query_low_texture_score"].astype(np.float16)
+                if "traj_query_low_texture_score" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            ),
+            "traj_query_specular_score": (
+                data["traj_query_specular_score"].astype(np.float16)
+                if "traj_query_specular_score" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            ),
+            "traj_query_depth_edge_score": (
+                data["traj_query_depth_edge_score"].astype(np.float16)
+                if "traj_query_depth_edge_score" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            ),
+            "traj_query_border_dist_px": (
+                data["traj_query_border_dist_px"].astype(np.uint16)
+                if "traj_query_border_dist_px" in data
+                else np.zeros(num_tracks, dtype=np.uint16)
+            ),
+            "traj_base_mask": (
+                np.asarray(data["traj_base_mask"]).astype(bool, copy=False)
+                if "traj_base_mask" in data
+                else np.ones(num_tracks, dtype=bool)
+            ),
+            "traj_query_depth_quality_mask": (
+                np.asarray(data["traj_query_depth_quality_mask"]).astype(bool, copy=False)
+                if "traj_query_depth_quality_mask" in data
+                else np.ones(num_tracks, dtype=bool)
+            ),
+            "traj_query_depth_keep_mask": (
+                np.asarray(data["traj_query_depth_keep_mask"]).astype(bool, copy=False)
+                if "traj_query_depth_keep_mask" in data
+                else np.ones(num_tracks, dtype=bool)
+            ),
+            "traj_supervision_support_mask": (
+                np.asarray(data["traj_supervision_support_mask"]).astype(bool, copy=False)
+                if "traj_supervision_support_mask" in data
+                else np.ones(num_tracks, dtype=bool)
+            ),
             "traj_motion_extent": (
                 data["traj_motion_extent"].astype(np.float16)
                 if "traj_motion_extent" in data
@@ -710,6 +1011,26 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 data["traj_manipulator_component_size"].astype(np.uint16)
                 if "traj_manipulator_component_size" in data
                 else np.zeros(num_tracks, dtype=np.uint16)
+            ),
+            "traj_near_depth_mask": (
+                np.asarray(data["traj_near_depth_mask"]).astype(bool, copy=False)
+                if "traj_near_depth_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            ),
+            "traj_motion_mask": (
+                np.asarray(data["traj_motion_mask"]).astype(bool, copy=False)
+                if "traj_motion_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            ),
+            "traj_cluster_mask": (
+                np.asarray(data["traj_cluster_mask"]).astype(bool, copy=False)
+                if "traj_cluster_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
+            ),
+            "traj_pre_top95_mask": (
+                np.asarray(data["traj_pre_top95_mask"]).astype(bool, copy=False)
+                if "traj_pre_top95_mask" in data
+                else np.zeros(num_tracks, dtype=bool)
             ),
             "traj_manipulator_cluster_fallback_used": (
                 bool(np.asarray(data["traj_manipulator_cluster_fallback_used"]).reshape(-1)[0])
@@ -750,6 +1071,136 @@ def normalize_sample_data(sample_path: str | Path) -> dict[str, Any]:
                 np.asarray(data["traj_pick_place_object_mask"]).astype(bool, copy=False)
                 if "traj_pick_place_object_mask" in data
                 else np.zeros(num_tracks, dtype=bool)
+            ),
+            "traj_stereo_compare_frame_count": (
+                data["traj_stereo_compare_frame_count"].astype(np.uint16)
+                if "traj_stereo_compare_frame_count" in data
+                else np.zeros(num_tracks, dtype=np.uint16)
+            ),
+            "traj_stereo_depth_consistency_ratio": (
+                data["traj_stereo_depth_consistency_ratio"].astype(np.float16)
+                if "traj_stereo_depth_consistency_ratio" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            ),
+            "traj_stereo_patch_error": (
+                data["traj_stereo_patch_error"].astype(np.float16)
+                if "traj_stereo_patch_error" in data
+                else np.full(num_tracks, np.nan, dtype=np.float16)
+            ),
+            "traj_stereo_consistency_mask": (
+                np.asarray(data["traj_stereo_consistency_mask"]).astype(bool, copy=False)
+                if "traj_stereo_consistency_mask" in data
+                else np.ones(num_tracks, dtype=bool)
+            ),
+            "traj_query_fixed_view_depth_consistency_mask": (
+                np.asarray(data["traj_query_fixed_view_depth_consistency_mask"]).astype(bool, copy=False)
+                if "traj_query_fixed_view_depth_consistency_mask" in data
+                else None
+            ),
+            "traj_query_fixed_view_depth_anomaly_mask": (
+                np.asarray(data["traj_query_fixed_view_depth_anomaly_mask"]).astype(bool, copy=False)
+                if "traj_query_fixed_view_depth_anomaly_mask" in data
+                else None
+            ),
+            "traj_query_fixed_view_compare_frame_count": (
+                data["traj_query_fixed_view_compare_frame_count"].astype(np.uint16)
+                if "traj_query_fixed_view_compare_frame_count" in data
+                else None
+            ),
+            "traj_query_fixed_view_uv_stable_hit_count": (
+                data["traj_query_fixed_view_uv_stable_hit_count"].astype(np.uint16)
+                if "traj_query_fixed_view_uv_stable_hit_count" in data
+                else None
+            ),
+            "traj_query_fixed_view_depth_jump_hit_count": (
+                data["traj_query_fixed_view_depth_jump_hit_count"].astype(np.uint16)
+                if "traj_query_fixed_view_depth_jump_hit_count" in data
+                else None
+            ),
+            "traj_query_fixed_view_depth_anomaly_hit_count": (
+                data["traj_query_fixed_view_depth_anomaly_hit_count"].astype(np.uint16)
+                if "traj_query_fixed_view_depth_anomaly_hit_count" in data
+                else None
+            ),
+            "traj_query_fixed_view_first_anomaly_step": (
+                data["traj_query_fixed_view_first_anomaly_step"].astype(np.int16)
+                if "traj_query_fixed_view_first_anomaly_step" in data
+                else None
+            ),
+            "traj_query_fixed_view_max_depth_delta_m": (
+                data["traj_query_fixed_view_max_depth_delta_m"].astype(np.float16)
+                if "traj_query_fixed_view_max_depth_delta_m" in data
+                else None
+            ),
+            "traj_query_fixed_view_min_uv_delta_px": (
+                data["traj_query_fixed_view_min_uv_delta_px"].astype(np.float16)
+                if "traj_query_fixed_view_min_uv_delta_px" in data
+                else None
+            ),
+            "traj_query_visibility_reliable_mask": (
+                np.asarray(data["traj_query_visibility_reliable_mask"]).astype(bool, copy=False)
+                if "traj_query_visibility_reliable_mask" in data
+                else None
+            ),
+            "traj_query_visibility_removed_mask": (
+                np.asarray(data["traj_query_visibility_removed_mask"]).astype(bool, copy=False)
+                if "traj_query_visibility_removed_mask" in data
+                else None
+            ),
+            "traj_query_visibility_future_visible_ratio": (
+                data["traj_query_visibility_future_visible_ratio"].astype(np.float16)
+                if "traj_query_visibility_future_visible_ratio" in data
+                else None
+            ),
+            "traj_query_visibility_first_invalid_step": (
+                data["traj_query_visibility_first_invalid_step"].astype(np.int16)
+                if "traj_query_visibility_first_invalid_step" in data
+                else None
+            ),
+            "traj_uvd_gate_reliable_mask": (
+                np.asarray(data["traj_uvd_gate_reliable_mask"]).astype(bool, copy=False)
+                if "traj_uvd_gate_reliable_mask" in data
+                else None
+            ),
+            "traj_uvd_gate_removed_mask": (
+                np.asarray(data["traj_uvd_gate_removed_mask"]).astype(bool, copy=False)
+                if "traj_uvd_gate_removed_mask" in data
+                else None
+            ),
+            "traj_uvd_gate_uv_depth_anomaly_mask": (
+                np.asarray(data["traj_uvd_gate_uv_depth_anomaly_mask"]).astype(bool, copy=False)
+                if "traj_uvd_gate_uv_depth_anomaly_mask" in data
+                else None
+            ),
+            "traj_uvd_gate_far_depth_mask": (
+                np.asarray(data["traj_uvd_gate_far_depth_mask"]).astype(bool, copy=False)
+                if "traj_uvd_gate_far_depth_mask" in data
+                else None
+            ),
+            "traj_uvd_gate_uv_mean_delta_px": (
+                data["traj_uvd_gate_uv_mean_delta_px"].astype(np.float16)
+                if "traj_uvd_gate_uv_mean_delta_px" in data
+                else None
+            ),
+            "traj_uvd_gate_depth_delta_std_m": (
+                data["traj_uvd_gate_depth_delta_std_m"].astype(np.float16)
+                if "traj_uvd_gate_depth_delta_std_m" in data
+                else None
+            ),
+            "traj_uvd_gate_max_depth_m": (
+                data["traj_uvd_gate_max_depth_m"].astype(np.float16)
+                if "traj_uvd_gate_max_depth_m" in data
+                else None
+            ),
+            "traj_uvd_gate_uv_pair_valid_count": (
+                data["traj_uvd_gate_uv_pair_valid_count"].astype(np.uint16)
+                if "traj_uvd_gate_uv_pair_valid_count" in data
+                else None
+            ),
+            "traj_uvd_gate_depth_pair_valid_count": (
+                data["traj_uvd_gate_depth_pair_valid_count"].astype(np.uint16)
+                if "traj_uvd_gate_depth_pair_valid_count" in data
+                else None
             ),
             "valid_steps": valid_steps,
             "frame_aligned": frame_aligned,
