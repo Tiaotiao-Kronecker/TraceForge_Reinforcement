@@ -11,6 +11,8 @@
 
 ## 历史调查与修正
 
+- [tracker_precision_real_case_ab_regression_2026-04-13.md](tracker_precision_real_case_ab_regression_2026-04-13.md)
+- [tracker_bf16_minimal_env_and_support_zero_2026-04-13.md](tracker_bf16_minimal_env_and_support_zero_2026-04-13.md)
 - [external_only_speed_reassessment_2026-04-07.md](external_only_speed_reassessment_2026-04-07.md)
 - [tracker_precision_note_2026-04-12.md](tracker_precision_note_2026-04-12.md)
 - [support_grid_zero_resize320_grid160_rebenchmark_2026-04-10.md](support_grid_zero_resize320_grid160_rebenchmark_2026-04-10.md)
@@ -39,6 +41,14 @@
 - [press_one_button_demo_v5_camera3_tail_empty_root_cause_2026-03-24.md](press_one_button_demo_v5_camera3_tail_empty_root_cause_2026-03-24.md)
 - [pick_place_wrist_pick_place_history_2026-03-26.md](pick_place_wrist_pick_place_history_2026-03-26.md)
 - [drift_patch_classification_analysis_2026-03-28.md](drift_patch_classification_analysis_2026-03-28.md)
+- [xperience_egocentric_stereo_checkpoint_2026-04-08.md](xperience_egocentric_stereo_checkpoint_2026-04-08.md)
+- [xperience_stereo_left_false_traj_plan_2026-04-10.md](xperience_stereo_left_false_traj_plan_2026-04-10.md)
+- [xperience_external_geometry_wobble_upstream_analysis_2026-04-10.md](xperience_external_geometry_wobble_upstream_analysis_2026-04-10.md)
+- [xperience_external_geometry_control_experiments_2026-04-10.md](xperience_external_geometry_control_experiments_2026-04-10.md)
+- [xperience_inference_query_depth_stabilization_and_tracker_interaction_2026-04-10.md](xperience_inference_query_depth_stabilization_and_tracker_interaction_2026-04-10.md)
+- [xperience_stereo_left_conclusions_checkpoint_2026-04-10.md](xperience_stereo_left_conclusions_checkpoint_2026-04-10.md)
+- [xperience_mature_baseline_root_cause_plan_2026-04-10.md](xperience_mature_baseline_root_cause_plan_2026-04-10.md)
+- [xperience_qvis_near_exempt_2026-04-16.md](xperience_qvis_near_exempt_2026-04-16.md)
 
 ## 当前保留的本地对比产物
 
@@ -59,6 +69,9 @@
 - `data_tmp/mcap_v1_wrist_pick_place_10cases_20260325_visualization`
 - `data_tmp/mcap_v1_wrist_pick_place_10cases_20260326_rerun_gpu`
 - `data_tmp/mcap_v1_wrist_pick_place_10cases_20260326_rerun_gpu_visualization`
+- `data_tmp/xperience_sample_analysis`
+- `data_tmp/xperience_sample_runs_20260402`
+- `data_tmp/xperience_traceforge_attempt_20260402`
 
 ## 根目录遗留项说明
 

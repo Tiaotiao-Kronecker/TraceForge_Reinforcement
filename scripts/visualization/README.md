@@ -12,6 +12,10 @@
   - 逐时间步播放 keypoint 轨迹
   - 支持 `v2` 和 `legacy`
   - `--episode_dir` 实际上传入的是 camera output root，例如 `<episode>/trajectory/varied_camera_3`
+- `visualize_4d_reconstruction.py`
+  - 聚合一个 camera 目录下所有 sample NPZ 的 world-space 轨迹点
+  - 支持 `All Pixels Tracking / Point Cloud / Both` 三种交互模式
+  - 可同时浏览动态 dense point cloud、当前 RGB 帧和相机 frustum
 - `visualize_3d_keypoint_comparison.py`
   - 同时读取 baseline / variant 两个 episode output
   - 把 `baseline-only / overlap / variant-only` 三类轨迹叠在一个 3D 视图里

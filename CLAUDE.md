@@ -96,6 +96,24 @@ python checker/batch_process_result_checker_3d.py <output_dir> --max-videos 1 --
 python checker/batch_process_result_checker.py <output_dir> --max-videos 1 --max-samples 3
 ```
 
+### ORB-SLAM3 RGB-D Mature Baseline
+```bash
+# Project-local ORB-SLAM3 environment
+source /opt/conda/etc/profile.d/conda.sh
+conda activate /DATA/disk2/wangchen/projects/TraceForge_Reinforcement_xperience/.conda_envs/orbslam3
+cd /DATA/disk2/wangchen/projects/TraceForge_Reinforcement_xperience/third_party/orbslam3_src/build
+make -j1 rgbd_tum
+
+# One-case ORB-SLAM3 RGB-D baseline
+/DATA/disk2/wangchen/projects/TraceForge_Reinforcement/.venv/bin/python \
+    scripts/data_analysis/run_orbslam3_rgbd_case.py \
+    --case_dir <case_dir> \
+    --camera_name stereo_left
+```
+
+The helper writes `depth_png/`, `associate.txt`, a generated ORB settings YAML, `CameraTrajectory.txt`,
+and `geom/geom_<camera>_orbslam3_rgbd_w2c.npz`. The bundled `rgbd_tum` is patched for headless offline runs.
+
 ### VLM Instruction Generation
 ```bash
 cd text_generation/
@@ -156,8 +174,13 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 - The maintained batch entry no longer exposes `--frame_drop_rate`, `--horizon`, or `--max_frames_per_video`
 - To request a fixed per-second keyframe count in batch mode, set `keyframes_per_sec_min == keyframes_per_sec_max`
 - Batch and benchmark entrypoints no longer hardcode maintained camera names; pass `--camera_names` / `--camera-names` explicitly, and only those cameras are processed
-- Other maintained defaults still cover `depth_pose_method=external`, `external_geom_name=trajectory_valid.h5`, `fps=1`, `max_num_frames=512`, `future_len=32`, `num_iters=3`, `grid_size=80`, `filter_level=standard`, and `traj_filter_profile=external`
-- Latest maintained external-only reference: `wipe_the_table_gs` median3 (`support_grid_ratio=0.8`, `varied_camera_1,varied_camera_2`, 2026-04-08) showed `num_iters=3` at about `1.52x` total-speedup vs `5`, with only mild systematic drift relative to `5` and no obvious extreme-case outliers; keep the maintained default throughput-first at `3`, while treating `num_iters=4` as the safer sanity-check fallback for new datasets or suspicious cases
+- Other maintained defaults still cover `depth_pose_method=external`, `external_geom_name=trajectory_valid.h5`, `fps=1`, `max_num_frames=512`, `future_len=32`, `num_iters=3`, `grid_size=80`, `query_sampler_mode=grid`, `support_grid_ratio=0.0`, `filter_level=none`, and `traj_filter_profile=external`
+- `--tracker_precision_mode=fp32` remains the maintained default; `autocast_bf16` and `deep_bf16` are available as explicit experimental tracker-only precision modes for throughput/quality A/B work
+- The current local branch also trims the top/left/right `30` query-grid units plus the bottom `10` query-grid units by default, to suppress recurrent edge artifacts without using post-track filtering
+- The maintained path now disables outer support points by default (`support_grid_ratio=0.0`); the 2026-04-08 `wipe_the_table_gs` median3 run with `support_grid_ratio=0.8` remains a historical support-enabled reference for throughput/quality tradeoff, while `num_iters=3` stays the maintained throughput-first default and `num_iters=4` remains the safer sanity-check fallback for new datasets or suspicious cases
+- The maintained path now also enables a pre-track future-visibility gate by default (`query_visibility_gate_mode=all_future_v1`): query seeds are lifted from the first frame into world coordinates and dropped before tracker forward if any later frame projects them out of the valid view
+- The maintained path now also enables a pre-track fixed-view depth gate by default (`query_fixed_view_depth_gate_mode=first_frame_uvd_v1`): if a query seed stays within `1 px` in the first-frame view while its reprojected first-frame depth changes by more than `0.1 m`, the seed is marked unreliable and skipped before tracker forward
+- The maintained path now also enables a post-track `traj_uvz` gate by default (`traj_uvd_gate_mode=delta_uv_depth_v1`): tracks are removed from the final valid mask when their mean uv motion stays below `3 px` while depth-step std exceeds `0.01 m`, or when their max tracked depth exceeds `1.5 m`
 - Next throughput-optimization backlog should target tracker forward rather than depth-filter: first try removing unnecessary CUDA synchronizations when `collect_profile_stats=False`, then profile low-risk same-semantics candidates such as hoisting repeated ROI/support-query prep out of the hot path, evaluating `torch.compile` / CUDA graph / TF32 on the maintained external-only benchmark, and trimming avoidable `clone` / `permute` / temporary-tensor churn in the tracker wrapper
 - `batch_infer_press_one_button_demo.py` writes in-place to `<episode>/trajectory/<camera_name>/...` by default; passing `--out_dir` switches the root to `<out_dir>/<episode>/<camera_name>/...`
 - `--telemetry_out_dir` decouples structured telemetry from artifact output: when set, `_batch_run_summary.json` and JSONL telemetry files are written there even if artifacts are still written in-place
@@ -186,7 +209,7 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 
 **Keypoint Sampling**:
 - `--grid_size N`: Samples N×N keypoints per frame (e.g., 20 = 400 points, 80 = 6400 points)
-- `support_grid_size` auto-scales to `grid_size × 0.8`
+- `support_grid_size` auto-scales to `round(grid_size × support_grid_ratio)`; the maintained default `support_grid_ratio=0.0` disables outer support points unless explicitly requested
 - Higher grid_size increases computation time and memory usage
 
 **Scan Depth Parameter**:
