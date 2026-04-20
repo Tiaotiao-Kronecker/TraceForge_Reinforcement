@@ -110,6 +110,21 @@ class AggregatedTracks:
     total_secondary_points: int
     total_primary_segments: int
     total_secondary_segments: int
+    raw_max_points_per_frame: int
+    raw_max_segments_per_frame: int
+    available_full_segments: int
+    applied_max_points_per_frame: int
+    applied_max_segments_per_frame: int
+    applied_max_full_segments: int
+
+
+@dataclass(frozen=True)
+class AggregationSettings:
+    query_stride: int
+    track_stride: int
+    max_points_ratio: float
+    max_segments_ratio: float
+    max_full_segments_ratio: float
 
 
 @dataclass(frozen=True)
@@ -117,6 +132,7 @@ class DisplaySettings:
     track_downsample: int
     dense_downsample: int
     trail_downsample: int
+    trajectory_display_ratio: float
     trail_mode: str
     fade_trails: bool
     fade_frames: int
@@ -207,6 +223,36 @@ def downsample_frame_lines(line_set: FrameLineSet, stride: int) -> FrameLineSet:
     )
 
 
+def limit_frame_points_by_ratio(point_set: FramePointSet, ratio: float) -> FramePointSet:
+    ratio = float(np.clip(ratio, 0.0, 1.0))
+    if ratio >= 0.999 or len(point_set.points) <= 1:
+        return point_set
+    keep_count = max(int(math.ceil(len(point_set.points) * ratio)), 1)
+    indices = deterministic_sample_indices(len(point_set.points), keep_count)
+    return FramePointSet(
+        points=point_set.points[indices].astype(np.float32, copy=False),
+        colors=point_set.colors[indices],
+        seed_border_dist_px=point_set.seed_border_dist_px[indices].astype(np.float32, copy=False),
+        in_bounds_ratio=point_set.in_bounds_ratio[indices].astype(np.float32, copy=False),
+        max_uv_step_px=point_set.max_uv_step_px[indices].astype(np.float32, copy=False),
+    )
+
+
+def limit_frame_lines_by_ratio(line_set: FrameLineSet, ratio: float) -> FrameLineSet:
+    ratio = float(np.clip(ratio, 0.0, 1.0))
+    if ratio >= 0.999 or len(line_set.segments) <= 1:
+        return line_set
+    keep_count = max(int(math.ceil(len(line_set.segments) * ratio)), 1)
+    indices = deterministic_sample_indices(len(line_set.segments), keep_count)
+    return FrameLineSet(
+        segments=line_set.segments[indices].astype(np.float32, copy=False),
+        colors=line_set.colors[indices],
+        seed_border_dist_px=line_set.seed_border_dist_px[indices].astype(np.float32, copy=False),
+        in_bounds_ratio=line_set.in_bounds_ratio[indices].astype(np.float32, copy=False),
+        max_uv_step_px=line_set.max_uv_step_px[indices].astype(np.float32, copy=False),
+    )
+
+
 def get_track_colors(seed_points: np.ndarray, colormap: str = "turbo") -> np.ndarray:
     if len(seed_points) == 0:
         return np.zeros((0, 3), dtype=np.float32)
@@ -263,6 +309,25 @@ def deterministic_sample_indices(length: int, max_items: int) -> np.ndarray:
         return np.arange(length, dtype=np.int32)
     stride = int(math.ceil(length / float(max_items)))
     return np.arange(0, length, stride, dtype=np.int32)[:max_items]
+
+
+def resolve_count_cap_from_ratio(raw_max_count: int, ratio: float | None, fallback_cap: int) -> int:
+    raw_max_count = max(int(raw_max_count), 0)
+    if ratio is None:
+        return max(int(fallback_cap), 1)
+    if raw_max_count <= 0:
+        return 1
+    ratio = float(np.clip(ratio, 0.0, 1.0))
+    return max(int(math.ceil(raw_max_count * ratio)), 1)
+
+
+def resolve_ratio_percent_from_cap(applied_cap: int, raw_max_count: int) -> int:
+    raw_max_count = max(int(raw_max_count), 0)
+    applied_cap = max(int(applied_cap), 1)
+    if raw_max_count <= 0:
+        return 100
+    ratio = min(float(applied_cap) / float(raw_max_count), 1.0)
+    return int(np.clip(round(ratio * 100.0), 1, 100))
 
 
 def concat_frame_chunks(
@@ -621,6 +686,8 @@ def build_display_lines_for_frame(
     secondary_lines = filter_frame_lines(secondary_lines, settings)
     primary_lines = downsample_frame_lines(primary_lines, int(settings.trail_downsample))
     secondary_lines = downsample_frame_lines(secondary_lines, int(settings.trail_downsample))
+    primary_lines = limit_frame_lines_by_ratio(primary_lines, float(settings.trajectory_display_ratio))
+    secondary_lines = limit_frame_lines_by_ratio(secondary_lines, float(settings.trajectory_display_ratio))
     return primary_lines, secondary_lines
 
 
@@ -635,6 +702,8 @@ def build_display_frame_data(
     secondary = filter_frame_points(aggregated.secondary_by_frame[int(frame_idx)], settings)
     primary = downsample_frame_points(primary, int(settings.track_downsample))
     secondary = downsample_frame_points(secondary, int(settings.track_downsample))
+    primary = limit_frame_points_by_ratio(primary, float(settings.trajectory_display_ratio))
+    secondary = limit_frame_points_by_ratio(secondary, float(settings.trajectory_display_ratio))
     primary_lines, secondary_lines = build_display_lines_for_frame(
         aggregated=aggregated,
         frame_idx=int(frame_idx),
@@ -673,6 +742,9 @@ def aggregate_tracked_points(
     max_segments_per_frame: int,
     max_full_segments: int,
     color_mode: str,
+    max_points_ratio: float | None = None,
+    max_segments_ratio: float | None = None,
+    max_full_segments_ratio: float | None = None,
 ) -> AggregatedTracks:
     video_name = episode_dir.name
     query_frames_all = list_sample_query_frames(episode_dir, video_name)
@@ -856,6 +928,24 @@ def aggregate_tracked_points(
                         np.full((len(seg),), int(frame_idx), dtype=np.int32)
                     )
 
+    raw_primary_points_per_frame = [sum(len(chunk) for chunk in frame_chunks) for frame_chunks in primary_points]
+    raw_secondary_points_per_frame = [sum(len(chunk) for chunk in frame_chunks) for frame_chunks in secondary_points]
+    raw_primary_segments_per_frame = [sum(len(chunk) for chunk in frame_chunks) for frame_chunks in primary_segments]
+    raw_secondary_segments_per_frame = [sum(len(chunk) for chunk in frame_chunks) for frame_chunks in secondary_segments]
+    raw_max_points_per_frame = max([0, *raw_primary_points_per_frame, *raw_secondary_points_per_frame])
+    raw_max_segments_per_frame = max([0, *raw_primary_segments_per_frame, *raw_secondary_segments_per_frame])
+
+    applied_max_points_per_frame = resolve_count_cap_from_ratio(
+        raw_max_points_per_frame,
+        max_points_ratio,
+        max_points_per_frame,
+    )
+    applied_max_segments_per_frame = resolve_count_cap_from_ratio(
+        raw_max_segments_per_frame,
+        max_segments_ratio,
+        max_segments_per_frame,
+    )
+
     primary_by_frame = [
         concat_frame_chunks(
             primary_points[idx],
@@ -863,7 +953,7 @@ def aggregate_tracked_points(
             primary_seed_border_dist[idx],
             primary_in_bounds_ratio[idx],
             primary_max_uv_step[idx],
-            max_points=max_points_per_frame,
+            max_points=applied_max_points_per_frame,
         )
         for idx in range(total_frames)
     ]
@@ -874,7 +964,7 @@ def aggregate_tracked_points(
             secondary_seed_border_dist[idx],
             secondary_in_bounds_ratio[idx],
             secondary_max_uv_step[idx],
-            max_points=max_points_per_frame,
+            max_points=applied_max_points_per_frame,
         )
         for idx in range(total_frames)
     ]
@@ -890,7 +980,7 @@ def aggregate_tracked_points(
             primary_segment_seed_border_dist[idx],
             primary_segment_in_bounds_ratio[idx],
             primary_segment_max_uv_step[idx],
-            max_segments=max_segments_per_frame,
+            max_segments=applied_max_segments_per_frame,
         )
         secondary_line_set, secondary_times = concat_timed_line_chunks(
             secondary_segments[idx],
@@ -899,12 +989,21 @@ def aggregate_tracked_points(
             secondary_segment_seed_border_dist[idx],
             secondary_segment_in_bounds_ratio[idx],
             secondary_segment_max_uv_step[idx],
-            max_segments=max_segments_per_frame,
+            max_segments=applied_max_segments_per_frame,
         )
         primary_lines_by_frame.append(primary_line_set)
         primary_line_times_by_frame.append(primary_times)
         secondary_lines_by_frame.append(secondary_line_set)
         secondary_line_times_by_frame.append(secondary_times)
+    available_full_segments = max(
+        int(sum(len(frame.segments) for frame in primary_lines_by_frame)),
+        int(sum(len(frame.segments) for frame in secondary_lines_by_frame)),
+    )
+    applied_max_full_segments = resolve_count_cap_from_ratio(
+        available_full_segments,
+        max_full_segments_ratio,
+        max_full_segments,
+    )
     primary_lines_full, primary_line_times_full = concat_timed_line_chunks(
         [frame.segments for frame in primary_lines_by_frame if len(frame.segments) > 0],
         [frame.colors for frame in primary_lines_by_frame if len(frame.colors) > 0],
@@ -912,7 +1011,7 @@ def aggregate_tracked_points(
         [frame.seed_border_dist_px for frame in primary_lines_by_frame if len(frame.seed_border_dist_px) > 0],
         [frame.in_bounds_ratio for frame in primary_lines_by_frame if len(frame.in_bounds_ratio) > 0],
         [frame.max_uv_step_px for frame in primary_lines_by_frame if len(frame.max_uv_step_px) > 0],
-        max_segments=max_full_segments,
+        max_segments=applied_max_full_segments,
     )
     secondary_lines_full, secondary_line_times_full = concat_timed_line_chunks(
         [frame.segments for frame in secondary_lines_by_frame if len(frame.segments) > 0],
@@ -921,7 +1020,7 @@ def aggregate_tracked_points(
         [frame.seed_border_dist_px for frame in secondary_lines_by_frame if len(frame.seed_border_dist_px) > 0],
         [frame.in_bounds_ratio for frame in secondary_lines_by_frame if len(frame.in_bounds_ratio) > 0],
         [frame.max_uv_step_px for frame in secondary_lines_by_frame if len(frame.max_uv_step_px) > 0],
-        max_segments=max_full_segments,
+        max_segments=applied_max_full_segments,
     )
 
     total_primary_points = int(sum(len(frame.points) for frame in primary_by_frame))
@@ -944,6 +1043,12 @@ def aggregate_tracked_points(
         total_secondary_points=total_secondary_points,
         total_primary_segments=total_primary_segments,
         total_secondary_segments=total_secondary_segments,
+        raw_max_points_per_frame=raw_max_points_per_frame,
+        raw_max_segments_per_frame=raw_max_segments_per_frame,
+        available_full_segments=available_full_segments,
+        applied_max_points_per_frame=applied_max_points_per_frame,
+        applied_max_segments_per_frame=applied_max_segments_per_frame,
+        applied_max_full_segments=applied_max_full_segments,
     )
 
 
@@ -1074,18 +1179,59 @@ def main() -> None:
         if total_frames <= 0:
             raise ValueError(f"No frames found for {episode_dir}")
 
-        aggregated = aggregate_tracked_points(
-            episode_dir=episode_dir,
-            scene_reader=scene_reader,
-            intrinsics=intrinsics,
-            extrinsics=extrinsics,
-            render_mode=str(args.render_mode),
-            query_stride=int(args.query_stride),
-            track_stride=int(args.track_stride),
-            max_points_per_frame=int(args.max_points_per_frame),
-            max_segments_per_frame=int(args.max_segments_per_frame),
-            max_full_segments=int(args.max_full_segments),
-            color_mode=str(args.color_mode),
+        all_query_frames = list_sample_query_frames(episode_dir, episode_dir.name)
+        if not all_query_frames:
+            raise FileNotFoundError(f"No sample NPZ files found under {episode_dir / 'samples'}")
+
+        def run_initial_aggregation() -> AggregatedTracks:
+            return aggregate_tracked_points(
+                episode_dir=episode_dir,
+                scene_reader=scene_reader,
+                intrinsics=intrinsics,
+                extrinsics=extrinsics,
+                render_mode=str(args.render_mode),
+                query_stride=max(1, int(args.query_stride)),
+                track_stride=max(1, int(args.track_stride)),
+                max_points_per_frame=max(1, int(args.max_points_per_frame)),
+                max_segments_per_frame=max(1, int(args.max_segments_per_frame)),
+                max_full_segments=max(1, int(args.max_full_segments)),
+                color_mode=str(args.color_mode),
+            )
+
+        def run_aggregation(settings: AggregationSettings) -> AggregatedTracks:
+            return aggregate_tracked_points(
+                episode_dir=episode_dir,
+                scene_reader=scene_reader,
+                intrinsics=intrinsics,
+                extrinsics=extrinsics,
+                render_mode=str(args.render_mode),
+                query_stride=int(settings.query_stride),
+                track_stride=int(settings.track_stride),
+                max_points_per_frame=1,
+                max_segments_per_frame=1,
+                max_full_segments=1,
+                color_mode=str(args.color_mode),
+                max_points_ratio=float(settings.max_points_ratio),
+                max_segments_ratio=float(settings.max_segments_ratio),
+                max_full_segments_ratio=float(settings.max_full_segments_ratio),
+            )
+
+        aggregated = run_initial_aggregation()
+        aggregation_settings = AggregationSettings(
+            query_stride=max(1, int(args.query_stride)),
+            track_stride=max(1, int(args.track_stride)),
+            max_points_ratio=float(resolve_ratio_percent_from_cap(
+                aggregated.applied_max_points_per_frame,
+                aggregated.raw_max_points_per_frame,
+            )) / 100.0,
+            max_segments_ratio=float(resolve_ratio_percent_from_cap(
+                aggregated.applied_max_segments_per_frame,
+                aggregated.raw_max_segments_per_frame,
+            )) / 100.0,
+            max_full_segments_ratio=float(resolve_ratio_percent_from_cap(
+                aggregated.applied_max_full_segments,
+                aggregated.available_full_segments,
+            )) / 100.0,
         )
 
         rgb_cache: dict[int, np.ndarray] = {}
@@ -1132,13 +1278,16 @@ def main() -> None:
             track_downsample=DEFAULT_DISPLAY_DOWNSAMPLE,
             dense_downsample=DEFAULT_DISPLAY_DOWNSAMPLE,
             trail_downsample=DEFAULT_DISPLAY_DOWNSAMPLE,
+            trajectory_display_ratio=1.0,
             trail_mode=TRAIL_MODE_PROGRESSIVE,
             fade_trails=True,
             fade_frames=min(max(total_frames, 1), DEFAULT_TRAIL_FADE_FRAMES),
             trail_window=min(total_frames, 12),
-            seed_border_margin_px=DEFAULT_TRACK_SEED_BORDER_MARGIN_PX,
-            min_in_bounds_ratio=DEFAULT_TRACK_MIN_IN_BOUNDS_RATIO,
-            max_uv_step_px=DEFAULT_TRACK_MAX_UV_STEP_PX,
+            # Start with display-layer filtering disabled so the viewer shows the
+            # full aggregated trajectory set by default.
+            seed_border_margin_px=0,
+            min_in_bounds_ratio=0.0,
+            max_uv_step_px=0.0,
         )
         initial_display_data = build_display_frame_data(
             frame_idx=initial_frame_idx,
@@ -1179,6 +1328,11 @@ def main() -> None:
             gui_show_dense = server.gui.add_checkbox("Show Dense Point Cloud", True)
             gui_show_trails = server.gui.add_checkbox("Show Trajectory Lines", True)
             gui_show_frustums = server.gui.add_checkbox("Show Frustums", False)
+            gui_trail_mode = server.gui.add_dropdown(
+                "Trail Mode",
+                TRAIL_MODES,
+                initial_value=TRAIL_MODE_PROGRESSIVE,
+            )
             gui_track_size = server.gui.add_slider(
                 "Track Point Size",
                 min=0.001,
@@ -1194,11 +1348,101 @@ def main() -> None:
                 initial_value=DEFAULT_DENSE_POINT_SIZE,
             )
             gui_trail_width = server.gui.add_slider("Trajectory Line Width", min=0.5, max=8.0, step=0.5, initial_value=2.0)
+            gui_trajectory_display_ratio = server.gui.add_slider(
+                "Trajectory Display Ratio (%)",
+                min=1,
+                max=100,
+                step=1,
+                initial_value=100,
+            )
             gui_frame_track_count = server.gui.add_number(
                 "Frame Track Points",
                 initial_value=int(len(initial_display_data.primary.points) + len(initial_display_data.secondary.points)),
                 disabled=True,
             )
+
+        with server.gui.add_folder("Aggregation"):
+            gui_query_stride = server.gui.add_number(
+                "Query Stride",
+                initial_value=int(aggregation_settings.query_stride),
+                min=1,
+                max=max(1, len(all_query_frames)),
+                step=1,
+            )
+            gui_track_stride = server.gui.add_number(
+                "Track Stride",
+                initial_value=int(aggregation_settings.track_stride),
+                min=1,
+                max=128,
+                step=1,
+            )
+            gui_points_ratio = server.gui.add_slider(
+                "Points / Frame Ratio (%)",
+                min=1,
+                max=100,
+                step=1,
+                initial_value=resolve_ratio_percent_from_cap(
+                    aggregated.applied_max_points_per_frame,
+                    aggregated.raw_max_points_per_frame,
+                ),
+            )
+            gui_segments_ratio = server.gui.add_slider(
+                "Segments / Frame Ratio (%)",
+                min=1,
+                max=100,
+                step=1,
+                initial_value=resolve_ratio_percent_from_cap(
+                    aggregated.applied_max_segments_per_frame,
+                    aggregated.raw_max_segments_per_frame,
+                ),
+            )
+            gui_full_segments_ratio = server.gui.add_slider(
+                "Full Segments Ratio (%)",
+                min=1,
+                max=100,
+                step=1,
+                initial_value=resolve_ratio_percent_from_cap(
+                    aggregated.applied_max_full_segments,
+                    aggregated.available_full_segments,
+                ),
+            )
+            gui_active_query_samples = server.gui.add_number(
+                "Active Query Samples",
+                initial_value=int(aggregated.sample_count),
+                disabled=True,
+            )
+            gui_total_tracks_after_stride = server.gui.add_number(
+                "Tracks After Stride",
+                initial_value=int(aggregated.total_tracks_after_stride),
+                disabled=True,
+            )
+            gui_total_points = server.gui.add_number(
+                "Total Aggregated Points",
+                initial_value=int(aggregated.total_primary_points + aggregated.total_secondary_points),
+                disabled=True,
+            )
+            gui_total_segments = server.gui.add_number(
+                "Total Aggregated Segments",
+                initial_value=int(aggregated.total_primary_segments + aggregated.total_secondary_segments),
+                disabled=True,
+            )
+            gui_applied_points_cap = server.gui.add_number(
+                "Applied Points / Frame Cap",
+                initial_value=int(aggregated.applied_max_points_per_frame),
+                disabled=True,
+            )
+            gui_applied_segments_cap = server.gui.add_number(
+                "Applied Segments / Frame Cap",
+                initial_value=int(aggregated.applied_max_segments_per_frame),
+                disabled=True,
+            )
+            gui_applied_full_segments_cap = server.gui.add_number(
+                "Applied Full Segments Cap",
+                initial_value=int(aggregated.applied_max_full_segments),
+                disabled=True,
+            )
+            server.gui.add_markdown("Change aggregation controls, then click **Rebuild Aggregation**.")
+            gui_rebuild_aggregation = server.gui.add_button("Rebuild Aggregation")
 
         with server.gui.add_folder("Current Frame"):
             gui_rgb = server.gui.add_image(
@@ -1258,7 +1502,8 @@ def main() -> None:
                 track_downsample=initial_display_settings.track_downsample,
                 dense_downsample=initial_display_settings.dense_downsample,
                 trail_downsample=initial_display_settings.trail_downsample,
-                trail_mode=initial_display_settings.trail_mode,
+                trajectory_display_ratio=float(gui_trajectory_display_ratio.value) / 100.0,
+                trail_mode=str(gui_trail_mode.value),
                 fade_trails=initial_display_settings.fade_trails,
                 fade_frames=initial_display_settings.fade_frames,
                 trail_window=initial_display_settings.trail_window,
@@ -1266,6 +1511,32 @@ def main() -> None:
                 min_in_bounds_ratio=initial_display_settings.min_in_bounds_ratio,
                 max_uv_step_px=initial_display_settings.max_uv_step_px,
             )
+
+        def current_aggregation_settings() -> AggregationSettings:
+            return AggregationSettings(
+                query_stride=max(1, int(gui_query_stride.value)),
+                track_stride=max(1, int(gui_track_stride.value)),
+                max_points_ratio=float(gui_points_ratio.value) / 100.0,
+                max_segments_ratio=float(gui_segments_ratio.value) / 100.0,
+                max_full_segments_ratio=float(gui_full_segments_ratio.value) / 100.0,
+            )
+
+        def update_aggregation_summary() -> None:
+            gui_active_query_samples.value = int(aggregated.sample_count)
+            gui_total_tracks_after_stride.value = int(aggregated.total_tracks_after_stride)
+            gui_total_points.value = int(aggregated.total_primary_points + aggregated.total_secondary_points)
+            gui_total_segments.value = int(aggregated.total_primary_segments + aggregated.total_secondary_segments)
+            gui_applied_points_cap.value = int(aggregated.applied_max_points_per_frame)
+            gui_applied_segments_cap.value = int(aggregated.applied_max_segments_per_frame)
+            gui_applied_full_segments_cap.value = int(aggregated.applied_max_full_segments)
+
+        def set_aggregation_controls_disabled(disabled: bool) -> None:
+            gui_query_stride.disabled = disabled
+            gui_track_stride.disabled = disabled
+            gui_points_ratio.disabled = disabled
+            gui_segments_ratio.disabled = disabled
+            gui_full_segments_ratio.disabled = disabled
+            gui_rebuild_aggregation.disabled = disabled
 
         def update_frustums(frame_idx: int) -> None:
             for idx, frustum in enumerate(camera_frustums):
@@ -1438,6 +1709,44 @@ def main() -> None:
             buffered_settings = settings
             apply_buffered_visibility(int(gui_time.value))
 
+        def rebuild_aggregation(*, force: bool = False) -> None:
+            nonlocal aggregated, aggregation_settings, buffered_settings, buffered_display_cache
+            settings = current_aggregation_settings()
+            if not force and settings == aggregation_settings:
+                return
+
+            set_aggregation_controls_disabled(True)
+            try:
+                gui_play.value = False
+                logger.info(
+                    "Rebuilding 4D aggregation: query_stride={}, track_stride={}, points_ratio={}%, "
+                    "segments_ratio={}%, full_segments_ratio={}%",
+                    int(settings.query_stride),
+                    int(settings.track_stride),
+                    int(round(float(settings.max_points_ratio) * 100.0)),
+                    int(round(float(settings.max_segments_ratio) * 100.0)),
+                    int(round(float(settings.max_full_segments_ratio) * 100.0)),
+                )
+                aggregated = run_aggregation(settings)
+                aggregation_settings = settings
+                buffered_settings = None
+                buffered_display_cache = []
+                update_aggregation_summary()
+                update_display(force_rgb=True)
+                logger.info(
+                    "Rebuilt 4D aggregation: query_samples={}, tracks_after_stride={}, total_points={}, "
+                    "total_segments={}, applied_points_cap={}, applied_segments_cap={}, applied_full_segments_cap={}",
+                    int(aggregated.sample_count),
+                    int(aggregated.total_tracks_after_stride),
+                    int(aggregated.total_primary_points + aggregated.total_secondary_points),
+                    int(aggregated.total_primary_segments + aggregated.total_secondary_segments),
+                    int(aggregated.applied_max_points_per_frame),
+                    int(aggregated.applied_max_segments_per_frame),
+                    int(aggregated.applied_max_full_segments),
+                )
+            finally:
+                set_aggregation_controls_disabled(False)
+
         def update_display(*, force_rgb: bool = False) -> None:
             frame_idx = int(gui_time.value)
             if playback_mode == BUFFER_MODE_BUFFERED:
@@ -1482,14 +1791,27 @@ def main() -> None:
         def _(_) -> None:
             update_display()
 
+        @gui_trail_mode.on_update
+        def _(_) -> None:
+            update_display()
+
         @gui_trail_width.on_update
         def _(_) -> None:
             update_display()
+
+        @gui_trajectory_display_ratio.on_update
+        def _(_) -> None:
+            update_display()
+
+        @gui_rebuild_aggregation.on_click
+        def _(_) -> None:
+            rebuild_aggregation()
 
         @gui_show_frustums.on_update
         def _(_) -> None:
             update_frustums(int(gui_time.value))
 
+        update_aggregation_summary()
         update_display(force_rgb=True)
 
         logger.info(

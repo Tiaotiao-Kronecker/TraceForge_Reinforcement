@@ -1393,6 +1393,7 @@ def list_sample_query_frames(episode_dir: str | Path, video_name: str | None = N
             frames.append(int(suffix))
         except ValueError:
             continue
+    frames.sort()
     return frames
 
 
