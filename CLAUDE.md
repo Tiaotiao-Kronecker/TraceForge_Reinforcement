@@ -115,8 +115,14 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 ### Key Components
 
 **Models** (`models/`):
-- `SpaTrackV2/`: TAPIP3D 3D point tracking model (main inference model)
-- `corr_features/`: Feature correlation for tracking
+- `point_tracker_3d.py`: **Main runtime tracker** — `PointTracker3D`, the TAPIP3D implementation (Copyright TAPIP3D team, arXiv:2504.14717). Instantiated by `utils/inference_utils.py::load_model` via `models.from_pretrained` → `from_config` when loading `checkpoints/tapip3d_final.pth` (from `huggingface.co/zbww/tapip3d`).
+- `corr_features/`: TAPIP3D Local Pair Attention / kNN feature-cloud correlation modules
+- `point_updaters/`: 3D Trajectory Transformer iterative update blocks
+- `encoders/`: RGB feature encoders
+- `moge/`, `monoD/`: depth/geometry auxiliaries
+
+**Archived (not runtime)**:
+- `third_party/archived/spatrackv2/`: SpatialTrackerV2 reference code (arXiv:2507.12462). Not loaded by any runtime path; kept for comparison / benchmarking only. See `third_party/archived/README.md`.
 
 **Inference Scripts** (`scripts/batch_inference/`):
 - `infer.py`: Single/batch video inference with full pipeline
