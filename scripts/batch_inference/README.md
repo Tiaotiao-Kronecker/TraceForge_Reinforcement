@@ -14,7 +14,10 @@
   - 支持 `external / external_manipulator / external_manipulator_v2 / wrist / wrist_manipulator_top95 / wrist_manipulator`
     轨迹过滤 profile
 - `batch_infer.py`
-  - 已下线的旧通用批处理入口
+  - 当前统一批处理入口
+  - `--dataset_adapter file_layout` 时转发到 `batch_infer_press_one_button_demo.py`
+  - `--dataset_adapter xperience` 时直接读取原始 Xperience episode（当前维护 `stereo_left`）
+  - Xperience 原生路径默认输出 `v2 + adapter_ref`
 - `batch_infer_press_one_button_demo.py`
   - button / sim / press-one-button episode 数据集批处理入口
   - 默认 `--fps=1`、`--max_num_frames=512`
@@ -43,6 +46,17 @@
 ## 文档
 
 - [BATCH_INFERENCE_GUIDE.md](BATCH_INFERENCE_GUIDE.md)
+
+## 已验证 Smoke 路径
+
+- `file_layout`：已于 2026-04-21 通过统一入口 `batch_infer.py --dataset_adapter file_layout`
+  在 `/data2/yaoxuran/press_one_button_demo_v1/episode_00000` 上完成真实 smoke；
+  转发到 `batch_infer_press_one_button_demo.py`、共享 query-frame schedule、`v2 + source_ref`
+  保存和 artifact 完整性检查都已通过。
+- `xperience`：已于 2026-04-21 在
+  `/data1/dataset/xperience-10m-partial-1tb/07f3aeee-5d64-4fd2-8450-f8baf8c239fd/ep7`
+  上完成真实 smoke；原始 `annotation.hdf5 + stereo_left.mp4` 读取、`v2 + adapter_ref`
+  保存和 artifact 完整性检查都已通过。
 
 如果需要查看旧实验或一次性调查，请不要从这里找，统一去
 `scripts/archived/investigations/`。

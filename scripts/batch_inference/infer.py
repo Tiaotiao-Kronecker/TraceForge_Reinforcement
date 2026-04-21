@@ -24,6 +24,7 @@ from utils.video_depth_pose_utils import DEFAULT_DEPTH_POSE_METHOD, video_depth_
 from utils.traceforge_artifact_utils import (
     DEFAULT_SCENE_STORAGE_MODE,
     LEGACY_LAYOUT,
+    SCENE_STORAGE_ADAPTER_REF,
     SCENE_STORAGE_CACHE,
     SCENE_STORAGE_SOURCE_REF,
     V2_LAYOUT,
@@ -93,6 +94,31 @@ def _set_profile_stat(
     if profile_stats is None:
         return
     profile_stats[key] = float(value)
+
+def _normalize_source_ref_path(path: str | os.PathLike[str] | None) -> str | None:
+    if path is None:
+        return None
+    path_str = os.fspath(path)
+    if not path_str:
+        return None
+    return str(Path(path_str).resolve())
+
+
+def _ensure_scene_bundle_video_tensor(video_ten) -> torch.Tensor:
+    if isinstance(video_ten, np.ndarray):
+        video_ten = torch.from_numpy(video_ten)
+    if not isinstance(video_ten, torch.Tensor):
+        raise TypeError(f"scene bundle video_ten must be a torch.Tensor or np.ndarray, got {type(video_ten).__name__}")
+    if video_ten.ndim != 4:
+        raise ValueError(f"scene bundle video_ten must be rank-4, got {tuple(video_ten.shape)}")
+    if video_ten.shape[1] not in (1, 3) and video_ten.shape[-1] in (1, 3):
+        video_ten = video_ten.permute(0, 3, 1, 2)
+    if video_ten.shape[1] not in (1, 3):
+        raise ValueError(f"scene bundle video_ten must have channel dim 1 or 3, got {tuple(video_ten.shape)}")
+    video_ten = video_ten.detach().cpu().float()
+    if video_ten.numel() > 0 and torch.max(video_ten) > 1.5:
+        video_ten = video_ten / 255.0
+    return video_ten
 
 
 def _get_profile_stat(
@@ -984,10 +1010,11 @@ def parse_args():
         "--scene_storage_mode",
         type=str,
         default=DEFAULT_SCENE_STORAGE_MODE,
-        choices=[SCENE_STORAGE_SOURCE_REF, SCENE_STORAGE_CACHE],
+        choices=[SCENE_STORAGE_SOURCE_REF, SCENE_STORAGE_ADAPTER_REF, SCENE_STORAGE_CACHE],
         help=(
             "Storage backend for v2 artifacts. source_ref stores source RGB/depth/geometry "
-            "references in scene_meta.json and skips scene.h5/scene_rgb.mp4; cache writes local scene caches."
+            "references in scene_meta.json, adapter_ref stores structured dataset descriptors, "
+            "and cache writes local scene caches."
         ),
     )
     parser.add_argument(
@@ -1221,11 +1248,11 @@ def parse_args():
     if (
         args.processing_resize_hw is not None
         and args.output_layout == V2_LAYOUT
-        and args.scene_storage_mode == SCENE_STORAGE_SOURCE_REF
+        and args.scene_storage_mode in (SCENE_STORAGE_SOURCE_REF, SCENE_STORAGE_ADAPTER_REF)
     ):
         parser.error(
             "Resize experiments require --scene_storage_mode cache when using v2 output; "
-            "source_ref would still point at the full-resolution inputs."
+            "non-cache scene references would still point at the full-resolution inputs."
         )
     return args
 
@@ -2319,6 +2346,7 @@ def save_structured_data(
     depth_conf=None,
     video_source_path: str | None = None,
     depth_source_path: str | None = None,
+    source_descriptor: dict[str, object] | None = None,
     source_frame_indices=None,
     query_frame_metadata: dict[str, object] | None = None,
     original_frame_height: int | None = None,
@@ -2358,10 +2386,10 @@ def save_structured_data(
             "sample_debug_records": sample_debug_records or [],
         }
 
-    if scene_storage_mode not in (SCENE_STORAGE_SOURCE_REF, SCENE_STORAGE_CACHE):
+    if scene_storage_mode not in (SCENE_STORAGE_SOURCE_REF, SCENE_STORAGE_ADAPTER_REF, SCENE_STORAGE_CACHE):
         raise ValueError(
             f"Unsupported scene_storage_mode='{scene_storage_mode}'. "
-            f"Expected one of {[SCENE_STORAGE_SOURCE_REF, SCENE_STORAGE_CACHE]}."
+            f"Expected one of {[SCENE_STORAGE_SOURCE_REF, SCENE_STORAGE_ADAPTER_REF, SCENE_STORAGE_CACHE]}."
         )
     if layout != V2_LAYOUT and scene_storage_mode != SCENE_STORAGE_CACHE:
         raise ValueError(
@@ -2379,13 +2407,15 @@ def save_structured_data(
         )
     if (
         layout == V2_LAYOUT
-        and scene_storage_mode == SCENE_STORAGE_SOURCE_REF
+        and scene_storage_mode in (SCENE_STORAGE_SOURCE_REF, SCENE_STORAGE_ADAPTER_REF)
         and processing_resize_hw is not None
     ):
         raise ValueError(
-            "scene_storage_mode='source_ref' cannot be used together with resize experiments; "
+            "non-cache scene storage cannot be used together with resize experiments; "
             "use --scene_storage_mode cache so the saved scene matches the resized processing inputs."
         )
+    if layout == V2_LAYOUT and scene_storage_mode == SCENE_STORAGE_ADAPTER_REF and not source_descriptor:
+        raise ValueError("scene_storage_mode='adapter_ref' requires source_descriptor metadata")
 
     logger.info(f"Saving {len(query_frame_results)} query frame results using layout={layout}")
     filter_config = resolve_traj_filter_config(filter_args)
@@ -2526,7 +2556,11 @@ def save_structured_data(
             )
         scene_h5_relpath = "scene.h5" if scene_storage_mode == SCENE_STORAGE_CACHE else None
         rgb_cache_relpath = "scene_rgb.mp4" if scene_storage_mode == SCENE_STORAGE_CACHE else None
-        source_geom_path = getattr(filter_args, "external_geom_npz", None) if filter_args is not None else None
+        source_rgb_path = _normalize_source_ref_path(video_source_path)
+        source_depth_path = _normalize_source_ref_path(depth_source_path)
+        source_geom_path = _normalize_source_ref_path(
+            getattr(filter_args, "external_geom_npz", None) if filter_args is not None else None
+        )
         if scene_storage_mode == SCENE_STORAGE_CACHE:
             scene_cache_write_start = time.perf_counter()
             write_scene_h5(
@@ -2561,10 +2595,11 @@ def save_structured_data(
                 "scene_storage_mode": scene_storage_mode,
                 "scene_h5_path": scene_h5_relpath,
                 "rgb_cache_path": rgb_cache_relpath,
-                "source_rgb_path": video_source_path,
-                "source_rgb_kind": path_kind(video_source_path),
-                "source_depth_path": depth_source_path,
-                "source_depth_kind": path_kind(depth_source_path),
+                "source_descriptor": source_descriptor,
+                "source_rgb_path": source_rgb_path,
+                "source_rgb_kind": path_kind(source_rgb_path),
+                "source_depth_path": source_depth_path,
+                "source_depth_kind": path_kind(source_depth_path),
                 "source_geom_path": source_geom_path,
                 "source_geom_kind": path_kind(source_geom_path),
                 "source_camera_name": getattr(filter_args, "camera_name", None),
@@ -3119,6 +3154,162 @@ def load_scene_context(video_path, depth_path, args, model_depth_pose):
         "query_prefilter_filter_config": query_prefilter_filter_config,
         "query_prefilter_enabled": bool(query_prefilter_enabled),
         "support_grid_size": int(support_grid_size),
+        "source_descriptor": None,
+        "process_start": float(process_start),
+        "profile_stats": profile_stats,
+    }
+
+
+def load_scene_context_from_bundle(scene_bundle: dict[str, object], args) -> dict[str, object]:
+    profile_stats = {} if bool(getattr(args, "collect_profile_stats", False)) else None
+    process_start = time.perf_counter()
+
+    video_ten = _ensure_scene_bundle_video_tensor(scene_bundle["video_ten"])
+    depth_npy = np.asarray(scene_bundle["depth_npy"], dtype=np.float32)
+    intrs_npy = np.asarray(scene_bundle["intrs_npy"], dtype=np.float32)
+    extrs_npy = np.asarray(scene_bundle["extrs_npy"], dtype=np.float32)
+    if depth_npy.ndim != 3:
+        raise ValueError(f"scene bundle depth_npy must have shape (T,H,W), got {depth_npy.shape}")
+    if intrs_npy.ndim != 3 or intrs_npy.shape[1:] != (3, 3):
+        raise ValueError(f"scene bundle intrs_npy must have shape (T,3,3), got {intrs_npy.shape}")
+    if extrs_npy.ndim != 3 or extrs_npy.shape[1:] != (4, 4):
+        raise ValueError(f"scene bundle extrs_npy must have shape (T,4,4), got {extrs_npy.shape}")
+
+    video_length = int(video_ten.shape[0])
+    if not (depth_npy.shape[0] == intrs_npy.shape[0] == extrs_npy.shape[0] == video_length):
+        raise ValueError(
+            "scene bundle temporal lengths must match: "
+            f"video={video_length}, depth={depth_npy.shape[0]}, intr={intrs_npy.shape[0]}, extr={extrs_npy.shape[0]}"
+        )
+
+    depth_conf_npy = np.asarray(
+        scene_bundle.get("depth_conf", (depth_npy > 0).astype(np.float32)),
+        dtype=np.float32,
+    )
+    if depth_conf_npy.shape != depth_npy.shape:
+        raise ValueError(
+            f"scene bundle depth_conf must match depth shape {depth_npy.shape}, got {depth_conf_npy.shape}"
+        )
+
+    original_filenames = list(scene_bundle.get("original_filenames") or [])
+    if not original_filenames:
+        original_filenames = [f"frame_{idx:010d}" for idx in range(video_length)]
+    if len(original_filenames) != video_length:
+        raise ValueError(
+            f"scene bundle original_filenames length must be {video_length}, got {len(original_filenames)}"
+        )
+
+    source_frame_indices = np.asarray(
+        scene_bundle.get("source_frame_indices", np.arange(video_length, dtype=np.int32)),
+        dtype=np.int32,
+    ).reshape(-1)
+    if source_frame_indices.shape != (video_length,):
+        raise ValueError(
+            f"scene bundle source_frame_indices length must be {video_length}, got {source_frame_indices.shape}"
+        )
+
+    original_frame_H = int(scene_bundle.get("original_frame_H") or video_ten.shape[-2])
+    original_frame_W = int(scene_bundle.get("original_frame_W") or video_ten.shape[-1])
+    processing_resize_hw = getattr(args, "processing_resize_hw", None)
+    if processing_resize_hw is None:
+        processing_resize_hw = _resolve_processing_resize_hw(args)
+        setattr(args, "processing_resize_hw", processing_resize_hw)
+    if processing_resize_hw is not None:
+        resize_start = time.perf_counter()
+        video_ten, depth_npy, depth_conf_npy, intrs_npy = _resize_scene_inputs(
+            video_ten=video_ten,
+            depth_npy=depth_npy,
+            depth_conf_npy=depth_conf_npy,
+            intrs_npy=intrs_npy,
+            target_hw=processing_resize_hw,
+        )
+        _accumulate_profile_stat(
+            profile_stats,
+            "resize_scene_inputs_seconds",
+            time.perf_counter() - resize_start,
+        )
+
+    frame_H, frame_W = video_ten.shape[-2:]
+    dense_query_keypoints = _build_grid_keypoints(
+        frame_H,
+        frame_W,
+        args.grid_size,
+        grid_hw=getattr(args, "query_grid_hw", None),
+    )
+    query_prefilter_mode = str(getattr(args, "query_prefilter_mode", DEFAULT_QUERY_PREFILTER_MODE))
+    query_prefilter_rank_keep_ratio = float(
+        getattr(
+            args,
+            "query_prefilter_wrist_rank_keep_ratio",
+            DEFAULT_QUERY_PREFILTER_WRIST_RANK_KEEP_RATIO,
+        )
+    )
+    query_prefilter_filter_config = (
+        resolve_traj_filter_config(args)
+        if query_prefilter_mode != QUERY_PREFILTER_MODE_OFF
+        else None
+    )
+    query_prefilter_enabled = bool(
+        query_prefilter_filter_config is not None
+        and bool(query_prefilter_filter_config["enabled"])
+        and query_prefilter_filter_config["profile"]
+        in {
+            "wrist",
+            "wrist_manipulator_top95",
+            "wrist_manipulator",
+        }
+    )
+    support_grid_size = _resolve_support_grid_size(
+        args.grid_size,
+        float(getattr(args, "support_grid_ratio", 0.8)),
+    )
+
+    query_points_per_frame = {}
+    query_frames, query_frame_metadata = _resolve_query_frames(
+        args,
+        source_frame_indices=source_frame_indices,
+        video_length=video_length,
+    )
+    query_frames, query_frame_metadata = _apply_short_tail_skip_to_query_frames(
+        query_frames=query_frames,
+        query_frame_metadata=query_frame_metadata,
+        source_frame_indices=source_frame_indices,
+        video_length=video_length,
+        future_len=int(args.future_len),
+    )
+    for frame_idx in query_frames:
+        grid_points = _build_frame_query_points(frame_idx, dense_query_keypoints)
+        if len(grid_points) > 0:
+            query_points_per_frame[int(frame_idx)] = grid_points[:, 1:3]
+
+    return {
+        "video_path": scene_bundle.get("video_path"),
+        "depth_path": scene_bundle.get("depth_path"),
+        "stride": int(scene_bundle.get("stride", getattr(args, "fps", 1))),
+        "video_ten": video_ten,
+        "depth_npy": depth_npy.astype(np.float32, copy=False),
+        "depth_conf": depth_conf_npy.astype(np.float32, copy=False),
+        "extrs_npy": extrs_npy.astype(np.float32, copy=False),
+        "intrs_npy": intrs_npy.astype(np.float32, copy=False),
+        "video_length": int(video_length),
+        "frame_H": int(frame_H),
+        "frame_W": int(frame_W),
+        "original_frame_H": int(original_frame_H),
+        "original_frame_W": int(original_frame_W),
+        "processing_frame_H": int(frame_H),
+        "processing_frame_W": int(frame_W),
+        "dense_query_keypoints": dense_query_keypoints.astype(np.float32, copy=False),
+        "query_frames": [int(frame_idx) for frame_idx in query_frames],
+        "query_points_per_frame": query_points_per_frame,
+        "query_frame_metadata": dict(query_frame_metadata),
+        "original_filenames": [str(name) for name in original_filenames],
+        "source_frame_indices": source_frame_indices.astype(np.int32, copy=False),
+        "query_prefilter_mode": query_prefilter_mode,
+        "query_prefilter_rank_keep_ratio": float(query_prefilter_rank_keep_ratio),
+        "query_prefilter_filter_config": query_prefilter_filter_config,
+        "query_prefilter_enabled": bool(query_prefilter_enabled),
+        "support_grid_size": int(support_grid_size),
+        "source_descriptor": dict(scene_bundle.get("source_descriptor") or {}),
         "process_start": float(process_start),
         "profile_stats": profile_stats,
     }
@@ -3615,9 +3806,7 @@ def save_source_ref_v2_query_results(
     }
 
 
-def process_single_video(video_path, depth_path, args, model_3dtracker, model_depth_pose, video_name=None, output_dir=None):
-    """Process a single video and return the processed data"""
-    scene_ctx = load_scene_context(video_path, depth_path, args, model_depth_pose)
+def _process_loaded_scene_context(scene_ctx, args, model_3dtracker):
     profile_stats = scene_ctx["profile_stats"]
     query_frame_results = {}
     tracking_segments = [
@@ -3732,8 +3921,25 @@ def process_single_video(video_path, depth_path, args, model_3dtracker, model_de
         "query_frame_results": query_frame_results,
         "full_intrinsics": np.asarray(scene_ctx["intrs_npy"], dtype=np.float32),
         "full_extrinsics": np.asarray(scene_ctx["extrs_npy"], dtype=np.float32),
+        "video_source_path": scene_ctx.get("video_path"),
+        "depth_source_path": scene_ctx.get("depth_path"),
+        "source_descriptor": dict(scene_ctx.get("source_descriptor") or {}),
         "profile_stats": profile_stats,
     }
+
+
+def process_single_video(video_path, depth_path, args, model_3dtracker, model_depth_pose, video_name=None, output_dir=None):
+    """Process a single file-backed video and return the processed data."""
+    del video_name, output_dir
+    scene_ctx = load_scene_context(video_path, depth_path, args, model_depth_pose)
+    return _process_loaded_scene_context(scene_ctx, args, model_3dtracker)
+
+
+def process_single_scene_bundle(scene_bundle, args, model_3dtracker, video_name=None, output_dir=None):
+    """Process a preloaded scene bundle and return the processed data."""
+    del video_name, output_dir
+    scene_ctx = load_scene_context_from_bundle(scene_bundle, args)
+    return _process_loaded_scene_context(scene_ctx, args, model_3dtracker)
 
 
 def find_video_folders(base_path: str, scan_depth: int = 2):
@@ -4097,6 +4303,7 @@ if __name__ == "__main__":
                 depth_conf=result["depth_conf"],
                 video_source_path=video_path,
                 depth_source_path=depth_path,
+                source_descriptor=result.get("source_descriptor"),
                 source_frame_indices=result["source_frame_indices"],
                 query_frame_metadata=result.get("query_frame_metadata"),
                 original_frame_height=result.get("original_frame_height"),

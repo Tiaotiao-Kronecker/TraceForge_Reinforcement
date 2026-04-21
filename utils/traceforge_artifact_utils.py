@@ -10,6 +10,16 @@ import numpy as np
 from PIL import Image
 
 from utils.extrinsics_utils import normalize_extrinsics_to_w2c
+from utils.xperience_adapter_utils import (
+    XPERIENCE_ADAPTER_TYPE,
+    build_stereo_left_extrinsics,
+    build_stereo_left_intrinsics,
+    load_video_frame as load_xperience_video_frame,
+    probe_video_metadata,
+    read_caption_main_task,
+    resolve_xperience_source_descriptor,
+    resize_rgb_frame,
+)
 
 
 V2_LAYOUT = "v2"
@@ -19,6 +29,7 @@ SCENE_META_NAME = "scene_meta.json"
 SCENE_RGB_NAME = "scene_rgb.mp4"
 SCENE_STORAGE_CACHE = "cache"
 SCENE_STORAGE_SOURCE_REF = "source_ref"
+SCENE_STORAGE_ADAPTER_REF = "adapter_ref"
 DEFAULT_SCENE_STORAGE_MODE = SCENE_STORAGE_SOURCE_REF
 
 _VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpg", ".mpeg")
@@ -100,6 +111,27 @@ def _load_depth_image(path: str | Path) -> np.ndarray:
         return np.load(path).astype(np.float32)
     image = Image.open(path).convert("I;16")
     return np.array(image).astype(np.float32) / 1000.0
+
+
+def _resolve_source_descriptor(meta: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not meta:
+        return None
+    descriptor = meta.get("source_descriptor")
+    return descriptor if isinstance(descriptor, dict) else None
+
+
+def _is_adapter_ref_complete(meta: dict[str, Any] | None) -> bool:
+    descriptor = _resolve_source_descriptor(meta)
+    if descriptor is None:
+        return False
+    adapter_type = str(descriptor.get("adapter_type") or "")
+    if adapter_type != XPERIENCE_ADAPTER_TYPE:
+        return False
+    try:
+        paths = resolve_xperience_source_descriptor(descriptor)
+    except Exception:
+        return False
+    return bool(paths.annotation_path.is_file() and paths.video_path.is_file())
 
 
 def _load_external_geom_arrays(
@@ -188,6 +220,8 @@ def is_traceforge_output_complete(output_dir: str | Path) -> bool:
                 and source_geom_path is not None
                 and source_geom_path.exists()
             )
+        if storage_mode == SCENE_STORAGE_ADAPTER_REF:
+            return _is_adapter_ref_complete(meta)
         return False
 
     images_dir = output_dir / "images"
@@ -1031,6 +1065,7 @@ class SceneReader:
         self._source_frame_indices: np.ndarray | None = None
         self._source_intrinsics: np.ndarray | None = None
         self._source_extrinsics: np.ndarray | None = None
+        self._source_annotation_h5: h5py.File | None = None
 
     def close(self) -> None:
         if self._scene_h5 is not None:
@@ -1048,6 +1083,9 @@ class SceneReader:
         if self._main_npz is not None:
             self._main_npz.close()
             self._main_npz = None
+        if self._source_annotation_h5 is not None:
+            self._source_annotation_h5.close()
+            self._source_annotation_h5 = None
 
     def __enter__(self) -> "SceneReader":
         return self
@@ -1116,6 +1154,27 @@ class SceneReader:
                 f"for {self.episode_dir}"
             )
         return int(source_frame_indices[frame_idx])
+
+    def _require_source_descriptor(self) -> dict[str, Any]:
+        descriptor = _resolve_source_descriptor(self._require_scene_meta())
+        if descriptor is None:
+            raise FileNotFoundError(
+                f"adapter_ref output is missing source_descriptor under {self.episode_dir}"
+            )
+        return descriptor
+
+    def _require_xperience_paths(self):
+        return resolve_xperience_source_descriptor(self._require_source_descriptor())
+
+    def _require_source_annotation_h5(self) -> h5py.File:
+        if self._source_annotation_h5 is None:
+            paths = self._require_xperience_paths()
+            self._source_annotation_h5 = h5py.File(paths.annotation_path, "r")
+        return self._source_annotation_h5
+
+    def _require_xperience_target_hw(self) -> tuple[int, int]:
+        meta = self._require_scene_meta()
+        return int(meta["height"]), int(meta["width"])
 
     def _require_source_rgb_path(self) -> Path:
         meta = self._require_scene_meta()
@@ -1203,11 +1262,39 @@ class SceneReader:
 
     def get_camera_arrays(self) -> tuple[np.ndarray, np.ndarray]:
         if self.layout == V2_LAYOUT:
-            if self._get_scene_storage_mode() == SCENE_STORAGE_CACHE:
+            storage_mode = self._get_scene_storage_mode()
+            if storage_mode == SCENE_STORAGE_CACHE:
                 scene_h5 = self._require_scene_h5()
                 intrinsics = scene_h5["camera/intrinsics"][:].astype(np.float32)
                 extrinsics = scene_h5["camera/extrinsics_w2c"][:].astype(np.float32)
                 return intrinsics, extrinsics
+
+            if storage_mode == SCENE_STORAGE_ADAPTER_REF:
+                descriptor = self._require_source_descriptor()
+                if str(descriptor.get("adapter_type") or "") != XPERIENCE_ADAPTER_TYPE:
+                    raise ValueError(
+                        f"Unsupported adapter_ref adapter_type={descriptor.get('adapter_type')!r} under {self.episode_dir}"
+                    )
+                handle = self._require_source_annotation_h5()
+                paths = self._require_xperience_paths()
+                target_hw = self._require_xperience_target_hw()
+                source_h = int(descriptor.get("source_height") or 0)
+                source_w = int(descriptor.get("source_width") or 0)
+                if source_h <= 0 or source_w <= 0:
+                    video_meta = probe_video_metadata(paths.video_path)
+                    source_w, source_h = map(int, video_meta.get("size", [target_hw[1], target_hw[0]]))
+                source_indices = self._require_source_frame_indices()
+                intrinsics_single = build_stereo_left_intrinsics(
+                    handle,
+                    source_hw=(source_h, source_w),
+                    target_hw=target_hw,
+                )
+                intrinsics = np.repeat(intrinsics_single[None, :, :], len(source_indices), axis=0)
+                extrinsics = build_stereo_left_extrinsics(
+                    handle,
+                    source_frame_indices=source_indices,
+                )
+                return intrinsics.astype(np.float32), extrinsics.astype(np.float32)
 
             source_indices = self._require_source_frame_indices()
             intrinsics_all, extrinsics_all = self._require_source_geom_arrays()
@@ -1241,9 +1328,20 @@ class SceneReader:
 
     def get_depth_frame(self, frame_idx: int) -> np.ndarray:
         if self.layout == V2_LAYOUT:
-            if self._get_scene_storage_mode() == SCENE_STORAGE_CACHE:
+            storage_mode = self._get_scene_storage_mode()
+            if storage_mode == SCENE_STORAGE_CACHE:
                 scene_h5 = self._require_scene_h5()
                 return scene_h5["dense/depth"][frame_idx].astype(np.float32)
+
+            if storage_mode == SCENE_STORAGE_ADAPTER_REF:
+                descriptor = self._require_source_descriptor()
+                if str(descriptor.get("adapter_type") or "") != XPERIENCE_ADAPTER_TYPE:
+                    raise ValueError(
+                        f"Unsupported adapter_ref adapter_type={descriptor.get('adapter_type')!r} under {self.episode_dir}"
+                    )
+                source_frame_idx = self._map_source_frame_index(frame_idx)
+                handle = self._require_source_annotation_h5()
+                return np.asarray(handle["depth/depth"][source_frame_idx], dtype=np.float32)
 
             source_frame_idx = self._map_source_frame_index(frame_idx)
             source_depth_path = self._require_source_depth_path()
@@ -1281,9 +1379,22 @@ class SceneReader:
 
     def get_rgb_frame(self, frame_idx: int) -> np.ndarray:
         if self.layout == V2_LAYOUT:
-            if self._get_scene_storage_mode() == SCENE_STORAGE_CACHE:
+            storage_mode = self._get_scene_storage_mode()
+            if storage_mode == SCENE_STORAGE_CACHE:
                 reader = self._require_scene_reader()
                 return np.asarray(reader.get_data(frame_idx), dtype=np.uint8)
+
+            if storage_mode == SCENE_STORAGE_ADAPTER_REF:
+                descriptor = self._require_source_descriptor()
+                if str(descriptor.get("adapter_type") or "") != XPERIENCE_ADAPTER_TYPE:
+                    raise ValueError(
+                        f"Unsupported adapter_ref adapter_type={descriptor.get('adapter_type')!r} under {self.episode_dir}"
+                    )
+                source_frame_idx = self._map_source_frame_index(frame_idx)
+                paths = self._require_xperience_paths()
+                target_hw = self._require_xperience_target_hw()
+                frame = load_xperience_video_frame(paths.video_path, source_frame_idx)
+                return resize_rgb_frame(frame, target_hw=target_hw)
 
             source_frame_idx = self._map_source_frame_index(frame_idx)
             source_rgb_path = self._require_source_rgb_path()

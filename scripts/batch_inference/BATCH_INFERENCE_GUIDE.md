@@ -24,6 +24,10 @@
   - 默认 `--fps=1`
   - 默认 `--max_num_frames=512`
   - 默认共享每秒采样 `2~3` 个关键帧
+- `scripts/batch_inference/batch_infer.py`
+  - 统一批处理入口
+  - `--dataset_adapter file_layout` 转发到现有 sim/button 维护路径
+  - `--dataset_adapter xperience` 直接读取原始 Xperience 数据集并写出 `v2 + adapter_ref`
 
 ## 通用批量推理
 
@@ -144,6 +148,64 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
   motion extent 只保留每个 sample 前 `95%` 的轨迹
 - 推荐直接在 episode 下写 `trajectory/<camera_name>/...`
 - `depth_pose_method=external` 时默认使用 `scene_storage_mode=source_ref`，直接复用源 RGB/depth/geometry
+
+## Xperience 原生批处理
+
+```bash
+python scripts/batch_inference/batch_infer.py \
+  --dataset_adapter xperience \
+  --dataset_root <xperience_root> \
+  --episode_glob '*/*' \
+  --camera_name stereo_left \
+  --checkpoint <checkpoint_path> \
+  --out_dir <output_dir> \
+  --device cuda:0 \
+  --fps 1 \
+  --max_num_frames 512 \
+  --window_size 512 \
+  --scene_storage_mode adapter_ref \
+  --skip_existing
+```
+
+关键点：
+
+- 当前维护范围只包含原始 Xperience 的 `stereo_left.mp4 + annotation.hdf5`
+- 原始 RGB 会在加载时对齐到 `depth/depth` 分辨率，再送入当前 TraceForge 推理链路
+- 输出仍然是标准 `v2` layout，但 `scene_meta.json` 里记录的是 `source_descriptor`
+  而不是缓存后的 `scene.h5`
+- `adapter_ref` 依赖原始数据仍然可访问，适合大规模数据集直接推理、避免重复缓存整份 RGB/depth
+- 如果你做了 resize 实验，仍然必须切回 `--scene_storage_mode cache`
+- `lang.txt` 会从 `caption.config["Main Task"]` 提取并随窗口输出
+
+## Smoke 验证
+
+### Sim / File Layout
+
+2026-04-21 已在真实 sim 数据集
+`/data2/yaoxuran/press_one_button_demo_v1/episode_00000` 上完成 smoke，使用的是统一入口
+`scripts/batch_inference/batch_infer.py --dataset_adapter file_layout`，不是绕过新入口直接调用旧脚本。
+
+结论：
+
+- `file_layout -> batch_infer_press_one_button_demo.py` 的转发链路正常。
+- 共享 query-frame schedule 正常生成，最终保存为标准 `v2 + source_ref`。
+- 输出目录通过 `is_traceforge_output_complete(...) == True` 校验。
+- 该次 smoke 使用单相机 `varied_camera_1`、`future_len=16`、`grid_size=20`，实际保存了 2 个 query frame sample。
+- 当 smoke 想用较小 `grid_size` 时，建议同时把 `grid_border_trim_left/right/top/bottom` 设为 `0`；否则默认 trim 可能在小网格下直接触发参数校验失败。
+
+### Xperience / Adapter Ref
+
+2026-04-21 已在真实 Xperience 数据集
+`/data1/dataset/xperience-10m-partial-1tb/07f3aeee-5d64-4fd2-8450-f8baf8c239fd/ep7` 上完成 smoke。
+
+结论：
+
+- 原始 `annotation.hdf5 + stereo_left.mp4` 可直接加载并进入当前 TraceForge 推理链路。
+- 输出目录保存为标准 `v2 + adapter_ref`，`scene_meta.json` 中会记录 `source_descriptor`。
+- 输出目录通过 `is_traceforge_output_complete(...) == True` 校验。
+- 为了让 smoke 真正进入 tracker 前向，建议把 `future_len` 设为大于 `8`，否则 short-tail 规则可能把 query frame 全部跳过。
+- 在这条真实 episode 上，如果目标只是验证 tracker 真跑，建议先用 `--query_visibility_gate_mode off`；默认 `all_future_v1` 可能把 query 全部过滤掉。
+- 同样地，当 smoke 使用较小 `grid_size` 时，建议把 `grid_border_trim_left/right/top/bottom` 设为 `0`。
 
 ## 关键参数语义
 

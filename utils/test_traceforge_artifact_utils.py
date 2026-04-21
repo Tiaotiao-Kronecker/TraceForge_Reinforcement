@@ -1,15 +1,20 @@
+import json
+import subprocess
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
 
+import h5py
+import imageio.v2 as imageio
 import numpy as np
 from PIL import Image
 
 from utils.traceforge_artifact_utils import (
     RENDER_MODE_FINITE,
     RENDER_MODE_HYBRID,
+    SCENE_STORAGE_ADAPTER_REF,
     SCENE_STORAGE_SOURCE_REF,
     SceneReader,
     build_pointcloud_from_frame,
@@ -18,6 +23,11 @@ from utils.traceforge_artifact_utils import (
     is_traceforge_output_complete,
     normalize_sample_data,
     write_scene_meta,
+)
+from utils.xperience_adapter_utils import (
+    build_stereo_left_extrinsics,
+    build_stereo_left_intrinsics,
+    build_xperience_source_descriptor,
 )
 
 
@@ -387,6 +397,35 @@ def _write_rgb_png(path: Path, value: int, *, hw: tuple[int, int] = (2, 3)) -> N
     Image.fromarray(image).save(path)
 
 
+def _write_rgb_mp4(path: Path, frames: np.ndarray, *, fps: int = 10) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frames = np.asarray(frames, dtype=np.uint8)
+    if frames.ndim != 4 or frames.shape[-1] != 3:
+        raise ValueError(f"Expected frames shape (T,H,W,3), got {frames.shape}")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        for idx, frame in enumerate(frames):
+            Image.fromarray(frame).save(tmpdir_path / f"{idx:06d}.png")
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-y",
+                "-framerate",
+                str(max(int(fps), 1)),
+                "-i",
+                str(tmpdir_path / "%06d.png"),
+                "-pix_fmt",
+                "yuv420p",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
 class SourceRefArtifactTests(unittest.TestCase):
     def _build_source_ref_episode(self, tmpdir: str) -> tuple[Path, np.ndarray, np.ndarray]:
         root = Path(tmpdir)
@@ -479,6 +518,144 @@ class SourceRefArtifactTests(unittest.TestCase):
             self.assertEqual(int(rgb1[0, 0, 0]), 10)
             np.testing.assert_allclose(depth0, np.full((2, 3), 3.0, dtype=np.float32))
             np.testing.assert_allclose(depth1, np.full((2, 3), 1.0, dtype=np.float32))
+
+
+class AdapterRefArtifactTests(unittest.TestCase):
+    def _build_xperience_adapter_ref_episode(self, tmpdir: str) -> tuple[Path, np.ndarray, np.ndarray]:
+        root = Path(tmpdir)
+        dataset_root = root / "raw"
+        episode_raw_dir = dataset_root / "session_a" / "ep1"
+        episode_output_dir = root / "stereo_left_window"
+        samples_dir = episode_output_dir / "samples"
+        samples_dir.mkdir(parents=True, exist_ok=True)
+        episode_raw_dir.mkdir(parents=True, exist_ok=True)
+
+        source_hw = (4, 6)
+        target_hw = (2, 3)
+        frames = np.stack(
+            [
+                np.full((*source_hw, 3), 25, dtype=np.uint8),
+                np.full((*source_hw, 3), 120, dtype=np.uint8),
+                np.full((*source_hw, 3), 230, dtype=np.uint8),
+            ],
+            axis=0,
+        )
+        _write_rgb_mp4(episode_raw_dir / "stereo_left.mp4", frames, fps=10)
+
+        depth = np.stack(
+            [
+                np.full(target_hw, 1.0, dtype=np.float32),
+                np.full(target_hw, 2.0, dtype=np.float32),
+                np.full(target_hw, 3.0, dtype=np.float32),
+            ],
+            axis=0,
+        )
+        depth_conf = np.full_like(depth, 255, dtype=np.float32)
+        translations = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        quaternions = np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (3, 1))
+
+        with h5py.File(episode_raw_dir / "annotation.hdf5", "w") as handle:
+            handle.create_dataset("calibration/cam01/K", data=np.array([8.0, 10.0, 3.0, 2.0], dtype=np.float32))
+            handle.create_dataset("slam/trans_xyz", data=translations)
+            handle.create_dataset("slam/quat_wxyz", data=quaternions)
+            handle.create_dataset("depth/depth", data=depth)
+            handle.create_dataset("depth/confidence", data=depth_conf.astype(np.uint8))
+            handle.create_dataset("video/frame_number", data=np.arange(3, dtype=np.int64))
+            handle.create_dataset(
+                "video/device_timestamp",
+                data=np.asarray([b"0", b"100000000", b"200000000"], dtype="S16"),
+            )
+            handle.create_dataset("video/length_sec", data=np.float64(0.3))
+            handle.create_dataset(
+                "caption",
+                data=np.bytes_(json.dumps({"config": {"Main Task": "synthetic xperience"}})),
+            )
+
+        np.savez(
+            samples_dir / "stereo_left_window_0.npz",
+            traj_uvz=np.array([[[1.0, 1.0, 1.0]]], dtype=np.float32),
+            keypoints=np.array([[1.0, 1.0]], dtype=np.float32),
+            query_frame_index=np.array([0], dtype=np.int32),
+            segment_frame_indices=np.array([0], dtype=np.int32),
+        )
+
+        source_descriptor = build_xperience_source_descriptor(
+            dataset_root=dataset_root,
+            episode_dir=episode_raw_dir,
+            camera_name="stereo_left",
+            window_start=0,
+            window_stop=3,
+            source_hw=source_hw,
+            target_hw=target_hw,
+        )
+        source_descriptor["episode_fps"] = 10.0
+
+        with h5py.File(episode_raw_dir / "annotation.hdf5", "r") as handle:
+            intrinsics_single = build_stereo_left_intrinsics(
+                handle,
+                source_hw=source_hw,
+                target_hw=target_hw,
+            )
+            extrinsics = build_stereo_left_extrinsics(handle, source_frame_indices=np.array([2, 0], dtype=np.int32))
+
+        intrinsics = np.repeat(intrinsics_single[None, :, :], 2, axis=0)
+        write_scene_meta(
+            episode_output_dir / "scene_meta.json",
+            {
+                "layout_version": 2,
+                "video_name": "stereo_left_window",
+                "frame_count": 2,
+                "height": target_hw[0],
+                "width": target_hw[1],
+                "extrinsics_mode": "w2c",
+                "frame_drop_rate": 1,
+                "future_len": 16,
+                "original_filenames": ["000002", "000000"],
+                "scene_storage_mode": SCENE_STORAGE_ADAPTER_REF,
+                "scene_h5_path": None,
+                "rgb_cache_path": None,
+                "source_descriptor": source_descriptor,
+                "source_rgb_path": None,
+                "source_depth_path": None,
+                "source_geom_path": None,
+                "source_camera_name": "stereo_left",
+                "source_extrinsics_mode": "w2c",
+                "depth_pose_method": "external",
+                "source_frame_indices": [2, 0],
+            },
+        )
+        return episode_output_dir, intrinsics, extrinsics
+
+    def test_detect_output_layout_accepts_adapter_ref_v2(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            episode_dir, _, _ = self._build_xperience_adapter_ref_episode(tmpdir)
+            self.assertEqual(detect_output_layout(episode_dir), "v2")
+            self.assertTrue(is_traceforge_output_complete(episode_dir))
+
+    def test_scene_reader_reads_adapter_ref_rgb_depth_and_geometry(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            episode_dir, intrinsics, extrinsics = self._build_xperience_adapter_ref_episode(tmpdir)
+            with SceneReader(episode_dir) as reader:
+                intrinsics_sel, extrinsics_sel = reader.get_camera_arrays()
+                rgb0 = reader.get_rgb_frame(0)
+                rgb1 = reader.get_rgb_frame(1)
+                depth0 = reader.get_depth_frame(0)
+                depth1 = reader.get_depth_frame(1)
+
+            np.testing.assert_allclose(intrinsics_sel, intrinsics)
+            np.testing.assert_allclose(extrinsics_sel, extrinsics)
+            np.testing.assert_allclose(depth0, np.full((2, 3), 3.0, dtype=np.float32))
+            np.testing.assert_allclose(depth1, np.full((2, 3), 1.0, dtype=np.float32))
+            self.assertEqual(rgb0.shape, (2, 3, 3))
+            self.assertEqual(rgb1.shape, (2, 3, 3))
+            self.assertGreater(float(rgb0.mean()), float(rgb1.mean()))
 
 
 if __name__ == "__main__":
