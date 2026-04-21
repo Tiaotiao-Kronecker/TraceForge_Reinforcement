@@ -5,6 +5,8 @@ from pathlib import Path
 
 _SOURCE_PATH = Path(__file__).resolve().with_name("batch_infer.py")
 _SOURCE_AST = ast.parse(_SOURCE_PATH.read_text(encoding="utf-8"), filename=str(_SOURCE_PATH))
+_XPERIENCE_SOURCE_PATH = Path(__file__).resolve().parent / "adapters" / "xperience_raw.py"
+_XPERIENCE_SOURCE_AST = ast.parse(_XPERIENCE_SOURCE_PATH.read_text(encoding="utf-8"), filename=str(_XPERIENCE_SOURCE_PATH))
 
 
 def _collect_cli_flags(func_ast: ast.FunctionDef) -> set[str]:
@@ -75,15 +77,35 @@ def _get_keyword_value(call_ast: ast.Call, keyword_name: str):
     return None
 
 
+def _collect_constant_tuple(module_ast: ast.Module, name: str) -> tuple[str, ...]:
+    for node in module_ast.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name) or target.id != name:
+            continue
+        if not isinstance(node.value, ast.Tuple):
+            raise AssertionError(f"{name} must be assigned from a tuple literal")
+        values: list[str] = []
+        for element in node.value.elts:
+            if not isinstance(element, ast.Constant) or not isinstance(element.value, str):
+                raise AssertionError(f"{name} must contain only string literals")
+            values.append(element.value)
+        return tuple(values)
+    raise AssertionError(f"missing assignment for {name}")
+
+
 _BUILD_DISPATCH_PARSER_AST = next(
     node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "_build_dispatch_parser"
 )
 _BUILD_XPERIENCE_PARSER_AST = next(
-    node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "_build_xperience_parser"
+    node for node in _XPERIENCE_SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "build_parser"
 )
 
 _DISPATCH_FLAGS = _collect_cli_flags(_BUILD_DISPATCH_PARSER_AST)
-_DISPATCH_CHOICES = _collect_cli_choices(_BUILD_DISPATCH_PARSER_AST)
+_SUPPORTED_DATASET_ADAPTERS = _collect_constant_tuple(_SOURCE_AST, "SUPPORTED_DATASET_ADAPTERS")
 _XPERIENCE_FLAGS = _collect_cli_flags(_BUILD_XPERIENCE_PARSER_AST)
 _XPERIENCE_CHOICES = _collect_cli_choices(_BUILD_XPERIENCE_PARSER_AST)
 _XPERIENCE_ARGUMENT_CALLS = _collect_argument_calls(_BUILD_XPERIENCE_PARSER_AST)
@@ -92,7 +114,7 @@ _XPERIENCE_ARGUMENT_CALLS = _collect_argument_calls(_BUILD_XPERIENCE_PARSER_AST)
 class BatchInferCliSurfaceTests(unittest.TestCase):
     def test_dispatch_parser_exposes_dataset_adapter_flag(self):
         self.assertIn("--dataset_adapter", _DISPATCH_FLAGS)
-        self.assertEqual(_DISPATCH_CHOICES.get("--dataset_adapter"), ("file_layout", "xperience"))
+        self.assertEqual(_SUPPORTED_DATASET_ADAPTERS, ("sim_file_layout", "xperience_raw"))
 
     def test_xperience_parser_exposes_native_dataset_controls(self):
         self.assertIn("--dataset_root", _XPERIENCE_FLAGS)

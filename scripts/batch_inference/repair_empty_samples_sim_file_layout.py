@@ -31,7 +31,7 @@ if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
 import infer
-import batch_infer_press_one_button_demo as batch_infer
+import batch_infer_sim_file_layout as batch_infer
 from utils.traj_filter_utils import compute_accessed_high_volatility_mask, resolve_traj_filter_config
 
 
@@ -850,7 +850,7 @@ def summarize_repair_results(task_records: list[dict[str, Any]]) -> dict[str, An
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Repair empty TraceForge samples for press_one_button_demo outputs."
+        description="Repair empty TraceForge samples for simulation file-layout outputs."
     )
     parser.add_argument("--base_path", type=str, required=True)
     parser.add_argument("--out_dir", type=str, default=None)

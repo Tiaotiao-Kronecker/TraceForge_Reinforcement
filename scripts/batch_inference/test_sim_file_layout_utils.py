@@ -4,7 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 
-_SOURCE_PATH = Path(__file__).resolve().with_name("batch_infer_press_one_button_demo.py")
+_SOURCE_PATH = Path(__file__).resolve().with_name("batch_infer_sim_file_layout.py")
 _SOURCE_AST = ast.parse(_SOURCE_PATH.read_text(encoding="utf-8"), filename=str(_SOURCE_PATH))
 _RESOLVE_FUNC_AST = next(
     node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "resolve_traj_filter_profile"
@@ -30,8 +30,8 @@ _FIND_VALID_EPISODES_NAMESPACE = {
 exec(compile(_FIND_VALID_EPISODES_MODULE, str(_SOURCE_PATH), "exec"), _FIND_VALID_EPISODES_NAMESPACE)
 find_valid_episodes = _FIND_VALID_EPISODES_NAMESPACE["find_valid_episodes"]
 
-_PARSE_ARGS_FUNC_AST = next(
-    node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "parse_args"
+_BUILD_PARSER_FUNC_AST = next(
+    node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "build_parser"
 )
 _PARSE_CAMERA_NAMES_AST = next(
     node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "parse_camera_names"
@@ -185,9 +185,9 @@ def _collect_cli_choices(func_ast: ast.FunctionDef) -> dict[str, tuple[str, ...]
     return choices
 
 
-_CLI_FLAGS = _collect_cli_flags(_PARSE_ARGS_FUNC_AST)
-_CLI_DEFAULTS = _collect_cli_defaults(_PARSE_ARGS_FUNC_AST)
-_CLI_CHOICES = _collect_cli_choices(_PARSE_ARGS_FUNC_AST)
+_CLI_FLAGS = _collect_cli_flags(_BUILD_PARSER_FUNC_AST)
+_CLI_DEFAULTS = _collect_cli_defaults(_BUILD_PARSER_FUNC_AST)
+_CLI_CHOICES = _collect_cli_choices(_BUILD_PARSER_FUNC_AST)
 
 
 class ResolveTrajFilterProfileTests(unittest.TestCase):

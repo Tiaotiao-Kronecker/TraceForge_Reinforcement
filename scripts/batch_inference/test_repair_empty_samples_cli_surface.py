@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 
-_SOURCE_PATH = Path(__file__).resolve().with_name("repair_empty_samples_press_one_button_demo.py")
+_SOURCE_PATH = Path(__file__).resolve().with_name("repair_empty_samples_sim_file_layout.py")
 _SOURCE_AST = ast.parse(_SOURCE_PATH.read_text(encoding="utf-8"), filename=str(_SOURCE_PATH))
 _PARSE_ARGS_AST = next(
     node for node in _SOURCE_AST.body if isinstance(node, ast.FunctionDef) and node.name == "parse_args"

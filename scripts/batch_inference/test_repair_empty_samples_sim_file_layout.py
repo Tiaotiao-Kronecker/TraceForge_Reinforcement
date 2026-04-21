@@ -9,7 +9,7 @@ from unittest import mock
 
 import numpy as np
 
-from scripts.batch_inference.repair_empty_samples_press_one_button_demo import (
+from scripts.batch_inference.repair_empty_samples_sim_file_layout import (
     RepairTask,
     build_backup_path,
     build_repair_tasks,
@@ -165,17 +165,17 @@ class RepairEmptySamplesHelperTests(unittest.TestCase):
             )
 
             with mock.patch(
-                "scripts.batch_inference.repair_empty_samples_press_one_button_demo.batch_infer.build_camera_args",
+                "scripts.batch_inference.repair_empty_samples_sim_file_layout.batch_infer.build_camera_args",
                 return_value=SimpleNamespace(
                     depth_pose_method="external",
                     grid_size=80,
                 ),
             ), mock.patch.dict(
-                "scripts.batch_inference.repair_empty_samples_press_one_button_demo.infer.video_depth_pose_dict",
+                "scripts.batch_inference.repair_empty_samples_sim_file_layout.infer.video_depth_pose_dict",
                 {"external": lambda _camera_args: object()},
                 clear=False,
             ), mock.patch(
-                "scripts.batch_inference.repair_empty_samples_press_one_button_demo.infer.process_single_video",
+                "scripts.batch_inference.repair_empty_samples_sim_file_layout.infer.process_single_video",
                 return_value={
                     "query_frame_results": {},
                     "query_frame_metadata": {
@@ -183,7 +183,7 @@ class RepairEmptySamplesHelperTests(unittest.TestCase):
                     },
                 },
             ), mock.patch(
-                "scripts.batch_inference.repair_empty_samples_press_one_button_demo.batch_infer.safe_empty_cuda_cache"
+                "scripts.batch_inference.repair_empty_samples_sim_file_layout.batch_infer.safe_empty_cuda_cache"
             ):
                 ok, retryable, task_record = run_repair_task(
                     task=task,

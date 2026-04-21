@@ -11,7 +11,7 @@ def main() -> None:
     exit_retired_entrypoint(
         entrypoint="scripts/batch_inference/batch_bridge_v2.py",
         replacement=(
-            "若是 button/sim episode，请使用 scripts/batch_inference/batch_infer_press_one_button_demo.py；"
+            "若是 button/sim episode，请使用 scripts/batch_inference/batch_infer_sim_file_layout.py；"
             "BridgeV2 专用批处理入口已整体移除。"
         ),
         reason="external-only 收敛后，不再维护 BridgeV2 兼容批处理链路。",

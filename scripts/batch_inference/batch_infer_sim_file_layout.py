@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Press-one-button demo 数据集批量推理脚本。
+通用仿真 file-layout 数据集批量推理脚本。
 
 目标数据结构：
     base_path/
@@ -25,7 +25,7 @@ Press-one-button demo 数据集批量推理脚本。
 
 默认输出方式：
 - 就地写回到每个 episode 下的 `trajectory/<camera_name>/...`；
-- 如需兼容旧流程，仍可通过 `--out_dir` 指定外部输出根目录。
+- 如需把产物集中写到单独目录，可通过 `--out_dir` 指定外部输出根目录。
 """
 
 from __future__ import annotations
@@ -517,15 +517,15 @@ def build_batch_run_summary(
     }
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Batch inference for press_one_button_demo_v1"
+        description="Batch inference for simulation datasets following the maintained file-layout contract"
     )
     parser.add_argument(
         "--base_path",
         type=str,
         required=True,
-        help="Dataset root, e.g. /data1/yaoxuran/press_one_button_demo_v1",
+        help="Dataset root containing episode directories, e.g. /data2/yaoxuran/sim_episode_dataset",
     )
     parser.add_argument(
         "--out_dir",
@@ -657,7 +657,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="external",
         choices=infer.video_depth_pose_dict.keys(),
-        help="Maintained mode: external, using trajectory_valid.h5 per episode",
+        help="Maintained mode: external, using per-episode geometry such as trajectory_valid.h5",
     )
     parser.add_argument(
         "--external_geom_name",
@@ -879,7 +879,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Depth change std threshold in meters (overrides filter_level default)",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def finalize_args(args: argparse.Namespace) -> argparse.Namespace:
+    args = copy.copy(args)
     args.camera_names = parse_camera_names(
         args.camera_names,
         option_name="--camera_names",
@@ -934,6 +938,16 @@ def parse_args() -> argparse.Namespace:
             )
 
     return args
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = build_parser()
+    parsed_args = parser.parse_args(argv)
+    try:
+        return finalize_args(parsed_args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    raise AssertionError("unreachable")
 
 
 def parse_gpu_ids(gpu_id: str | None) -> list[int]:
@@ -2181,8 +2195,7 @@ def process_camera_tasks_on_gpu_entrypoint(
         )
 
 
-def main() -> None:
-    args = parse_args()
+def run(args: argparse.Namespace) -> int:
     base_path = Path(args.base_path).resolve()
     out_dir = resolve_output_root(args)
     telemetry_out_dir = resolve_telemetry_root(args, out_root=out_dir)
@@ -2218,7 +2231,7 @@ def main() -> None:
     episodes = find_valid_episodes(base_path, args.camera_names, args.external_geom_name)
     if not episodes:
         logger.error(f"No valid episodes found under {base_path}")
-        return
+        return 0
 
     if args.episode_name is not None and args.episode_names_file is not None:
         raise ValueError("--episode_name and --episode_names_file are mutually exclusive")
@@ -2227,7 +2240,7 @@ def main() -> None:
         episodes = [episode for episode in episodes if episode.name == args.episode_name]
         if not episodes:
             logger.error(f"Episode not found: {args.episode_name}")
-            return
+            return 0
     elif args.episode_names_file is not None:
         episode_names_path = Path(args.episode_names_file).expanduser()
         requested_names = [
@@ -2237,12 +2250,12 @@ def main() -> None:
         ]
         if not requested_names:
             logger.error(f"No episode names found in {episode_names_path}")
-            return
+            return 0
         requested_name_set = set(requested_names)
         episodes = [episode for episode in episodes if episode.name in requested_name_set]
         if not episodes:
             logger.error(f"No requested episodes found under {base_path} from {episode_names_path}")
-            return
+            return 0
         missing_names = [name for name in requested_names if name not in {episode.name for episode in episodes}]
         if missing_names:
             logger.warning(
@@ -2255,7 +2268,7 @@ def main() -> None:
     episodes_for_run = episodes
 
     logger.info("=" * 80)
-    logger.info("Press-one-button demo batch inference")
+    logger.info("Simulation file-layout batch inference")
     logger.info(f"base_path={base_path}")
     logger.info(f"out_dir={describe_output_target(args, out_dir)}")
     logger.info(f"telemetry_out_dir={describe_telemetry_target(telemetry_out_dir)}")
@@ -2325,7 +2338,7 @@ def main() -> None:
         else:
             for idx, episode in enumerate(episodes_for_run, start=1):
                 logger.info(f"[dry_run {idx:03d}/{len(episodes_for_run):03d}] {episode}")
-        return
+        return 0
 
     total_camera_success = 0
     total_camera_fail = 0
@@ -2339,7 +2352,7 @@ def main() -> None:
             if not dynamic_tasks:
                 logger.info("No pending camera tasks after filtering.")
                 logger.info("=" * 80)
-                return
+                return 0
             if args.copy_lang:
                 for episode_dir in episodes_for_run:
                     copy_episode_lang(
@@ -2522,7 +2535,12 @@ def main() -> None:
         )
     logger.info(f"wall_clock_seconds={wall_clock_seconds:.3f}")
     logger.info("=" * 80)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    return run(parse_args(argv))
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
