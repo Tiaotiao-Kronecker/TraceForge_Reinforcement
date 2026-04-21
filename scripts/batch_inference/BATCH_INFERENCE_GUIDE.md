@@ -19,15 +19,15 @@
   - 默认 `--fps=1`
   - 默认 `--max_num_frames=512`
   - 未提供共享 schedule 时，用 `--frame_drop_rate` 做 fallback query-frame 采样
-- `scripts/batch_inference/batch_infer_press_one_button_demo.py`
-  - button / sim / press-one-button episode 数据集批处理入口
+- `scripts/batch_inference/batch_infer_sim_file_layout.py`
+  - button / sim episode 数据集批处理入口
   - 默认 `--fps=1`
   - 默认 `--max_num_frames=512`
   - 默认共享每秒采样 `2~3` 个关键帧
 - `scripts/batch_inference/batch_infer.py`
   - 统一批处理入口
-  - `--dataset_adapter file_layout` 转发到现有 sim/button 维护路径
-  - `--dataset_adapter xperience` 直接读取原始 Xperience 数据集并写出 `v2 + adapter_ref`
+  - `--dataset_adapter sim_file_layout` 读取维护态 sim/button episode 布局
+  - `--dataset_adapter xperience_raw` 直接读取原始 Xperience 数据集并写出 `v2 + adapter_ref`
 
 ## 通用批量推理
 
@@ -75,7 +75,7 @@ python scripts/batch_inference/infer.py \
 ## Sim / Button 批处理
 
 ```bash
-python scripts/batch_inference/batch_infer_press_one_button_demo.py \
+python scripts/batch_inference/batch_infer_sim_file_layout.py \
   --base_path <dataset_root> \
   --camera_names <camera_a,camera_b,...> \
   --gpu_id 0,1,2,3 \
@@ -110,10 +110,10 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
 - wrist-oriented profile 仍可显式切到 `wrist_pick_place` / `wrist_pick_place_no_heatmap` /
   `wrist` / `wrist_manipulator_top95`，但这些都不再属于维护态默认路径
 
-## Press-One-Button Demo
+## Simulation File-Layout Shortcut
 
 ```bash
-python scripts/batch_inference/batch_infer_press_one_button_demo.py \
+python scripts/batch_inference/batch_infer_sim_file_layout.py \
   --base_path <dataset_root> \
   --camera_names <camera_a,camera_b,...> \
   --keyframes_per_sec_min 2 \
@@ -123,7 +123,7 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
 
 补充说明：
 
-- `batch_infer_press_one_button_demo.py` 会为每个 episode 生成一份共享 schedule：
+- `batch_infer_sim_file_layout.py` 会为每个 episode 生成一份共享 schedule：
   `<episode_output>/_shared/query_frame_schedule_v3_<hash>.json`
 - 默认只有 `--camera_names` 里的相机会消费同一份 schedule；若需要跨批次固定更大的对齐集合，显式传 `--shared_schedule_camera_names`
 - schedule 里存的是 raw source frame index，`infer.py` 运行时再映射到当前
@@ -153,7 +153,7 @@ python scripts/batch_inference/batch_infer_press_one_button_demo.py \
 
 ```bash
 python scripts/batch_inference/batch_infer.py \
-  --dataset_adapter xperience \
+  --dataset_adapter xperience_raw \
   --dataset_root <xperience_root> \
   --episode_glob '*/*' \
   --camera_name stereo_left \
@@ -182,16 +182,43 @@ python scripts/batch_inference/batch_infer.py \
 ### Sim / File Layout
 
 2026-04-21 已在真实 sim 数据集
-`/data2/yaoxuran/press_one_button_demo_v1/episode_00000` 上完成 smoke，使用的是统一入口
-`scripts/batch_inference/batch_infer.py --dataset_adapter file_layout`，不是绕过新入口直接调用旧脚本。
+`/data2/yaoxuran/press_one_button_demo_v1/episode_00001` 上完成 smoke，使用的是统一入口
+`scripts/batch_inference/batch_infer.py --dataset_adapter sim_file_layout`。
 
 结论：
 
-- `file_layout -> batch_infer_press_one_button_demo.py` 的转发链路正常。
+- `sim_file_layout` adapter 可直接进入维护态 sim runner。
 - 共享 query-frame schedule 正常生成，最终保存为标准 `v2 + source_ref`。
 - 输出目录通过 `is_traceforge_output_complete(...) == True` 校验。
-- 该次 smoke 使用单相机 `varied_camera_1`、`future_len=16`、`grid_size=20`，实际保存了 2 个 query frame sample。
+- 该次 smoke 使用单相机 `varied_camera_1`、`future_len=16`、`grid_size=20`，实际保存了 3 个 query frame sample：`0,24,34`。
 - 当 smoke 想用较小 `grid_size` 时，建议同时把 `grid_border_trim_left/right/top/bottom` 设为 `0`；否则默认 trim 可能在小网格下直接触发参数校验失败。
+
+本次实跑命令：
+
+```bash
+env MPLCONFIGDIR=/tmp/matplotlib CUDA_VISIBLE_DEVICES=1 \
+  /home/wangchen/.conda/envs/traceforge/bin/python scripts/batch_inference/batch_infer.py \
+  --dataset_adapter sim_file_layout \
+  --base_path /data2/yaoxuran/press_one_button_demo_v1 \
+  --camera_names varied_camera_1 \
+  --episode_name episode_00001 \
+  --checkpoint ./checkpoints/tapip3d_final.pth \
+  --out_dir /tmp/traceforge_sim_smoke_ep00001_20260421 \
+  --device cuda:0 \
+  --fps 1 \
+  --max_num_frames 64 \
+  --future_len 16 \
+  --grid_size 20 \
+  --grid_border_trim_left 0 \
+  --grid_border_trim_right 0 \
+  --grid_border_trim_top 0 \
+  --grid_border_trim_bottom 0 \
+  --keyframes_per_sec_min 1 \
+  --keyframes_per_sec_max 1 \
+  --num_iters 2 \
+  --depth_filter_workers 4 \
+  --skip_existing
+```
 
 ### Xperience / Adapter Ref
 
@@ -206,6 +233,54 @@ python scripts/batch_inference/batch_infer.py \
 - 为了让 smoke 真正进入 tracker 前向，建议把 `future_len` 设为大于 `8`，否则 short-tail 规则可能把 query frame 全部跳过。
 - 在这条真实 episode 上，如果目标只是验证 tracker 真跑，建议先用 `--query_visibility_gate_mode off`；默认 `all_future_v1` 可能把 query 全部过滤掉。
 - 同样地，当 smoke 使用较小 `grid_size` 时，建议把 `grid_border_trim_left/right/top/bottom` 设为 `0`。
+- 本次 smoke 在窗口 `000000_000064` 上实际保存了 2 个 query frame sample：`0,15`。
+
+本次实跑命令：
+
+```bash
+env MPLCONFIGDIR=/tmp/matplotlib CUDA_VISIBLE_DEVICES=1 \
+  /home/wangchen/.conda/envs/traceforge/bin/python scripts/batch_inference/batch_infer.py \
+  --dataset_adapter xperience_raw \
+  --dataset_root /data1/dataset/xperience-10m-partial-1tb \
+  --episode_glob '07f3aeee-5d64-4fd2-8450-f8baf8c239fd/ep7' \
+  --checkpoint ./checkpoints/tapip3d_final.pth \
+  --out_dir /tmp/traceforge_xperience_raw_smoke_ep7_20260421 \
+  --device cuda:0 \
+  --start_index 0 \
+  --stop_index 64 \
+  --window_size 64 \
+  --fps 1 \
+  --max_num_frames 32 \
+  --frame_drop_rate 15 \
+  --future_len 16 \
+  --grid_size 20 \
+  --grid_border_trim_left 0 \
+  --grid_border_trim_right 0 \
+  --grid_border_trim_top 0 \
+  --grid_border_trim_bottom 0 \
+  --query_visibility_gate_mode off \
+  --num_iters 2 \
+  --depth_filter_workers 4 \
+  --skip_existing
+```
+
+## 4D Viewer 验证
+
+2026-04-21 已使用通用 viewer
+`scripts/visualization/visualize_4d_reconstruction.py`
+对上面两条 smoke 产物做读取验证。验证方式覆盖了 viewer 的核心 artifact 路径：
+
+- `resolve_episode_camera_dir(...)`
+- `SceneReader(...)`
+- `list_sample_query_frames(...)`
+- `aggregate_tracked_points(...)`
+- `build_dense_pointcloud_for_frame(...)`
+- `build_display_frame_data(...)`
+
+验证结果：
+
+- sim smoke 输出可被 viewer 正常读取，得到 `frames=50`、`query_frames=[0,24,34]`，并成功构造当前帧 dense pointcloud。
+- xperience smoke 输出可被 viewer 正常读取，得到 `frames=32`、`query_frames=[0,15]`，并成功构造当前帧 dense pointcloud。
 
 ## 关键参数语义
 

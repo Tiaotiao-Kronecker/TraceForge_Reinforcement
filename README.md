@@ -20,6 +20,9 @@ The repository still contains a few compatibility paths, notably
 `--output_layout legacy`. BridgeV2/VGGT-specific inference entrypoints have been
 retired from the maintained workflow.
 
+The maintained batch dispatcher is
+`scripts/batch_inference/batch_infer.py --dataset_adapter <sim_file_layout|xperience_raw>`.
+
 For model training on processed datasets, see
 [TraceGen](https://github.com/jayLEE0301/TraceGen).
 
@@ -63,10 +66,10 @@ python scripts/batch_inference/infer.py \
 自带完整场景缓存时，才需要改成 `cache`。`--frame_drop_rate` 只在没有共享
 schedule manifest 的 direct `infer.py` 路径里参与 query-frame 采样。
 
-### Press-one-button demo batch inference
+### Simulation File-Layout Batch Inference
 
 ```bash
-python scripts/batch_inference/batch_infer_press_one_button_demo.py \
+python scripts/batch_inference/batch_infer_sim_file_layout.py \
   --base_path <dataset_root> \
   --camera_names <camera_a,camera_b,...> \
   --keyframes_per_sec_min 2 \
@@ -82,7 +85,8 @@ the same per-episode camera outputs are written under
 ### Sim / button batch inference
 
 ```bash
-python scripts/batch_inference/batch_infer_press_one_button_demo.py \
+python scripts/batch_inference/batch_infer.py \
+  --dataset_adapter sim_file_layout \
   --base_path <dataset_root> \
   --camera_names <camera_a,camera_b,...> \
   --gpu_id 0,1,2,3 \

@@ -15,11 +15,11 @@
     轨迹过滤 profile
 - `batch_infer.py`
   - 当前统一批处理入口
-  - `--dataset_adapter file_layout` 时转发到 `batch_infer_press_one_button_demo.py`
-  - `--dataset_adapter xperience` 时直接读取原始 Xperience episode（当前维护 `stereo_left`）
-  - Xperience 原生路径默认输出 `v2 + adapter_ref`
-- `batch_infer_press_one_button_demo.py`
-  - button / sim / press-one-button episode 数据集批处理入口
+  - `--dataset_adapter sim_file_layout` 时读取维护态仿真 episode 目录布局
+  - `--dataset_adapter xperience_raw` 时直接读取原始 Xperience episode（当前维护 `stereo_left`）
+  - 所有数据集路径都收敛到同一 dispatcher + adapter 架构
+- `batch_infer_sim_file_layout.py`
+  - button / sim episode 数据集批处理入口
   - 默认 `--fps=1`、`--max_num_frames=512`
   - 默认每秒共享采样 `2~3` 个关键帧，按 episode 的 `trajectory_valid.h5` root attr `fps` 计算
   - 如果 source frame `0` 通过 stride/cap/tail 过滤，会被强制写入 shared schedule
@@ -49,14 +49,84 @@
 
 ## 已验证 Smoke 路径
 
-- `file_layout`：已于 2026-04-21 通过统一入口 `batch_infer.py --dataset_adapter file_layout`
-  在 `/data2/yaoxuran/press_one_button_demo_v1/episode_00000` 上完成真实 smoke；
-  转发到 `batch_infer_press_one_button_demo.py`、共享 query-frame schedule、`v2 + source_ref`
-  保存和 artifact 完整性检查都已通过。
-- `xperience`：已于 2026-04-21 在
+- `sim_file_layout`：已于 2026-04-21 通过统一入口 `batch_infer.py --dataset_adapter sim_file_layout`
+  在 `/data2/yaoxuran/press_one_button_demo_v1/episode_00001` 上完成真实 smoke；
+  共享 query-frame schedule、`v2 + source_ref`
+  保存和 artifact 完整性检查都已通过。该次输出位于
+  `/tmp/traceforge_sim_smoke_ep00001_20260421/episode_00001/varied_camera_1`，
+  实际保存了 `query_frame={0,24,34}` 三个 sample。
+- `xperience_raw`：已于 2026-04-21 在
   `/data1/dataset/xperience-10m-partial-1tb/07f3aeee-5d64-4fd2-8450-f8baf8c239fd/ep7`
   上完成真实 smoke；原始 `annotation.hdf5 + stereo_left.mp4` 读取、`v2 + adapter_ref`
-  保存和 artifact 完整性检查都已通过。
+  保存和 artifact 完整性检查都已通过。该次输出位于
+  `/tmp/traceforge_xperience_raw_smoke_ep7_20260421/07f3aeee-5d64-4fd2-8450-f8baf8c239fd__ep7__stereo_left__000000_000064`，
+  实际保存了 `query_frame={0,15}` 两个 sample。
+
+### 最新已验证命令
+
+- `sim_file_layout`
+
+```bash
+env MPLCONFIGDIR=/tmp/matplotlib CUDA_VISIBLE_DEVICES=1 \
+  /home/wangchen/.conda/envs/traceforge/bin/python scripts/batch_inference/batch_infer.py \
+  --dataset_adapter sim_file_layout \
+  --base_path /data2/yaoxuran/press_one_button_demo_v1 \
+  --camera_names varied_camera_1 \
+  --episode_name episode_00001 \
+  --checkpoint ./checkpoints/tapip3d_final.pth \
+  --out_dir /tmp/traceforge_sim_smoke_ep00001_20260421 \
+  --device cuda:0 \
+  --fps 1 \
+  --max_num_frames 64 \
+  --future_len 16 \
+  --grid_size 20 \
+  --grid_border_trim_left 0 \
+  --grid_border_trim_right 0 \
+  --grid_border_trim_top 0 \
+  --grid_border_trim_bottom 0 \
+  --keyframes_per_sec_min 1 \
+  --keyframes_per_sec_max 1 \
+  --num_iters 2 \
+  --depth_filter_workers 4 \
+  --skip_existing
+```
+
+- `xperience_raw`
+
+```bash
+env MPLCONFIGDIR=/tmp/matplotlib CUDA_VISIBLE_DEVICES=1 \
+  /home/wangchen/.conda/envs/traceforge/bin/python scripts/batch_inference/batch_infer.py \
+  --dataset_adapter xperience_raw \
+  --dataset_root /data1/dataset/xperience-10m-partial-1tb \
+  --episode_glob '07f3aeee-5d64-4fd2-8450-f8baf8c239fd/ep7' \
+  --checkpoint ./checkpoints/tapip3d_final.pth \
+  --out_dir /tmp/traceforge_xperience_raw_smoke_ep7_20260421 \
+  --device cuda:0 \
+  --start_index 0 \
+  --stop_index 64 \
+  --window_size 64 \
+  --fps 1 \
+  --max_num_frames 32 \
+  --frame_drop_rate 15 \
+  --future_len 16 \
+  --grid_size 20 \
+  --grid_border_trim_left 0 \
+  --grid_border_trim_right 0 \
+  --grid_border_trim_top 0 \
+  --grid_border_trim_bottom 0 \
+  --query_visibility_gate_mode off \
+  --num_iters 2 \
+  --depth_filter_workers 4 \
+  --skip_existing
+```
+
+### 4D Viewer 验证
+
+- 2026-04-21 已用 [`scripts/visualization/visualize_4d_reconstruction.py`](../visualization/visualize_4d_reconstruction.py)
+  对上述 `sim_file_layout` 与 `xperience_raw` smoke 产物做通用 viewer 数据路径验证。
+- 已确认 viewer 的 artifact 读取、sample 聚合和当前帧 dense pointcloud 构建都可正常工作：
+  - sim smoke：`frames=50`、`query_frames=[0,24,34]`
+  - xperience smoke：`frames=32`、`query_frames=[0,15]`
 
 如果需要查看旧实验或一次性调查，请不要从这里找，统一去
 `scripts/archived/investigations/`。

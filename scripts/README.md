@@ -16,7 +16,7 @@
 ## 推荐入口
 
 - `scripts/batch_inference/infer.py`
-- `scripts/batch_inference/batch_infer_press_one_button_demo.py`
+- `scripts/batch_inference/batch_infer_sim_file_layout.py`
   - button/sim episode 多 GPU 批处理，三相机共享 episode 级 query-frame schedule
 - `scripts/batch_inference/batch_droid_external.py`
 - `scripts/visualization/visualize_single_image.py`
