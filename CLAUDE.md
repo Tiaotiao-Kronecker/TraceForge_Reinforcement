@@ -216,7 +216,7 @@ python generate_description.py --episode_dir <dataset_directory> --skip_existing
 - `traj_filter_profile=auto` is retained only as a compatibility alias and currently resolves to `external`; wrist-oriented profiles remain available only when explicitly requested for historical investigations or compatibility reruns
 
 **Sim360 Dataset**:
-- Branch `curation/sim-360-extrinsics-fixed` contains extrinsics fixes
+- Historical commit `ad064b0994c4` contains the Sim360 extrinsics fixes that previously lived on branch `curation/sim-360-extrinsics-fixed`
 - See `docs/history/camera_extrinsics_investigation_2026-03-12.md` for details
 
 ## Common Issues

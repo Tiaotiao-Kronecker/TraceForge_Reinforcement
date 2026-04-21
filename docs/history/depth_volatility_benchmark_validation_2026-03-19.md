@@ -20,7 +20,7 @@
 对比目标：
 
 - baseline ref：`8f9060d`
-- current：`feat/default-source-ref-and-wrist-top95` 当前工作树
+- current：historical commit `41b3d12c230e`（原分支 `feat/default-source-ref-and-wrist-top95`）
 
 工作负载：
 

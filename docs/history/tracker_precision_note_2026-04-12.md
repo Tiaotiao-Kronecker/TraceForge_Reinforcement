@@ -2,7 +2,7 @@
 
 日期：2026-04-12
 
-分支：`feat/external-only-maintained-mode`
+提交：`9e6bcbf700cf`（原分支 `feat/external-only-maintained-mode`，现已进入 `main`）
 
 ## 结论
 
