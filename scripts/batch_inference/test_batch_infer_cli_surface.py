@@ -122,10 +122,22 @@ class BatchInferCliSurfaceTests(unittest.TestCase):
         self.assertIn("--window_size", _XPERIENCE_FLAGS)
         self.assertIn("--window_step", _XPERIENCE_FLAGS)
         self.assertIn("--camera_name", _XPERIENCE_FLAGS)
+        self.assertIn("--gpu_id", _XPERIENCE_FLAGS)
+        self.assertIn("--workers_per_gpu", _XPERIENCE_FLAGS)
+        self.assertIn("--min_free_gpu_mem_gb", _XPERIENCE_FLAGS)
+        self.assertIn("--gpu_recovery_poll_sec", _XPERIENCE_FLAGS)
+        self.assertIn("--telemetry_out_dir", _XPERIENCE_FLAGS)
+        self.assertIn("--hardware_telemetry_interval_sec", _XPERIENCE_FLAGS)
+        self.assertIn("--keyframes_per_sec_min", _XPERIENCE_FLAGS)
+        self.assertIn("--keyframes_per_sec_max", _XPERIENCE_FLAGS)
+        self.assertIn("--keyframe_seed", _XPERIENCE_FLAGS)
+        self.assertIn("--fallback_episode_fps", _XPERIENCE_FLAGS)
         self.assertIn("--scene_storage_mode", _XPERIENCE_FLAGS)
         self.assertIn("--tracker_precision_mode", _XPERIENCE_FLAGS)
         self.assertIn("--query_visibility_gate_mode", _XPERIENCE_FLAGS)
         self.assertIn("--query_depth_stabilization_mode", _XPERIENCE_FLAGS)
+        self.assertIn("--grid_width", _XPERIENCE_FLAGS)
+        self.assertIn("--grid_height", _XPERIENCE_FLAGS)
 
     def test_xperience_parser_defaults_to_stereo_left_and_adapter_ref(self):
         camera_name_call = _XPERIENCE_ARGUMENT_CALLS["--camera_name"]
@@ -144,6 +156,29 @@ class BatchInferCliSurfaceTests(unittest.TestCase):
             [element.id for element in scene_storage_choices.elts if isinstance(element, ast.Name)],
             ["SCENE_STORAGE_ADAPTER_REF", "SCENE_STORAGE_CACHE"],
         )
+
+    def test_xperience_parser_defaults_to_per_second_keyframe_sampling(self):
+        min_call = _XPERIENCE_ARGUMENT_CALLS["--keyframes_per_sec_min"]
+        min_default = _get_keyword_value(min_call, "default")
+        self.assertIsInstance(min_default, ast.Constant)
+        self.assertEqual(min_default.value, 2)
+
+        max_call = _XPERIENCE_ARGUMENT_CALLS["--keyframes_per_sec_max"]
+        max_default = _get_keyword_value(max_call, "default")
+        self.assertIsInstance(max_default, ast.Constant)
+        self.assertEqual(max_default.value, 3)
+
+    def test_xperience_parser_defaults_to_future_len_16(self):
+        future_len_call = _XPERIENCE_ARGUMENT_CALLS["--future_len"]
+        future_len_default = _get_keyword_value(future_len_call, "default")
+        self.assertIsInstance(future_len_default, ast.Constant)
+        self.assertEqual(future_len_default.value, 16)
+
+    def test_xperience_parser_defaults_to_one_worker_per_gpu(self):
+        workers_call = _XPERIENCE_ARGUMENT_CALLS["--workers_per_gpu"]
+        workers_default = _get_keyword_value(workers_call, "default")
+        self.assertIsInstance(workers_default, ast.Constant)
+        self.assertEqual(workers_default.value, 1)
 
 
 if __name__ == "__main__":
