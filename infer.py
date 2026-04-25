@@ -209,6 +209,35 @@ def retarget_trajectories(
     valid_mask[:L] = True
     return retargeted, valid_mask
 
+
+def pad_trajectories_to_frame_window(
+    trajectory: np.ndarray,
+    max_length: int,
+    pad_value: float = np.inf,
+):
+    """Pad per-frame trajectories without changing their temporal sampling."""
+    if trajectory.ndim != 3:
+        raise ValueError(f"trajectory must be (N, T, D), got {trajectory.shape}")
+    if max_length is None or int(max_length) <= 0:
+        valid_mask = np.ones(trajectory.shape[1], dtype=bool)
+        return trajectory, valid_mask
+
+    max_length = int(max_length)
+    num_tracks, current_len, dims = trajectory.shape
+    if current_len > max_length:
+        raise ValueError(
+            f"Expected trajectory time dimension <= max_length, got {current_len} > {max_length}"
+        )
+
+    valid_mask = np.zeros(max_length, dtype=bool)
+    valid_mask[:current_len] = True
+    if current_len == max_length:
+        return trajectory, valid_mask
+
+    padded = np.full((num_tracks, max_length, dims), pad_value, dtype=trajectory.dtype)
+    padded[:, :current_len, :] = trajectory
+    return padded, valid_mask
+
 def save_structured_data(
     video_name,
     output_dir,
@@ -376,8 +405,18 @@ def save_structured_data(
                 depth_raw_path = os.path.join(depth_dir, depth_raw_filename)
                 np.savez(depth_raw_path, depth=query_frame_depth)
             
-            retargeted, valid_mask = retarget_trajectories(sample_data["traj"], max_length=args.future_len)
-            sample_data["traj"] = retargeted
+            sample_data["segment_frame_indices"] = (
+                query_frame_idx + np.arange(actual_frames, dtype=np.int32)
+            )
+            padded_traj, valid_mask = pad_trajectories_to_frame_window(
+                sample_data["traj"], max_length=future_len
+            )
+            sample_data["traj"] = padded_traj
+            if "traj_2d" in sample_data:
+                padded_traj_2d, _ = pad_trajectories_to_frame_window(
+                    sample_data["traj_2d"], max_length=future_len
+                )
+                sample_data["traj_2d"] = padded_traj_2d
             sample_data["valid_steps"] = valid_mask
 
             # Save sample NPZ for this query frame

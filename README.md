@@ -3,6 +3,21 @@
 TraceForge is a unified dataset pipeline that converts cross-embodiment videos into consistent 3D traces via camera motion compensation and speed retargeting. 
 For model training on the processed datasets, please refer to [TraceGen](https://github.com/jayLEE0301/TraceGen).
 
+## Branch Notes: `traj_2d`
+
+This branch is based on the original TraceForge code path and keeps the
+automatic VGGT4 depth/camera frontend. Unlike the upstream output retargeting
+behavior, saved sample trajectories are frame-aligned:
+
+- `traj` is padded to `--future_len` without arc-length retiming, so each valid
+  step corresponds to the same RGB frame step in the input segment.
+- `traj_2d` is saved alongside `traj` and is padded with the same `valid_steps`
+  convention.
+- `segment_frame_indices` records the source frame index for every valid step.
+- Padded tail values are `inf`; use `valid_steps` to mask invalid padded steps.
+
+The local environment is maintained with `uv` and a repository-local `.venv`.
+
 **Project Website**: [tracegen.github.io](https://tracegen.github.io/)  
 **arXiv**: [2511.21690](https://arxiv.org/abs/2511.21690)
 
@@ -10,16 +25,36 @@ For model training on the processed datasets, please refer to [TraceGen](https:/
 
 ## Installation
 
-### 1. Create a conda environment
+### 1. Create a uv environment
 ```bash
-conda create -n traceforge python=3.11
-conda activate traceforge
+uv venv --python 3.11 .venv
+source .venv/bin/activate
 ```
 
 ### 2. Install dependencies 
 Installs PyTorch 2.8.0 (CUDA 12.8) and all required packages.
 ```bash
-bash setup_env.sh
+uv pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
+uv pip install git+https://github.com/facebookresearch/segment-anything.git
+uv pip install git+https://github.com/EasternJournalist/utils3d.git#egg=utils3d
+uv pip install kornia==0.8.1 huggingface_hub hydra-core omegaconf timm PyJWT gdown rich "ray[default]" jaxtyping tqdm
+uv pip install torch-scatter -f https://data.pyg.org/whl/torch-2.8.0+cu128.html
+uv pip install av typed-argument-parser scipy h5py sophuspy trimesh "python-box[all]~=7.0"
+uv pip install wandb loguru opencv-python einops matplotlib Pillow viser mediapy scikit-learn
+uv pip install python-dotenv openai google-genai flow_vis moviepy==1.0.0 easydict socksio
+uv pip install git+https://github.com/facebookresearch/vggt.git
+
+cd third_party/pointops2
+CUDA_HOME=/usr/local/cuda-12.8 PATH=/usr/local/cuda-12.8/bin:$PATH TORCH_CUDA_ARCH_LIST='8.0;8.6;8.9;9.0' ../../.venv/bin/python setup.py install
+cd ../..
+```
+
+If `mediapy` cannot find `ffmpeg`, expose the binary bundled by
+`imageio-ffmpeg`:
+
+```bash
+ln -sf "$PWD/.venv/lib/python3.11/site-packages/imageio_ffmpeg/binaries/ffmpeg-linux-x86_64-v7.0.2" .venv/bin/ffmpeg
+export PATH="$PWD/.venv/bin:$PATH"
 ```
 
 ### 3. Download checkpoints
@@ -27,6 +62,16 @@ Download the TAPIP3D model checkpoint:
 ```bash
 mkdir -p checkpoints
 wget -O checkpoints/tapip3d_final.pth https://huggingface.co/zbww/tapip3d/resolve/main/tapip3d_final.pth
+```
+
+The default VGGT4 frontend loads `Yuxihenry/SpatialTrackerV2_Front` from the
+Hugging Face cache on first use. To prefetch it:
+
+```bash
+python - <<'PY'
+from huggingface_hub import snapshot_download
+snapshot_download(repo_id="Yuxihenry/SpatialTrackerV2_Front")
+PY
 ```
 
 ## Usage
@@ -135,6 +180,13 @@ python infer.py \
     │   └── ...
     └── <video_name>.npz          # Full video visualization data
 ```
+
+Each sample NPZ contains frame-aligned trajectories:
+
+- `traj`: `(num_points, future_len, 3)` padded 3D trajectory.
+- `traj_2d`: `(num_points, future_len, 2)` padded 2D trajectory.
+- `valid_steps`: `(future_len,)` mask for real frame-aligned steps.
+- `segment_frame_indices`: source RGB frame indices for the valid steps.
 
 ## Visualization
 
