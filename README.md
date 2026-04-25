@@ -160,7 +160,7 @@ python infer.py \
 | `--scan_depth` | Directory levels to scan for subfolders | `2` |
 | `--fps` | Frame sampling stride (0 for auto) | `1` |
 | `--max_frames_per_video` | Target max frames per episode | `50` |
-| `--future_len` | Tracking window length per query frame | `128` |
+| `--future_len` | Tracking window length per query frame | `64` |
 
 ### Output Structure
 ```

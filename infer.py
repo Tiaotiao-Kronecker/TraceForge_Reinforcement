@@ -88,7 +88,7 @@ def parse_args():
     parser.add_argument(
         "--future_len",
         type=int,
-        default=128,
+        default=64,
         help="Tracking window length (number of frames) per query frame in offline mode",
     )
     parser.add_argument(
@@ -252,7 +252,7 @@ def save_structured_data(
     original_filenames,
     use_all_trajectories=True,
     query_frame_results=None,
-    future_len: int = 128,
+    future_len: int = 64,
 ):
     """Save data in the structured format"""
 
