@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "mcp__zread__read_file",
+      "Bash(conda --version)",
+      "Bash(conda create:*)",
+      "Bash(conda env:*)",
+      "Bash(conda run:*)",
+      "Bash(find /tmp/spconv_build/ -name *.py -exec grep -l \"core_cc\\\\|CCImportExtension\\\\|ccimport\" {})",
+      "Bash(2)"
+    ]
+  }
+}
